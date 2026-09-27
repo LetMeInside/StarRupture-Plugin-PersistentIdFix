@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <StarRupturePluginSDKRoot>$(SolutionDir)..\..\StarRupture-Plugin-SDK\</StarRupturePluginSDKRoot>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug' Or '$(Configuration)' == 'Release'">
+    <StarRuptureSDKSourceDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Server\SDK\</StarRuptureSDKSourceDir>
+    <StarRuptureSDKConfigDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Server\;$(StarRupturePluginSDKRoot)StarRupture SDK\Server\SDK\</StarRuptureSDKConfigDir>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Client Debug' Or '$(Configuration)' == 'Client Release'">
+    <StarRuptureSDKSourceDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Client\SDK\</StarRuptureSDKSourceDir>
+    <StarRuptureSDKConfigDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Client\;$(StarRupturePluginSDKRoot)StarRupture SDK\Client\SDK\</StarRuptureSDKConfigDir>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Server Debug' Or '$(Configuration)' == 'Server Release'">
+    <StarRuptureSDKSourceDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Server\SDK\</StarRuptureSDKSourceDir>
+    <StarRuptureSDKConfigDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Server\;$(StarRupturePluginSDKRoot)StarRupture SDK\Server\SDK\</StarRuptureSDKConfigDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Client Debug' Or '$(Configuration)' == 'Client Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>MODLOADER_CLIENT_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Server Debug' Or '$(Configuration)' == 'Server Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>MODLOADER_SERVER_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>
+
