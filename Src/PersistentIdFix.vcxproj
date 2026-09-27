@@ -122,5 +122,8 @@
     <ClCompile Include="PersistentIdReuse.cpp" />
     <ClCompile Include="plugin.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="PersistentIdFix.rc" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

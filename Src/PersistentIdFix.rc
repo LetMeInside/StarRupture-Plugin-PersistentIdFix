@@ -1,0 +1,36 @@
+#include "resource.h"
+#include <winver.h>
+
+#define STRINGIZE2(x) #x
+#define STRINGIZE(x) STRINGIZE2(x)
+
+#define VERSION_STRING STRINGIZE(VERSION_MAJOR) "." STRINGIZE(VERSION_MINOR) "." STRINGIZE(VERSION_PATCH) ".0"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
+ PRODUCTVERSION VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0x0L
+ FILEOS VOS__WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Kian369 / LetMeInside\0"
+            VALUE "FileDescription", "Persistent ID exhaustion prevention plugin for StarRupture\0"
+            VALUE "FileVersion", VERSION_STRING "\0"
+            VALUE "InternalName", "PersistentIdFix.dll\0"
+            VALUE "OriginalFilename", "PersistentIdFix.dll\0"
+            VALUE "ProductName", "PersistentIdFix\0"
+            VALUE "ProductVersion", VERSION_STRING "\0"
+        END
+    END
+
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
