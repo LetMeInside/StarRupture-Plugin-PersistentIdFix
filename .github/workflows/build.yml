@@ -417,6 +417,10 @@ jobs:
             $clientPdb `
             (Join-Path $package "$env:PLUGIN_NAME.pdb")
 
+          Copy-Item `
+            $clientDll `
+            (Join-Path $env:GITHUB_WORKSPACE "$env:PLUGIN_NAME-Client.dll")
+
       # --------------------------------------------------------
       # Copy Server package files
       # --------------------------------------------------------
@@ -439,6 +443,10 @@ jobs:
           Copy-Item `
             $serverPdb `
             (Join-Path $package "$env:PLUGIN_NAME.pdb")
+
+          Copy-Item `
+            $serverDll `
+            (Join-Path $env:GITHUB_WORKSPACE "$env:PLUGIN_NAME-Server.dll")
 
       # --------------------------------------------------------
       # Generate remote Client manifest
@@ -638,6 +646,7 @@ jobs:
           name: ${{ env.PLUGIN_NAME }}-Client-v${{ env.VERSION }}
           path: |
             ${{ github.workspace }}/${{ env.PLUGIN_NAME }}-Client-v${{ env.VERSION }}.zip
+            ${{ github.workspace }}/${{ env.PLUGIN_NAME }}-Client.dll
             ${{ github.workspace }}/${{ env.PLUGIN_NAME }}-client-manifest.json
           if-no-files-found: error
 
@@ -647,5 +656,6 @@ jobs:
           name: ${{ env.PLUGIN_NAME }}-Server-v${{ env.VERSION }}
           path: |
             ${{ github.workspace }}/${{ env.PLUGIN_NAME }}-Server-v${{ env.VERSION }}.zip
+            ${{ github.workspace }}/${{ env.PLUGIN_NAME }}-Server.dll
             ${{ github.workspace }}/${{ env.PLUGIN_NAME }}-server-manifest.json
           if-no-files-found: error
