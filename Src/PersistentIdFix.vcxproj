@@ -106,7 +106,7 @@
   <ItemGroup>
     <ClInclude Include="Config\Config.h" />
     <ClInclude Include="PersistentIdFixNetwork.h" />
-    <ClInclude Include="PersistentIdFixStats.h" />
+    <ClInclude Include="Stats\Stats.h" />
     <ClInclude Include="PersistentIdFixUI.h" />
     <ClInclude Include="PersistentIdNativeLookup.h" />
     <ClInclude Include="PersistentIdReuse.h" />
@@ -126,7 +126,7 @@
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="Config\Config.cpp" />
     <ClCompile Include="PersistentIdFixNetwork.cpp" />
-    <ClCompile Include="PersistentIdFixStats.cpp" />
+    <ClCompile Include="Stats\Stats.cpp" />
     <ClCompile Include="PersistentIdFixUI.cpp" />
     <ClCompile Include="PersistentIdReuse.cpp" />
     <ClCompile Include="plugin.cpp" />

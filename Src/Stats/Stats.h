@@ -39,4 +39,3 @@ namespace PersistentIdFixStats
     // Logs the latest statistics using the same terminology as the UI.
     void LogStats();
 }
-

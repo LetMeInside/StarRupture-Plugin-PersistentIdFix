@@ -3,7 +3,7 @@
 #include "PersistentIdFixUI.h"
 #include "PersistentIdFixConfig.h"
 #include "PersistentIdFixNetwork.h"
-#include "PersistentIdFixStats.h"
+#include "Stats/Stats.h"
 #include "plugin.h"
 #include "plugin_helpers.h"
 

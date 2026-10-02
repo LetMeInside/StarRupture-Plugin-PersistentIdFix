@@ -1,6 +1,6 @@
 #pragma once
 
-#include "PersistentIdFixStats.h"
+#include "Stats/Stats.h"
 
 #include <cstdint>
 

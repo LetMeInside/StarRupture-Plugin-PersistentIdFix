@@ -2,7 +2,7 @@
 #include "plugin_helpers.h"
 #include "PersistentIdReuse.h"
 #include "PersistentIdNativeLookup.h"
-#include "PersistentIdFixStats.h"
+#include "Stats/Stats.h"
 #include "Config/Config.h"
 #include "PersistentIdFixNetwork.h"
 
