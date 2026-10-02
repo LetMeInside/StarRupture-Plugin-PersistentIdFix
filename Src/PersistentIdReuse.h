@@ -5,6 +5,7 @@
 
 #include "ChimeraMassCommon_classes.hpp"
 #include "plugin.h"
+#include "plugin_helpers.h"
 
 enum class PersistentIdAllocationResult
 {
@@ -42,6 +43,8 @@ public:
     bool GetLastRange(
         uint32_t& first,
         uint32_t& last) const;
+
+    SDK::UCrMassPersistentIDSubsystem* GetSubsystem() const;
 
 private:
     struct IdRange

@@ -36,10 +36,6 @@ namespace
 
     constexpr int32_t InvalidHashIndex = -1;
 
-    // for debugging:
-    static bool g_loggedFirstPersistentIdLookupMiss = false;
-    static uint32_t g_persistentIdLookupMissCount = 0;
- 
 
     static uint32_t HashMassEntityHandle(
         const SDK::FMassEntityHandle& handle)

@@ -104,9 +104,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="PersistentIdFixConfig.h" />
+    <ClInclude Include="PersistentIdFixNetwork.h" />
+    <ClInclude Include="PersistentIdFixStats.h" />
+    <ClInclude Include="PersistentIdFixUI.h" />
     <ClInclude Include="PersistentIdNativeLookup.h" />
     <ClInclude Include="PersistentIdReuse.h" />
     <ClInclude Include="plugin.h" />
+    <ClInclude Include="plugin_helpers.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="$(StarRuptureSDKSourceDir)Basic.cpp">
@@ -119,6 +124,10 @@
       <Visible>false</Visible>
     </ClCompile>
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="PersistentIdFixConfig.cpp" />
+    <ClCompile Include="PersistentIdFixNetwork.cpp" />
+    <ClCompile Include="PersistentIdFixStats.cpp" />
+    <ClCompile Include="PersistentIdFixUI.cpp" />
     <ClCompile Include="PersistentIdReuse.cpp" />
     <ClCompile Include="plugin.cpp" />
   </ItemGroup>

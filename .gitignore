@@ -2,6 +2,7 @@
 .vs/
 *.user
 *.suo
+*.aps
 
 # Build output
 [Bb]in/
