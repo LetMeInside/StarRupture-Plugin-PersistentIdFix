@@ -1,6 +1,6 @@
 #ifdef MODLOADER_CLIENT_BUILD
 
-#include "PersistentIdFixUI.h"
+#include "UI.h"
 #include "Config/Config.h"
 #include "Network/Network.h"
 #include "Stats/Stats.h"

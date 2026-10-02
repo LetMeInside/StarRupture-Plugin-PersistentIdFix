@@ -107,7 +107,7 @@
     <ClInclude Include="Config\Config.h" />
     <ClInclude Include="Network\Network.h" />
     <ClInclude Include="Stats\Stats.h" />
-    <ClInclude Include="PersistentIdFixUI.h" />
+    <ClInclude Include="UI\UI.h" />
     <ClInclude Include="PersistentIdNativeLookup.h" />
     <ClInclude Include="PersistentIdReuse.h" />
     <ClInclude Include="plugin.h" />
@@ -127,7 +127,7 @@
     <ClCompile Include="Config\Config.cpp" />
     <ClCompile Include="Network\Network.cpp" />
     <ClCompile Include="Stats\Stats.cpp" />
-    <ClCompile Include="PersistentIdFixUI.cpp" />
+    <ClCompile Include="UI\UI.cpp" />
     <ClCompile Include="PersistentIdReuse.cpp" />
     <ClCompile Include="plugin.cpp" />
   </ItemGroup>

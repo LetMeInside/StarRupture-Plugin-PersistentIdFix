@@ -7,7 +7,7 @@
 #include "Network/Network.h"
 
 #ifdef MODLOADER_CLIENT_BUILD
-#include "PersistentIdFixUI.h"
+#include "UI/UI.h"
 #endif
 
 #include <cstdint>
