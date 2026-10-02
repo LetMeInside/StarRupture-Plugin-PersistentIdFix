@@ -81,9 +81,7 @@ jobs:
       - name: Verify SDK location
         shell: pwsh
         run: |
-          $sdkRoot = Join-Path $env:GITHUB_WORKSPACE `
-            "..\..\StarRupture-Plugin-SDK"
-
+          $sdkRoot = Join-Path $env:GITHUB_WORKSPACE "plugin-sdk"
           $sdkRoot = [System.IO.Path]::GetFullPath($sdkRoot)
 
           Write-Host "Expected SDK location:"
