@@ -3,7 +3,7 @@
 #include "PersistentIdReuse.h"
 #include "PersistentIdNativeLookup.h"
 #include "PersistentIdFixStats.h"
-#include "PersistentIdFixConfig.h"
+#include "Config/Config.h"
 #include "PersistentIdFixNetwork.h"
 
 #ifdef MODLOADER_CLIENT_BUILD

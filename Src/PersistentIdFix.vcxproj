@@ -104,7 +104,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="PersistentIdFixConfig.h" />
+    <ClInclude Include="Config\Config.h" />
     <ClInclude Include="PersistentIdFixNetwork.h" />
     <ClInclude Include="PersistentIdFixStats.h" />
     <ClInclude Include="PersistentIdFixUI.h" />
@@ -124,7 +124,7 @@
       <Visible>false</Visible>
     </ClCompile>
     <ClCompile Include="dllmain.cpp" />
-    <ClCompile Include="PersistentIdFixConfig.cpp" />
+    <ClCompile Include="Config\Config.cpp" />
     <ClCompile Include="PersistentIdFixNetwork.cpp" />
     <ClCompile Include="PersistentIdFixStats.cpp" />
     <ClCompile Include="PersistentIdFixUI.cpp" />
