@@ -1,7 +1,7 @@
 ﻿#include "plugin.h"
 #include "plugin_helpers.h"
 #include "PersistentIdReuse.h"
-#include "PersistentIdNativeLookup.h"
+#include "Native/NativeIdLookup.h"
 #include "Stats/Stats.h"
 #include "Config/Config.h"
 #include "Network/Network.h"
