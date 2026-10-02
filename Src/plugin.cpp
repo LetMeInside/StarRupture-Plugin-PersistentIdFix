@@ -27,7 +27,7 @@ static bool g_networkSessionActive = false;
 static bool g_gameWorldActive = false;
 
 #ifndef MODLOADER_BUILD_TAG
-#define MODLOADER_BUILD_TAG "0.2.0"
+#define MODLOADER_BUILD_TAG "1.2.0"
 #endif
 
 #ifdef MODLOADER_SERVER_BUILD

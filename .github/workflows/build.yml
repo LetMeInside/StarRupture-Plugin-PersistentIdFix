@@ -2,9 +2,15 @@ name: Build PersistentIdFix
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish GitHub Release and Nexus packages"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write
 
 # ============================================================
 # Plugin-specific configuration
@@ -659,3 +665,63 @@ jobs:
             ${{ github.workspace }}/${{ env.PLUGIN_NAME }}-Server.dll
             ${{ github.workspace }}/${{ env.PLUGIN_NAME }}-server-manifest.json
           if-no-files-found: error
+
+      # --------------------------------------------------------
+      # Create GitHub Release
+      # --------------------------------------------------------
+      - name: Create GitHub Release
+        if: ${{ inputs.publish }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+
+          $assets = @(
+            (Join-Path $root "$env:PLUGIN_NAME-Client.dll"),
+            (Join-Path $root "$env:PLUGIN_NAME-client-manifest.json"),
+            (Join-Path $root "$env:PLUGIN_NAME-Client-v$env:VERSION.zip"),
+            (Join-Path $root "$env:PLUGIN_NAME-Server.dll"),
+            (Join-Path $root "$env:PLUGIN_NAME-server-manifest.json"),
+            (Join-Path $root "$env:PLUGIN_NAME-Server-v$env:VERSION.zip")
+          )
+
+          Write-Host "Creating GitHub Release $env:VERSION_TAG"
+          Write-Host "Uploading $($assets.Count) assets:"
+          $assets | ForEach-Object { Write-Host "  $_" }
+
+          gh release create $env:VERSION_TAG @assets `
+            --title "$env:PLUGIN_NAME $env:VERSION_TAG" `
+            --generate-notes
+
+      # --------------------------------------------------------
+      # Upload Client package to Nexus Mods
+      # --------------------------------------------------------
+      - name: Upload Client build to Nexus Mods
+        if: ${{ inputs.publish }}
+        uses: Nexus-Mods/upload-action@main
+        with:
+          api_key: ${{ secrets.NEXUS_APIKEY }}
+          file_id: ${{ secrets.NEXUS_CLIENT_GROUP_ID }}
+          filename: ${{ github.workspace }}\${{ env.PLUGIN_NAME }}-Client-v${{ env.VERSION }}.zip
+          archive_existing_version: true
+          allow_mod_manager_download: false
+          display_name: "${{ env.PLUGIN_NAME }} Client v${{ env.VERSION }}"
+          description: "Changelog: https://github.com/${{ github.repository }}/releases/tag/v${{ env.VERSION }}"
+          version: ${{ env.VERSION }}
+
+      # --------------------------------------------------------
+      # Upload Server package to Nexus Mods
+      # --------------------------------------------------------
+      - name: Upload Server build to Nexus Mods
+        if: ${{ inputs.publish }}
+        uses: Nexus-Mods/upload-action@main
+        with:
+          api_key: ${{ secrets.NEXUS_APIKEY }}
+          file_id: ${{ secrets.NEXUS_SERVER_GROUP_ID }}
+          filename: ${{ github.workspace }}\${{ env.PLUGIN_NAME }}-Server-v${{ env.VERSION }}.zip
+          archive_existing_version: true
+          allow_mod_manager_download: false
+          display_name: "${{ env.PLUGIN_NAME }} Server v${{ env.VERSION }}"
+          description: "Changelog: https://github.com/${{ github.repository }}/releases/tag/v${{ env.VERSION }}"
+          version: ${{ env.VERSION }}
