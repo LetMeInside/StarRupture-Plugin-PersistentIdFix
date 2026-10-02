@@ -1,0 +1,832 @@
+#include "PersistentId/PersistentIdSystem.h"
+
+#include "plugin_helpers.h"
+#include "PersistentIdReuse.h"
+#include "Native/NativeIdLookup.h"
+#include "Stats/Stats.h"
+#include "Config/Config.h"
+#include "Network/Network.h"
+
+#ifdef MODLOADER_CLIENT_BUILD
+#include "UI/UI.h"
+#endif
+
+#include <cstdint>
+#include <chrono>
+
+namespace
+{
+    static IPluginSelf* g_systemSelf = nullptr;
+
+    static PersistentIdReuse g_persistentIdReuse;
+    static SDK::UCrMassPersistentIDSubsystem* g_persistentIdSubsystem = nullptr;
+
+    static SetIDHandlePairFn g_setIDHandlePair = nullptr;
+    static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
+
+    static bool g_reusePoolReady = false;
+    static bool g_sessionActive = false;
+
+    static EPluginNetMode g_sessionNetMode = EPluginNetMode::Unknown;
+
+    static std::chrono::steady_clock::time_point g_nextStatisticsLogTime{};
+    static std::chrono::steady_clock::time_point g_nextLiveStatisticsRefreshTime{};
+    static bool g_statisticsTimerActive = false;
+
+    static EPluginNetMode GetEffectiveSessionNetMode()
+    {
+        if (g_sessionNetMode != EPluginNetMode::Unknown)
+            return g_sessionNetMode;
+
+        if (g_systemSelf == nullptr ||
+            g_systemSelf->hooks == nullptr ||
+            g_systemSelf->hooks->NetMode == nullptr ||
+            g_systemSelf->hooks->NetMode->GetNetMode == nullptr)
+        {
+            return EPluginNetMode::Unknown;
+        }
+
+        return g_systemSelf->hooks->NetMode->GetNetMode();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Persistent-ID subsystem initialisation.
+    //
+    // Discovers the live UCrMassPersistentIDSubsystem and builds the reusable-ID
+    // pool from the IDs that were already consumed before this session started.
+    //
+    // This function is shared by:
+    //   - loaded-save initialisation via OnSaveLoaded()
+    //   - new-game initialisation via OnNewGame()
+    //
+    // The caller is responsible for ensuring that the persistent-ID subsystem
+    // belongs to the current world.
+    // ---------------------------------------------------------------------------
+
+    static bool InitializeSession()
+    {
+        g_persistentIdReuse.Clear();
+        g_reusePoolReady = false;
+        g_persistentIdSubsystem = nullptr;
+
+        g_statisticsTimerActive = false;
+        g_nextStatisticsLogTime = {};
+        g_nextLiveStatisticsRefreshTime = {};
+
+        if (g_systemSelf == nullptr || g_systemSelf->hooks == nullptr)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: hooks are unavailable during persistent ID system initialization");
+            return false;
+        }
+
+        auto* walker = g_systemSelf->hooks->ObjectWalker;
+
+        if (walker == nullptr || !walker->IsReady())
+        {
+            LOG_ERROR(
+                "PersistentIdFix: ObjectWalker is unavailable during persistent ID system initialization");
+            return false;
+        }
+
+        PluginObjectInfo objects[8] = {};
+
+        const int count = walker->FindObjectsByClassNameInto(
+            "CrMassPersistentIDSubsystem",
+            PluginObjectLookup_InstanceOnly,
+            objects,
+            8);
+
+        LOG_INFO(
+            "PersistentIdFix: found %d CrMassPersistentIDSubsystem instance(s)",
+            count);
+
+        if (count <= 0)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: persistent ID subsystem was not found");
+            return false;
+        }
+
+        if (count > 1)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: expected exactly one CrMassPersistentIDSubsystem, found %d",
+                count);
+            return false;
+        }
+
+        void* object = objects[0].object;
+
+        LOG_INFO(
+            "PersistentIdFix: subsystem object=%p name=%s",
+            object,
+            objects[0].objectName);
+
+        auto* subsystem =
+            static_cast<SDK::UCrMassPersistentIDSubsystem*>(object);
+
+        // The highest existing ID is diagnostic information here.
+        // PersistentIdFix does not infer corruption from MaxID alone.
+        uint32_t minId = UINT32_MAX;
+        uint32_t maxCurrentId = 0;
+
+        for (const auto& pair : subsystem->IDHandleMap)
+        {
+            const uint32_t id = pair.Key().ID;
+
+            if (id < minId)
+                minId = id;
+
+            if (id > maxCurrentId)
+                maxCurrentId = id;
+        }
+
+        uint64_t maxId = 0;
+        bool propertyRead = false;
+
+        auto* properties = g_systemSelf->hooks->ObjectProperties;
+
+        if (properties != nullptr && properties->IsReady())
+        {
+            PluginPropertyHandle property =
+                properties->FindPropertyOnObject(object, "MaxID");
+
+            if (property != nullptr)
+            {
+                int64_t value = 0;
+
+                if (properties->GetIntProperty(
+                    object,
+                    property,
+                    &value))
+                {
+                    if (value < 0 ||
+                        static_cast<uint64_t>(value) > UINT32_MAX)
+                    {
+                        LOG_ERROR(
+                            "PersistentIdFix: MaxID FProperty value is outside uint32 range: %lld",
+                            static_cast<long long>(value));
+
+                        return false;
+                    }
+
+                    maxId = static_cast<uint64_t>(value);
+                    propertyRead = true;
+                }
+                else
+                {
+                    LOG_WARN(
+                        "PersistentIdFix: MaxID property was found but GetIntProperty failed");
+                }
+            }
+            else
+            {
+                LOG_WARN(
+                    "PersistentIdFix: MaxID was not found as an FProperty");
+            }
+        }
+        else
+        {
+            LOG_WARN(
+                "PersistentIdFix: ObjectProperties is unavailable");
+        }
+
+        if (!propertyRead)
+        {
+            // UCrMassPersistentIDSubsystem::MaxID is documented by the
+            // generated SDK at offset 0xD0. Read only; never write here.
+            const auto* bytes =
+                static_cast<const std::uint8_t*>(object);
+
+            maxId =
+                static_cast<uint64_t>(
+                    *reinterpret_cast<const std::uint32_t*>(
+                        bytes + 0xD0));
+        }
+
+        const uint32_t loadedMaxID =
+            static_cast<uint32_t>(maxId);
+
+        // Build the reusable pool from holes below the loaded high-water mark.
+        g_persistentIdReuse.Initialize(
+            subsystem,
+            g_setIDHandlePair);
+
+        g_persistentIdReuse.BuildPool();
+        g_reusePoolReady = true;
+
+        const EPluginNetMode netMode =
+            GetEffectiveSessionNetMode();
+
+        PersistentIdFixStats::UpdateSnapshot(
+            netMode,
+            static_cast<uint32_t>(
+                subsystem->IDHandleMap.Num()),
+            loadedMaxID,
+            g_persistentIdReuse.GetReusableIDCount(),
+            static_cast<uint64_t>(
+                g_persistentIdReuse.GetRangeCount()));
+
+        g_persistentIdSubsystem = subsystem;
+        g_sessionActive = true;
+
+        if (netMode == EPluginNetMode::Standalone ||
+            netMode == EPluginNetMode::ListenServer ||
+            netMode == EPluginNetMode::DedicatedServer)
+        {
+            g_nextStatisticsLogTime =
+                std::chrono::steady_clock::now() +
+                std::chrono::minutes(
+                    PersistentIdFixConfig::GetLogIntervalMinutes());
+
+            g_statisticsTimerActive = true;
+        }
+
+        return true;
+    }
+
+    static bool RefreshPersistentIdStatistics()
+    {
+        if (!g_reusePoolReady)
+            return false;
+
+        if (g_persistentIdSubsystem == nullptr)
+            return false;
+
+        PersistentIdFixStats::UpdateSnapshot(
+            GetEffectiveSessionNetMode(),
+            static_cast<std::uint32_t>(
+                g_persistentIdSubsystem->IDHandleMap.Num()),
+            g_persistentIdSubsystem->MaxID,
+            g_persistentIdReuse.GetReusableIDCount(),
+            static_cast<std::uint64_t>(
+                g_persistentIdReuse.GetRangeCount()));
+
+        return true;
+    }
+
+    // ---------------------------------------------------------------------------
+    // New-game initialisation.
+    //
+    // A new game seeds persistent IDs before OnWorldBeginPlay and does not
+    // produce an OnSaveLoaded callback. During that initial seeding phase the
+    // persistent-ID subsystem starts empty:
+    //
+    //     MaxID == 0
+    //     IDHandleMap.Num() == 0
+    //
+    // The first GetOrAddIDForHandle call therefore provides the earliest reliable
+    // indication that a new-game persistent-ID system is being populated.
+    // ---------------------------------------------------------------------------
+
+    static void OnNewGame()
+    {
+        LOG_INFO(
+            "PersistentIdFix: new game detected");
+
+        if (!InitializeSession())
+        {
+            LOG_ERROR(
+                "PersistentIdFix: persistent ID system initialization failed for new game");
+            return;
+        }
+
+        LOG_INFO(
+            "PersistentIdFix: new-game persistent ID system initialized");
+    }
+}
+
+namespace PersistentIdFixSystem
+{
+    void Configure(
+        IPluginSelf* self,
+        SetIDHandlePairFn setIDHandlePair,
+        GetOrAddIDForHandleFn originalGetOrAddIDForHandle)
+    {
+        g_systemSelf = self;
+        g_setIDHandlePair = setIDHandlePair;
+        g_originalGetOrAddIDForHandle = originalGetOrAddIDForHandle;
+    }
+
+    void Reset()
+    {
+        g_persistentIdReuse.Clear();
+        g_persistentIdSubsystem = nullptr;
+        g_reusePoolReady = false;
+        g_sessionActive = false;
+        g_sessionNetMode = EPluginNetMode::Unknown;
+
+        g_statisticsTimerActive = false;
+        g_nextStatisticsLogTime = {};
+        g_nextLiveStatisticsRefreshTime = {};
+
+        PersistentIdFixStats::Reset();
+
+        g_setIDHandlePair = nullptr;
+        g_originalGetOrAddIDForHandle = nullptr;
+        g_systemSelf = nullptr;
+    }
+
+    void SetSessionNetMode(EPluginNetMode netMode)
+    {
+        if (g_sessionNetMode != EPluginNetMode::Unknown)
+            return;
+
+        if (netMode == EPluginNetMode::Standalone ||
+            netMode == EPluginNetMode::ListenServer ||
+            netMode == EPluginNetMode::DedicatedServer ||
+            netMode == EPluginNetMode::Client)
+        {
+            g_sessionNetMode = netMode;
+        }
+    }
+
+    void OnSaveLoaded()
+    {
+        if (!InitializeSession())
+        {
+            LOG_ERROR(
+                "PersistentIdFix: persistent ID system initialization failed after save load");
+            return;
+        }
+
+        if (!RefreshPersistentIdStatistics())
+        {
+            LOG_WARN(
+                "PersistentIdFix: statistics refresh failed after save load");
+        }
+        else
+        {
+            PersistentIdFixStats::LogStats();
+        }
+    }
+
+    void Tick()
+    {
+        /*
+         * -----------------------------------------------------------------------
+         * Local statistics lifecycle.
+         *
+         * Nothing below this point should run merely because the process is a
+         * network client. A remote client has no local persistent-ID subsystem.
+         */
+        if (!g_statisticsTimerActive)
+            return;
+
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        /*
+         * The statistics snapshot is refreshed once per second when either:
+         *
+         *   1. the local statistics UI is visible, or
+         *   2. a remote client currently has the statistics UI open.
+         *
+         * The second case is important for dedicated servers, which have no
+         * local UI.
+         */
+        bool statisticsRefreshRequired = false;
+
+#ifdef MODLOADER_CLIENT_BUILD
+        if (PersistentIdFixUI::IsVisible())
+        {
+            statisticsRefreshRequired = true;
+        }
+#endif
+
+        if (PersistentIdFixNetwork::HasSubscribedClients())
+        {
+            statisticsRefreshRequired = true;
+        }
+
+        if (statisticsRefreshRequired &&
+            now >= g_nextLiveStatisticsRefreshTime)
+        {
+            if (!RefreshPersistentIdStatistics())
+            {
+                LOG_WARN(
+                    "PersistentIdFix: live statistics refresh failed");
+            }
+            else
+            {
+                const PersistentIdFixStats::Snapshot snapshot =
+                    PersistentIdFixStats::GetSnapshot();
+
+                /*
+                 * On a server/listen host this sends the same complete snapshot
+                 * that the local UI sees to all subscribed remote clients.
+                 */
+                if (PersistentIdFixNetwork::HasSubscribedClients())
+                {
+                    PersistentIdFixNetwork::SendSnapshotToSubscribedClients(
+                        snapshot);
+                }
+            }
+
+            g_nextLiveStatisticsRefreshTime =
+                now +
+                std::chrono::seconds(1);
+        }
+
+        if (g_systemSelf == nullptr ||
+            g_systemSelf->hooks == nullptr ||
+            g_systemSelf->hooks->NetMode == nullptr ||
+            g_systemSelf->hooks->NetMode->GetNetMode == nullptr)
+        {
+            return;
+        }
+
+        const EPluginNetMode netMode =
+            g_systemSelf->hooks->NetMode->GetNetMode();
+
+        /*
+         * Periodic logging is server/standalone only.
+         *
+         * A pure remote client does not have a local persistent-ID subsystem and
+         * therefore never produces local statistics logs.
+         */
+        if (netMode == EPluginNetMode::Client)
+            return;
+
+        if (now < g_nextStatisticsLogTime)
+            return;
+
+        if (!RefreshPersistentIdStatistics())
+        {
+            LOG_WARN(
+                "PersistentIdFix: periodic statistics refresh failed");
+        }
+        else
+        {
+            PersistentIdFixStats::LogStats();
+        }
+
+        g_nextStatisticsLogTime =
+            now +
+            std::chrono::minutes(
+                PersistentIdFixConfig::GetLogIntervalMinutes());
+    }
+
+    void EndSession()
+    {
+        /*
+         * Only perform final local statistics processing when a local persistent-ID
+         * game session was actually active.
+         *
+         * Main-menu/transition worlds such as "Untitled" must not generate a
+         * final statistics log.
+         */
+        if (g_sessionActive)
+        {
+            if (g_statisticsTimerActive)
+            {
+                if (RefreshPersistentIdStatistics())
+                {
+                    PersistentIdFixStats::LogStats();
+                }
+                else
+                {
+                    LOG_WARN(
+                        "PersistentIdFix: final statistics refresh failed at world end");
+                }
+            }
+        }
+
+        g_sessionActive = false;
+
+        g_statisticsTimerActive = false;
+        g_nextStatisticsLogTime = {};
+        g_nextLiveStatisticsRefreshTime = {};
+
+        g_persistentIdSubsystem = nullptr;
+
+        g_persistentIdReuse.Clear();
+        g_reusePoolReady = false;
+
+        PersistentIdFixStats::Reset();
+
+        g_sessionNetMode = EPluginNetMode::Unknown;
+    }
+
+    bool IsSessionActive()
+    {
+        return g_sessionActive;
+    }
+
+    // ---------------------------------------------------------------------------
+    // GetOrAddIDForHandle detour.
+    //
+    // The native function returns FCrMassPersistentEntityID by value. The MSVC
+    // ABI passes the hidden return buffer as the second argument:
+    //
+    //   RCX = subsystem
+    //   RDX = return-value buffer
+    //   R8  = FMassEntityHandle
+    //
+    // Existing handles are resolved directly through the native HandleIDMap
+    // representation. They are not forwarded to the native implementation.
+    //
+    // Only genuinely new handles are allowed to consume an ID from our pool.
+    // If the pool is empty, the native allocation semantics are reproduced
+    // using MaxID and SetIDHandlePair.
+    // ---------------------------------------------------------------------------
+
+    SDK::FCrMassPersistentEntityID* GetOrAddIDForHandleDetour(
+        void* subsystem,
+        SDK::FCrMassPersistentEntityID* returnValue,
+        SDK::FMassEntityHandle handle)
+    {
+        if (returnValue == nullptr)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: GetOrAddIDForHandle return buffer is null");
+
+            return nullptr;
+        }
+
+        *returnValue = {};
+
+        if (subsystem == nullptr)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: GetOrAddIDForHandle subsystem is null");
+
+            return returnValue;
+        }
+
+        /*
+         * Determine whether this process is a remote client.
+         *
+         * Once a concrete game-world role has been established, retain that role for
+         * the lifetime of the world. Runtime NetMode can change during teardown and
+         * must not cause a remote client to enter the local persistent-ID path.
+         *
+         * Before the role has been established, retain the startup fallback because
+         * GetNetMode() can remain Unknown for some time on a remote client.
+         */
+        bool isRemoteClient =
+            (g_sessionNetMode == EPluginNetMode::Client);
+
+        if (g_sessionNetMode == EPluginNetMode::Unknown &&
+            g_systemSelf != nullptr &&
+            g_systemSelf->hooks != nullptr &&
+            g_systemSelf->hooks->NetMode != nullptr)
+        {
+            if (g_systemSelf->hooks->NetMode->GetNetMode != nullptr)
+            {
+                const EPluginNetMode netMode =
+                    g_systemSelf->hooks->NetMode->GetNetMode();
+
+                if (netMode == EPluginNetMode::Client)
+                {
+                    isRemoteClient = true;
+                }
+                else if (netMode == EPluginNetMode::Unknown &&
+                    g_systemSelf->hooks->NetMode->IsServer != nullptr &&
+                    !g_systemSelf->hooks->NetMode->IsServer())
+                {
+                    isRemoteClient = true;
+                }
+            }
+        }
+
+        /*
+         * The native function remains authoritative for remote clients.
+         *
+         * A remote client does not own the persistent-ID state that
+         * PersistentIdFix is intended to manage. In particular, it must not
+         * trigger new-game detection or build a local reuse pool merely because
+         * GetOrAddIDForHandle happens to execute on the client.
+         */
+        if (isRemoteClient)
+        {
+            if (g_originalGetOrAddIDForHandle == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: native GetOrAddIDForHandle is unavailable "
+                    "while running as a remote client");
+
+                return returnValue;
+            }
+
+            return g_originalGetOrAddIDForHandle(
+                subsystem,
+                returnValue,
+                handle);
+        }
+
+        auto* persistentIDSubsystem =
+            static_cast<SDK::UCrMassPersistentIDSubsystem*>(subsystem);
+
+        /*
+         * First reproduce the native HandleIDMap lookup.
+         *
+         * This must happen before allocating anything.
+         */
+        const SDK::FCrMassPersistentEntityID* existingId =
+            FindPersistentIdByHandle(
+                persistentIDSubsystem,
+                handle);
+
+        if (existingId != nullptr)
+        {
+            *returnValue = *existingId;
+            return returnValue;
+        }
+
+        /*
+         * A new game begins with an empty persistent-ID subsystem. StarRupture
+         * starts allocating persistent IDs before OnWorldBeginPlay and without
+         * producing OnSaveLoaded, so the first cache miss while the subsystem is
+         * completely empty is our new-game initialization point.
+         *
+         * The remote-client exclusion above deliberately runs first because
+         * GetNetMode() may still be Unknown during client startup.
+         */
+        if (!g_reusePoolReady &&
+            persistentIDSubsystem->MaxID == 0 &&
+            persistentIDSubsystem->IDHandleMap.Num() == 0)
+        {
+            OnNewGame();
+        }
+
+        /*
+         * On a local multiplayer session, the game can call
+         * GetOrAddIDForHandle before OnSaveLoaded has built the PersistentIdFix
+         * reuse pool. This was observed in the listen-server test:
+         *
+         *     MaxID=1256
+         *     reuse pool not yet built
+         *
+         * During this initialization window the native allocator remains
+         * authoritative. OnSaveLoaded will subsequently inspect the resulting
+         * persistent-ID state and build the reuse pool from it.
+         *
+         * The same fallback also protects us if persistent-ID initialization
+         * unexpectedly has not completed for another local reason.
+         */
+        if (!g_reusePoolReady)
+        {
+            LOG_INFO(
+                "PersistentIdFix: GetOrAddIDForHandle before reuse pool was built; "
+                "delegating to native allocator: handle=(%u,%u) MaxID=%u",
+                handle.Index,
+                handle.SerialNumber,
+                persistentIDSubsystem->MaxID);
+
+            if (g_originalGetOrAddIDForHandle == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: native GetOrAddIDForHandle is unavailable "
+                    "during persistent ID initialization");
+
+                return returnValue;
+            }
+
+            return g_originalGetOrAddIDForHandle(
+                subsystem,
+                returnValue,
+                handle);
+        }
+
+        /*
+         * No existing mapping.
+         *
+         * First consume an ID hole that existed when the save was loaded.
+         */
+        switch (g_persistentIdReuse.TryAllocate(handle, *returnValue))
+        {
+        case PersistentIdAllocationResult::Allocated:
+            PersistentIdFixStats::RecordAssignment();
+            return returnValue;
+
+        case PersistentIdAllocationResult::NoReusableId:
+            break;
+
+        case PersistentIdAllocationResult::Failed:
+            // This is logged inside TryAllocate.
+            return returnValue;
+        }
+
+        /*
+         * No reusable IDs remain.
+         *
+         * Allocate exactly as the native function does.
+         */
+        if (persistentIDSubsystem->MaxID == UINT32_MAX)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: persistent ID space exhausted; "
+                "no reusable IDs remain and MaxID is UINT32_MAX");
+
+            return returnValue;
+        }
+
+        ++persistentIDSubsystem->MaxID;
+
+        SDK::FCrMassPersistentEntityID persistentId{};
+
+        persistentId.ID =
+            persistentIDSubsystem->MaxID;
+
+        persistentId.CachedHandle =
+            handle;
+
+        if (g_setIDHandlePair == nullptr)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: SetIDHandlePair is unavailable");
+
+            return returnValue;
+        }
+
+        if (!g_setIDHandlePair(
+            persistentIDSubsystem,
+            &persistentId,
+            handle))
+        {
+            LOG_ERROR(
+                "PersistentIdFix: SetIDHandlePair failed for new ID %u "
+                "handle=(%u,%u)",
+                persistentId.ID,
+                handle.Index,
+                handle.SerialNumber);
+
+            const uint8_t* map =
+                reinterpret_cast<const uint8_t*>(
+                    &persistentIDSubsystem->HandleIDMap);
+
+            const uint8_t* elementsData =
+                *reinterpret_cast<const uint8_t* const*>(
+                    map + HandleIDMapElementsDataOffset);
+
+            const int32_t elementsNum =
+                *reinterpret_cast<const int32_t*>(
+                    map + HandleIDMapElementsNumOffset);
+
+            bool foundByLinearScan = false;
+
+            if (elementsData != nullptr && elementsNum > 0)
+            {
+                for (int32_t i = 0; i < elementsNum; ++i)
+                {
+                    const uint8_t* element =
+                        elementsData +
+                        static_cast<size_t>(i) *
+                        SetElementStride;
+
+                    const auto* elementHandle =
+                        reinterpret_cast<const SDK::FMassEntityHandle*>(
+                            element + SetElementHandleOffset);
+
+                    if (elementHandle->Index == handle.Index &&
+                        elementHandle->SerialNumber == handle.SerialNumber)
+                    {
+                        const uint32_t existingPersistentId =
+                            *reinterpret_cast<const uint32_t*>(
+                                element + SetElementPersistentIdOffset);
+
+                        LOG_ERROR(
+                            "PersistentIdFix: FAILED allocation handle "
+                            "FOUND by linear scan: "
+                            "element=%d "
+                            "handle=(%u,%u) "
+                            "existingPersistentId=%u "
+                            "elementsNum=%d",
+                            i,
+                            elementHandle->Index,
+                            elementHandle->SerialNumber,
+                            existingPersistentId,
+                            elementsNum);
+
+                        foundByLinearScan = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!foundByLinearScan)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: FAILED allocation handle "
+                    "NOT FOUND by linear scan: "
+                    "handle=(%u,%u) "
+                    "elementsData=%p "
+                    "elementsNum=%d",
+                    handle.Index,
+                    handle.SerialNumber,
+                    elementsData,
+                    elementsNum);
+            }
+
+            return returnValue;
+        }
+
+        *returnValue = persistentId;
+
+        PersistentIdFixStats::RecordAssignment();
+
+        return returnValue;
+    }
+}

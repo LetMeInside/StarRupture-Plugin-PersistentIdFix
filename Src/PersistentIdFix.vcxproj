@@ -104,9 +104,16 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="PersistentIdNativeLookup.h" />
-    <ClInclude Include="PersistentIdReuse.h" />
+    <ClInclude Include="Config\Config.h" />
+    <ClInclude Include="PersistentId\PersistentIdSystem.h" />
+    <ClInclude Include="Network\Network.h" />
+    <ClInclude Include="Stats\Stats.h" />
+    <ClInclude Include="UI\UI.h" />
+    <ClInclude Include="Native\Fingerprints.h" />
+    <ClInclude Include="Native\NativeIdLookup.h" />
+    <ClInclude Include="PersistentId\PersistentIdReuse.h" />
     <ClInclude Include="plugin.h" />
+    <ClInclude Include="plugin_helpers.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="$(StarRuptureSDKSourceDir)Basic.cpp">
@@ -119,11 +126,17 @@
       <Visible>false</Visible>
     </ClCompile>
     <ClCompile Include="dllmain.cpp" />
-    <ClCompile Include="PersistentIdReuse.cpp" />
+    <ClCompile Include="Config\Config.cpp" />
+    <ClCompile Include="PersistentId\PersistentIdSystem.cpp" />
+    <ClCompile Include="Native\Fingerprints.cpp" />
+    <ClCompile Include="Network\Network.cpp" />
+    <ClCompile Include="Stats\Stats.cpp" />
+    <ClCompile Include="UI\UI.cpp" />
+    <ClCompile Include="PersistentId\PersistentIdReuse.cpp" />
     <ClCompile Include="plugin.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="PersistentIdFix.rc" />
+    <ResourceCompile Include="resource.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

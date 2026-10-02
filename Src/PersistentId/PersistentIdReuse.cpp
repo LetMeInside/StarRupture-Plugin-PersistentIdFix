@@ -187,3 +187,9 @@ bool PersistentIdReuse::GetLastRange(
 
     return true;
 }
+
+SDK::UCrMassPersistentIDSubsystem*
+PersistentIdReuse::GetSubsystem() const
+{
+    return subsystem_;
+}
