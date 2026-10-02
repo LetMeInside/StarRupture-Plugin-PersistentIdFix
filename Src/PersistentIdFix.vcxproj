@@ -108,6 +108,7 @@
     <ClInclude Include="Network\Network.h" />
     <ClInclude Include="Stats\Stats.h" />
     <ClInclude Include="UI\UI.h" />
+    <ClInclude Include="Native\Fingerprints.h" />
     <ClInclude Include="Native\NativeIdLookup.h" />
     <ClInclude Include="PersistentIdReuse.h" />
     <ClInclude Include="plugin.h" />
@@ -125,6 +126,7 @@
     </ClCompile>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="Config\Config.cpp" />
+    <ClCompile Include="Native\Fingerprints.cpp" />
     <ClCompile Include="Network\Network.cpp" />
     <ClCompile Include="Stats\Stats.cpp" />
     <ClCompile Include="UI\UI.cpp" />
