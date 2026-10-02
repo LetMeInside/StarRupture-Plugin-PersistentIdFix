@@ -10,13 +10,14 @@
 #endif
 
 #include <cstdint>
-#include <chrono>
 
 IPluginSelf* g_self = nullptr;
 IPluginSelf* GetSelf() { return g_self; }
 
 static HookHandle g_getOrAddIDForHandleHook = nullptr;
-static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr; // Not actively used, but is an SDK requirement.
+
+// SDK hook output; passed to PersistentIdFixSystem for native delegation.
+static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
 
 static uintptr_t g_getOrAddIDForHandleAddress = 0;
 
@@ -221,12 +222,12 @@ static void OnAfterWorldEndPlay(
 
 #ifdef MODLOADER_CLIENT_BUILD
     /*
-     * The UI belongs to the game world, not to g_gameSessionActive.
+     * The UI belongs to the game world, not to the local persistent-ID session.
      *
      * A remote client can have a visible statistics window without ever
-     * setting g_gameSessionActive because the server owns the persistent-ID
-     * subsystem. Therefore the UI must also be hidden when the game world
-     * ends on a remote client.
+     * creating a local persistent-ID session because the server owns the
+     * persistent-ID subsystem. Therefore the UI must also be hidden when the
+     * game world ends on a remote client.
      *
      * PersistentIdFixNetwork::ResetSession() has already happened above, so
      * Hide() will not attempt to send a subscription packet for the ended
@@ -306,8 +307,6 @@ extern "C"
 #ifdef MODLOADER_CLIENT_BUILD
         bool bInitUI = false;
 #endif
-
-        bool bInitEngineTick = false;
 
         while (true)
         {
@@ -472,8 +471,6 @@ extern "C"
             LOG_INFO(
                 "PersistentIdFix: registered OnTick callback");
 
-            bInitEngineTick = true;
-
             LOG_INFO(
                 "PersistentIdFix: initialization complete");
 
@@ -486,16 +483,6 @@ extern "C"
         // Unwind everything that was successfully initialized,
         // in reverse initialization order.
         //
-
-        if (bInitEngineTick)
-        {
-            //
-            // There is currently no Engine::UnregisterOnTick() call
-            // in the existing code, so there is nothing to unwind here.
-            // Keep the flag because the initialization step is still
-            // explicitly tracked and can be made reversible later.
-            //
-        }
 
 #ifdef MODLOADER_CLIENT_BUILD
 

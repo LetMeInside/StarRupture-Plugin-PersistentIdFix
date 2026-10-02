@@ -493,9 +493,9 @@ namespace PersistentIdFixNetwork
 
         /*
          * This is intentionally the first point where we ask IsServer().
-         * OnTick calls BeginSession() only after IsGameSessionActive()
-         * becomes true, so listen-host role detection happens at the
-         * correct lifecycle point.
+         * Plugin orchestration calls BeginSession() only after the game world
+         * becomes active, so listen-host role detection happens at the correct
+         * lifecycle point.
          */
         if (g_networkSelf->hooks->Network->IsServer == nullptr)
         {
