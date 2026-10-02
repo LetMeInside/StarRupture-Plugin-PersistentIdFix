@@ -4,7 +4,7 @@
 #include "PersistentIdNativeLookup.h"
 #include "Stats/Stats.h"
 #include "Config/Config.h"
-#include "PersistentIdFixNetwork.h"
+#include "Network/Network.h"
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "PersistentIdFixUI.h"

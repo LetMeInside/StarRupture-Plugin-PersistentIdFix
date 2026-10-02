@@ -105,7 +105,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Config\Config.h" />
-    <ClInclude Include="PersistentIdFixNetwork.h" />
+    <ClInclude Include="Network\Network.h" />
     <ClInclude Include="Stats\Stats.h" />
     <ClInclude Include="PersistentIdFixUI.h" />
     <ClInclude Include="PersistentIdNativeLookup.h" />
@@ -125,7 +125,7 @@
     </ClCompile>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="Config\Config.cpp" />
-    <ClCompile Include="PersistentIdFixNetwork.cpp" />
+    <ClCompile Include="Network\Network.cpp" />
     <ClCompile Include="Stats\Stats.cpp" />
     <ClCompile Include="PersistentIdFixUI.cpp" />
     <ClCompile Include="PersistentIdReuse.cpp" />
