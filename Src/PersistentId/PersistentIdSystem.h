@@ -11,6 +11,8 @@ namespace PersistentIdFixSystem
 
     void Reset();
 
+    void SetSessionNetMode(EPluginNetMode netMode);
+
     void OnSaveLoaded();
 
     void Tick();

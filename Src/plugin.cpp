@@ -61,6 +61,11 @@ static void OnTick(
     const EPluginNetMode netMode =
         g_self->hooks->NetMode->GetNetMode();
 
+    if (g_gameWorldActive)
+    {
+        PersistentIdFixSystem::SetSessionNetMode(netMode);
+    }
+
     /*
      * -----------------------------------------------------------------------
      * Network session lifecycle.
@@ -122,6 +127,7 @@ static void OnWorldBeginPlay(SDK::UWorld* world)
 
     const EPluginNetMode netMode =
         g_self->hooks->NetMode->GetNetMode();
+    PersistentIdFixSystem::SetSessionNetMode(netMode);
 
     LOG_INFO(
         "PersistentIdFix: OnWorldBeginPlay NetMode = %u",

@@ -27,9 +27,27 @@ namespace
     static bool g_reusePoolReady = false;
     static bool g_sessionActive = false;
 
+    static EPluginNetMode g_sessionNetMode = EPluginNetMode::Unknown;
+
     static std::chrono::steady_clock::time_point g_nextStatisticsLogTime{};
     static std::chrono::steady_clock::time_point g_nextLiveStatisticsRefreshTime{};
     static bool g_statisticsTimerActive = false;
+
+    static EPluginNetMode GetEffectiveSessionNetMode()
+    {
+        if (g_sessionNetMode != EPluginNetMode::Unknown)
+            return g_sessionNetMode;
+
+        if (g_systemSelf == nullptr ||
+            g_systemSelf->hooks == nullptr ||
+            g_systemSelf->hooks->NetMode == nullptr ||
+            g_systemSelf->hooks->NetMode->GetNetMode == nullptr)
+        {
+            return EPluginNetMode::Unknown;
+        }
+
+        return g_systemSelf->hooks->NetMode->GetNetMode();
+    }
 
     // ---------------------------------------------------------------------------
     // Persistent-ID subsystem initialisation.
@@ -198,39 +216,31 @@ namespace
         g_persistentIdReuse.BuildPool();
         g_reusePoolReady = true;
 
-        if (g_systemSelf->hooks->NetMode != nullptr &&
-            g_systemSelf->hooks->NetMode->GetNetMode != nullptr)
-        {
-            PersistentIdFixStats::UpdateSnapshot(
-                g_systemSelf->hooks->NetMode->GetNetMode(),
-                static_cast<uint32_t>(
-                    subsystem->IDHandleMap.Num()),
-                loadedMaxID,
-                g_persistentIdReuse.GetReusableIDCount(),
-                static_cast<uint64_t>(
-                    g_persistentIdReuse.GetRangeCount()));
-        }
+        const EPluginNetMode netMode =
+            GetEffectiveSessionNetMode();
+
+        PersistentIdFixStats::UpdateSnapshot(
+            netMode,
+            static_cast<uint32_t>(
+                subsystem->IDHandleMap.Num()),
+            loadedMaxID,
+            g_persistentIdReuse.GetReusableIDCount(),
+            static_cast<uint64_t>(
+                g_persistentIdReuse.GetRangeCount()));
 
         g_persistentIdSubsystem = subsystem;
         g_sessionActive = true;
 
-        if (g_systemSelf->hooks->NetMode != nullptr &&
-            g_systemSelf->hooks->NetMode->GetNetMode != nullptr)
+        if (netMode == EPluginNetMode::Standalone ||
+            netMode == EPluginNetMode::ListenServer ||
+            netMode == EPluginNetMode::DedicatedServer)
         {
-            const EPluginNetMode netMode =
-                g_systemSelf->hooks->NetMode->GetNetMode();
+            g_nextStatisticsLogTime =
+                std::chrono::steady_clock::now() +
+                std::chrono::minutes(
+                    PersistentIdFixConfig::GetLogIntervalMinutes());
 
-            if (netMode == EPluginNetMode::Standalone ||
-                netMode == EPluginNetMode::ListenServer ||
-                netMode == EPluginNetMode::DedicatedServer)
-            {
-                g_nextStatisticsLogTime =
-                    std::chrono::steady_clock::now() +
-                    std::chrono::minutes(
-                        PersistentIdFixConfig::GetLogIntervalMinutes());
-
-                g_statisticsTimerActive = true;
-            }
+            g_statisticsTimerActive = true;
         }
 
         return true;
@@ -244,16 +254,8 @@ namespace
         if (g_persistentIdSubsystem == nullptr)
             return false;
 
-        if (g_systemSelf == nullptr ||
-            g_systemSelf->hooks == nullptr ||
-            g_systemSelf->hooks->NetMode == nullptr ||
-            g_systemSelf->hooks->NetMode->GetNetMode == nullptr)
-        {
-            return false;
-        }
-
         PersistentIdFixStats::UpdateSnapshot(
-            g_systemSelf->hooks->NetMode->GetNetMode(),
+            GetEffectiveSessionNetMode(),
             static_cast<std::uint32_t>(
                 g_persistentIdSubsystem->IDHandleMap.Num()),
             g_persistentIdSubsystem->MaxID,
@@ -313,6 +315,7 @@ namespace PersistentIdFixSystem
         g_persistentIdSubsystem = nullptr;
         g_reusePoolReady = false;
         g_sessionActive = false;
+        g_sessionNetMode = EPluginNetMode::Unknown;
 
         g_statisticsTimerActive = false;
         g_nextStatisticsLogTime = {};
@@ -323,6 +326,20 @@ namespace PersistentIdFixSystem
         g_setIDHandlePair = nullptr;
         g_originalGetOrAddIDForHandle = nullptr;
         g_systemSelf = nullptr;
+    }
+
+    void SetSessionNetMode(EPluginNetMode netMode)
+    {
+        if (g_sessionNetMode != EPluginNetMode::Unknown)
+            return;
+
+        if (netMode == EPluginNetMode::Standalone ||
+            netMode == EPluginNetMode::ListenServer ||
+            netMode == EPluginNetMode::DedicatedServer ||
+            netMode == EPluginNetMode::Client)
+        {
+            g_sessionNetMode = netMode;
+        }
     }
 
     void OnSaveLoaded()
@@ -488,6 +505,8 @@ namespace PersistentIdFixSystem
         g_reusePoolReady = false;
 
         PersistentIdFixStats::Reset();
+
+        g_sessionNetMode = EPluginNetMode::Unknown;
     }
 
     bool IsSessionActive()
@@ -539,16 +558,18 @@ namespace PersistentIdFixSystem
         /*
          * Determine whether this process is a remote client.
          *
-         * During actual client-world startup GetNetMode() can remain Unknown
-         * for some time. In that state, IsServer() provides the additional
-         * information needed to distinguish a remote client from a server.
+         * Once a concrete game-world role has been established, retain that role for
+         * the lifetime of the world. Runtime NetMode can change during teardown and
+         * must not cause a remote client to enter the local persistent-ID path.
          *
-         * Do not treat Unknown by itself as Client: Solo and listen-server
-         * startup can also pass through Unknown.
+         * Before the role has been established, retain the startup fallback because
+         * GetNetMode() can remain Unknown for some time on a remote client.
          */
-        bool isRemoteClient = false;
+        bool isRemoteClient =
+            (g_sessionNetMode == EPluginNetMode::Client);
 
-        if (g_systemSelf != nullptr &&
+        if (g_sessionNetMode == EPluginNetMode::Unknown &&
+            g_systemSelf != nullptr &&
             g_systemSelf->hooks != nullptr &&
             g_systemSelf->hooks->NetMode != nullptr)
         {
