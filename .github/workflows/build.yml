@@ -25,9 +25,6 @@ env:
   CLIENT_CONFIGURATION: Client Release
   SERVER_CONFIGURATION: Server Release
 
-  CLIENT_DLL: bin/x64/Client Release/plugins/PersistentIdFix.dll
-  SERVER_DLL: bin/x64/Server Release/plugins/PersistentIdFix.dll
-
 jobs:
   build:
     name: Build Client and Server
@@ -41,21 +38,63 @@ jobs:
         uses: actions/checkout@v4
 
       # --------------------------------------------------------
+      # Show exactly what is being built
+      # --------------------------------------------------------
+      - name: Show build revision
+        shell: pwsh
+        run: |
+          Write-Host "Repository : $env:GITHUB_REPOSITORY"
+          Write-Host "Ref        : $env:GITHUB_REF"
+          Write-Host "Commit     : $env:GITHUB_SHA"
+          Write-Host "Workspace  : $env:GITHUB_WORKSPACE"
+
+      # --------------------------------------------------------
       # Checkout SDK at the exact location expected by
       # PersistentIdFix.props:
       #
       # $(SolutionDir)..\..\StarRupture-Plugin-SDK\
       #
-      # Because the repository root is Solution\, this becomes:
+      # The GitHub repository contents are checked out directly
+      # into GITHUB_WORKSPACE.
       #
-      # <workspace>\StarRupture-Plugin-SDK\
+      # Therefore:
+      #
+      #   SolutionDir
+      #       = <workspace>
+      #
+      # and the SDK must be:
+      #
+      #   <workspace>\..\..\StarRupture-Plugin-SDK\
+      #
+      # This mirrors the directory relationship used locally.
       # --------------------------------------------------------
       - name: Checkout StarRupture Plugin SDK
         uses: actions/checkout@v4
         with:
           repository: AlienXAXS/StarRupture-Plugin-SDK
-          path: StarRupture-Plugin-SDK
+          path: ../../StarRupture-Plugin-SDK
+          allow-path-outside-workspace: true
           submodules: recursive
+
+      # --------------------------------------------------------
+      # Verify the expected SDK location
+      # --------------------------------------------------------
+      - name: Verify SDK location
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path $env:GITHUB_WORKSPACE `
+            "..\..\StarRupture-Plugin-SDK"
+
+          $sdkRoot = [System.IO.Path]::GetFullPath($sdkRoot)
+
+          Write-Host "Expected SDK location:"
+          Write-Host $sdkRoot
+
+          if (-not (Test-Path $sdkRoot)) {
+            throw "StarRupture Plugin SDK was not found at: $sdkRoot"
+          }
+
+          Write-Host "SDK location verified."
 
       # --------------------------------------------------------
       # MSBuild
@@ -143,7 +182,10 @@ jobs:
       - name: Read ModLoader interface version
         shell: pwsh
         run: |
-          $sdkRoot = Join-Path $env:GITHUB_WORKSPACE "StarRupture-Plugin-SDK"
+          $sdkRoot = Join-Path $env:GITHUB_WORKSPACE `
+            "..\..\StarRupture-Plugin-SDK"
+
+          $sdkRoot = [System.IO.Path]::GetFullPath($sdkRoot)
 
           $interfaceHeader = Get-ChildItem `
             -Path $sdkRoot `
@@ -227,11 +269,15 @@ jobs:
       - name: Verify build outputs
         shell: pwsh
         run: |
-          $clientDll = Join-Path $env:GITHUB_WORKSPACE $env:CLIENT_DLL
+          $clientDll = Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
+
           $clientPdb = Join-Path $env:GITHUB_WORKSPACE `
             "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb"
 
-          $serverDll = Join-Path $env:GITHUB_WORKSPACE $env:SERVER_DLL
+          $serverDll = Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
+
           $serverPdb = Join-Path $env:GITHUB_WORKSPACE `
             "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb"
 
@@ -251,12 +297,19 @@ jobs:
 
       # --------------------------------------------------------
       # Verify DLL embedded version resources
+      #
+      # Windows commonly exposes the resource as four components,
+      # e.g. 0.2.0.0, while our project version is 0.2.0.
+      # Normalize both to three components before comparing.
       # --------------------------------------------------------
       - name: Verify DLL version resources
         shell: pwsh
         run: |
-          $clientDll = Join-Path $env:GITHUB_WORKSPACE $env:CLIENT_DLL
-          $serverDll = Join-Path $env:GITHUB_WORKSPACE $env:SERVER_DLL
+          $clientDll = Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
+
+          $serverDll = Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
 
           foreach ($dll in @($clientDll, $serverDll)) {
             $versionInfo = (Get-Item $dll).VersionInfo
@@ -266,12 +319,18 @@ jobs:
             Write-Host "FileVersion: $($versionInfo.FileVersion)"
             Write-Host "ProductVersion: $($versionInfo.ProductVersion)"
 
-            if ($versionInfo.FileVersion -ne $env:VERSION) {
-              throw "DLL FileVersion mismatch: expected $env:VERSION but found $($versionInfo.FileVersion)"
+            $fileVersion = $versionInfo.FileVersion.Trim()
+            $productVersion = $versionInfo.ProductVersion.Trim()
+
+            $fileVersionNormalized = ($fileVersion -split '\.')[0..2] -join '.'
+            $productVersionNormalized = ($productVersion -split '\.')[0..2] -join '.'
+
+            if ($fileVersionNormalized -ne $env:VERSION) {
+              throw "DLL FileVersion mismatch: expected $env:VERSION but found $fileVersion"
             }
 
-            if ($versionInfo.ProductVersion -ne $env:VERSION) {
-              throw "DLL ProductVersion mismatch: expected $env:VERSION but found $($versionInfo.ProductVersion)"
+            if ($productVersionNormalized -ne $env:VERSION) {
+              throw "DLL ProductVersion mismatch: expected $env:VERSION but found $productVersion"
             }
           }
 
@@ -343,15 +402,21 @@ jobs:
       - name: Stage Client package
         shell: pwsh
         run: |
-          $package = Join-Path $env:GITHUB_WORKSPACE "package\Client\Plugins"
+          $package = Join-Path $env:GITHUB_WORKSPACE `
+            "package\Client\Plugins"
+
+          $clientDll = Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
+
+          $clientPdb = Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb"
 
           Copy-Item `
-            (Join-Path $env:GITHUB_WORKSPACE $env:CLIENT_DLL) `
+            $clientDll `
             (Join-Path $package "$env:PLUGIN_NAME.dll")
 
           Copy-Item `
-            (Join-Path $env:GITHUB_WORKSPACE `
-              "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb") `
+            $clientPdb `
             (Join-Path $package "$env:PLUGIN_NAME.pdb")
 
       # --------------------------------------------------------
@@ -360,15 +425,21 @@ jobs:
       - name: Stage Server package
         shell: pwsh
         run: |
-          $package = Join-Path $env:GITHUB_WORKSPACE "package\Server\Plugins"
+          $package = Join-Path $env:GITHUB_WORKSPACE `
+            "package\Server\Plugins"
+
+          $serverDll = Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
+
+          $serverPdb = Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb"
 
           Copy-Item `
-            (Join-Path $env:GITHUB_WORKSPACE $env:SERVER_DLL) `
+            $serverDll `
             (Join-Path $package "$env:PLUGIN_NAME.dll")
 
           Copy-Item `
-            (Join-Path $env:GITHUB_WORKSPACE `
-              "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb") `
+            $serverPdb `
             (Join-Path $package "$env:PLUGIN_NAME.pdb")
 
       # --------------------------------------------------------
@@ -430,7 +501,9 @@ jobs:
       - name: Create Client ZIP
         shell: pwsh
         run: |
-          $package = Join-Path $env:GITHUB_WORKSPACE "package\Client\Plugins"
+          $package = Join-Path $env:GITHUB_WORKSPACE `
+            "package\Client\Plugins"
+
           $zip = Join-Path $env:GITHUB_WORKSPACE `
             "$env:PLUGIN_NAME-Client-v$env:VERSION.zip"
 
@@ -447,7 +520,9 @@ jobs:
       - name: Create Server ZIP
         shell: pwsh
         run: |
-          $package = Join-Path $env:GITHUB_WORKSPACE "package\Server\Plugins"
+          $package = Join-Path $env:GITHUB_WORKSPACE `
+            "package\Server\Plugins"
+
           $zip = Join-Path $env:GITHUB_WORKSPACE `
             "$env:PLUGIN_NAME-Server-v$env:VERSION.zip"
 
@@ -503,7 +578,10 @@ jobs:
           $serverSidecar = Join-Path $root `
             "package\Server\Plugins\$env:PLUGIN_NAME.json"
 
-          foreach ($file in @($clientSidecar, $serverSidecar)) {
+          foreach ($file in @(
+            $clientSidecar,
+            $serverSidecar
+          )) {
             if (-not (Test-Path $file)) {
               throw "Sidecar not found: $file"
             }
@@ -515,6 +593,39 @@ jobs:
             }
 
             Write-Host "$($file): $($json.manifest_url)"
+          }
+
+          $clientManifestJson =
+            Get-Content $clientManifest -Raw | ConvertFrom-Json
+
+          $serverManifestJson =
+            Get-Content $serverManifest -Raw | ConvertFrom-Json
+
+          foreach ($manifest in @(
+            $clientManifestJson,
+            $serverManifestJson
+          )) {
+            if ($manifest.plugin_name -ne $env:PLUGIN_NAME) {
+              throw "Manifest plugin_name mismatch"
+            }
+
+            if ($manifest.version -ne $env:VERSION) {
+              throw "Manifest version mismatch"
+            }
+
+            if ($manifest.interface_version_min -ne [int]$env:INTERFACE_VERSION_MIN) {
+              throw "Manifest interface_version_min mismatch"
+            }
+
+            if ($manifest.interface_version_max -ne [int]$env:INTERFACE_VERSION_MAX) {
+              throw "Manifest interface_version_max mismatch"
+            }
+
+            if (-not $manifest.download_url) {
+              throw "Manifest has no download_url"
+            }
+
+            Write-Host "Verified release manifest for $($manifest.plugin_name) $($manifest.version)"
           }
 
       # --------------------------------------------------------
