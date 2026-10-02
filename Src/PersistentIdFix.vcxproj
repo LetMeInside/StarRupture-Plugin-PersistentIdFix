@@ -134,7 +134,7 @@
     <ClCompile Include="plugin.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="PersistentIdFix.rc" />
+    <ResourceCompile Include="resource.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
