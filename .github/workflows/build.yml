@@ -179,8 +179,7 @@ jobs:
       - name: Read ModLoader interface version
         shell: pwsh
         run: |
-          $sdkRoot = Join-Path $env:GITHUB_WORKSPACE `
-            "..\..\StarRupture-Plugin-SDK"
+          $sdkRoot = Join-Path $env:GITHUB_WORKSPACE "plugin-sdk"
 
           $sdkRoot = [System.IO.Path]::GetFullPath($sdkRoot)
 
