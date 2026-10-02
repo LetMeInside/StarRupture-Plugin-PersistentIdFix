@@ -2,7 +2,9 @@
 
 #include "plugin_helpers.h"
 
+#ifdef MODLOADER_CLIENT_BUILD
 #include <cstring>
+#endif
 
 namespace
 {
@@ -16,14 +18,16 @@ namespace
             "Interval in minutes between statistics log entries",
             1,
             60
-        },
-        {
+        }
+#ifdef MODLOADER_CLIENT_BUILD
+        , {
             "UI",
             "UIToggleKey",
             ConfigValueType::Keybind,
             "F3",
             "Keyboard key used to toggle the statistics UI"
         }
+#endif
     };
 
     static const ConfigSchema SCHEMA =
@@ -35,7 +39,9 @@ namespace
     int g_logIntervalMinutes =
         PersistentIdFixConfig::DefaultLogIntervalMinutes;
 
+#ifdef MODLOADER_CLIENT_BUILD
     char g_uiToggleKey[64] = "F3";
+#endif
 }
 
 namespace PersistentIdFixConfig
@@ -82,6 +88,7 @@ namespace PersistentIdFixConfig
             g_logIntervalMinutes = DefaultLogIntervalMinutes;
         }
 
+#ifdef MODLOADER_CLIENT_BUILD
         self->config->ReadString(
             self,
             "UI",
@@ -101,6 +108,7 @@ namespace PersistentIdFixConfig
                 sizeof(g_uiToggleKey),
                 DefaultUIToggleKey);
         }
+#endif
 
         LOG_INFO(
             "PersistentIdFix: configuration initialized");
@@ -109,9 +117,11 @@ namespace PersistentIdFixConfig
             "PersistentIdFix: LogIntervalMinutes = %d",
             g_logIntervalMinutes);
 
+#ifdef MODLOADER_CLIENT_BUILD
         LOG_INFO(
             "PersistentIdFix: UIToggleKey = %s",
             g_uiToggleKey);
+#endif
 
         return true;
     }
@@ -121,8 +131,10 @@ namespace PersistentIdFixConfig
         return g_logIntervalMinutes;
     }
 
+#ifdef MODLOADER_CLIENT_BUILD
     const char* GetUIToggleKey()
     {
         return g_uiToggleKey;
     }
+#endif
 }
