@@ -18,8 +18,6 @@ bool (*)(
     SDK::FCrMassPersistentEntityID* persistentId,
     SDK::FMassEntityHandle handle);
 
-bool IsGameSessionActive();
-
 extern "C"
 {
     __declspec(dllexport) PluginInfo* GetPluginInfo();

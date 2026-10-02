@@ -3,6 +3,7 @@
 #include "UI.h"
 #include "Config/Config.h"
 #include "Network/Network.h"
+#include "PersistentId/PersistentIdSystem.h"
 #include "Stats/Stats.h"
 #include "plugin.h"
 #include "plugin_helpers.h"
@@ -501,7 +502,7 @@ namespace PersistentIdFixUI
 		 * Their UI is backed entirely by the remote network session instead.
 		 */
 		const bool localSessionActive =
-			IsGameSessionActive();
+			PersistentIdFixSystem::IsSessionActive();
 
 		const bool remoteSessionActive =
 			netMode == EPluginNetMode::Client &&
