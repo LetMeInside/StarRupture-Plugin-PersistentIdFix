@@ -11,6 +11,7 @@
 #include "UI/UI.h"
 #endif
 
+#include <algorithm>
 #include <cstdint>
 #include <chrono>
 #include <mutex>
@@ -22,6 +23,12 @@ namespace
 
     static PersistentIdReuse g_persistentIdReuse;
     static SDK::UCrMassPersistentIDSubsystem* g_persistentIdSubsystem = nullptr;
+
+    // Snapshot of IDs present in IDHandleMap when the authoritative
+    // session was initialized. This intentionally remains stable for
+    // the session so IDs freed later are never treated as reusable.
+    static std::vector<std::uint32_t> g_loadedHandleIds;
+    static std::uint32_t g_loadedHighWater = 0;
 
     static SetIDHandlePairFn g_setIDHandlePair = nullptr;
     static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
@@ -146,6 +153,8 @@ namespace
         g_persistentIdReuse.Clear();
         g_reusePoolReady = false;
         g_persistentIdSubsystem = nullptr;
+        g_loadedHandleIds.clear();
+        g_loadedHighWater = 0;
 
         g_statisticsTimerActive = false;
         g_nextStatisticsLogTime = {};
@@ -209,15 +218,40 @@ namespace
         uint32_t minId = UINT32_MAX;
         uint32_t maxCurrentId = 0;
 
-        for (const auto& pair : subsystem->IDHandleMap)
+        try
         {
-            const uint32_t id = pair.Key().ID;
+            g_loadedHandleIds.reserve(
+                static_cast<std::size_t>(subsystem->IDHandleMap.Num()));
 
-            if (id < minId)
-                minId = id;
+            for (const auto& pair : subsystem->IDHandleMap)
+            {
+                const uint32_t id = pair.Key().ID;
 
-            if (id > maxCurrentId)
-                maxCurrentId = id;
+                g_loadedHandleIds.push_back(id);
+
+                if (id < minId)
+                    minId = id;
+
+                if (id > maxCurrentId)
+                    maxCurrentId = id;
+            }
+
+            std::sort(
+                g_loadedHandleIds.begin(),
+                g_loadedHandleIds.end());
+
+            g_loadedHandleIds.erase(
+                std::unique(
+                    g_loadedHandleIds.begin(),
+                    g_loadedHandleIds.end()),
+                g_loadedHandleIds.end());
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: failed to capture loaded IDHandleMap snapshot");
+            g_loadedHandleIds.clear();
+            return false;
         }
 
         uint64_t maxId = 0;
@@ -285,6 +319,8 @@ namespace
 
         const uint32_t loadedMaxID =
             static_cast<uint32_t>(maxId);
+
+        g_loadedHighWater = loadedMaxID;
 
         // Build the reusable pool from holes below the loaded high-water mark.
         g_persistentIdReuse.Initialize(
@@ -391,6 +427,8 @@ namespace PersistentIdFixSystem
     {
         g_persistentIdReuse.Clear();
         g_persistentIdSubsystem = nullptr;
+        g_loadedHandleIds.clear();
+        g_loadedHighWater = 0;
         g_reusePoolReady = false;
         g_sessionActive = false;
         g_sessionNetMode = EPluginNetMode::Unknown;
@@ -473,6 +511,191 @@ namespace PersistentIdFixSystem
             static_cast<unsigned long long>(snapshot.currentSubsystemBurned),
             static_cast<unsigned long long>(snapshot.foreignSubsystemAssigned),
             static_cast<unsigned long long>(snapshot.foreignSubsystemBurned));
+    }
+
+    CandidatePoolDiagnostic BuildCandidatePoolDiagnostic(
+        std::uint64_t loadGeneration,
+        const std::vector<std::uint32_t>& sourceProtectedIds)
+    {
+        CandidatePoolDiagnostic diagnostic;
+        diagnostic.loadGeneration = loadGeneration;
+
+        if (!g_sessionActive ||
+            g_persistentIdSubsystem == nullptr ||
+            !g_reusePoolReady ||
+            g_loadedHighWater == 0)
+        {
+            LOG_WARN(
+                "PersistentIdFix: candidate-pool diagnostic unavailable: authoritative session state is incomplete");
+            return diagnostic;
+        }
+
+        std::vector<std::uint32_t> ledgerProtected;
+
+        {
+            std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
+
+            if (!g_assignmentLedgerHealthy ||
+                g_assignmentLedgerGeneration != loadGeneration)
+            {
+                LOG_WARN(
+                    "PersistentIdFix: candidate-pool diagnostic unavailable: assignment ledger generation/health mismatch");
+                return diagnostic;
+            }
+
+            try
+            {
+                ledgerProtected.reserve(g_assignmentLedger.size());
+
+                for (const LedgerEntry& entry : g_assignmentLedger)
+                {
+                    if (entry.subsystem == g_persistentIdSubsystem)
+                    {
+                        ledgerProtected.push_back(entry.id);
+                    }
+                }
+            }
+            catch (...)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: candidate-pool diagnostic failed while copying assignment ledger");
+                return diagnostic;
+            }
+        }
+
+        std::vector<std::uint32_t> blocked;
+
+        try
+        {
+            blocked.reserve(
+                g_loadedHandleIds.size() +
+                sourceProtectedIds.size() +
+                ledgerProtected.size());
+
+            blocked.insert(
+                blocked.end(),
+                g_loadedHandleIds.begin(),
+                g_loadedHandleIds.end());
+
+            blocked.insert(
+                blocked.end(),
+                sourceProtectedIds.begin(),
+                sourceProtectedIds.end());
+
+            blocked.insert(
+                blocked.end(),
+                ledgerProtected.begin(),
+                ledgerProtected.end());
+
+            blocked.erase(
+                std::remove_if(
+                    blocked.begin(),
+                    blocked.end(),
+                    [](std::uint32_t id)
+                    {
+                        return id == 0 ||
+                            id == UINT32_MAX ||
+                            id >= g_loadedHighWater;
+                    }),
+                blocked.end());
+
+            std::sort(blocked.begin(), blocked.end());
+            blocked.erase(
+                std::unique(blocked.begin(), blocked.end()),
+                blocked.end());
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: candidate-pool diagnostic failed while staging blocked IDs");
+            return diagnostic;
+        }
+
+        std::uint64_t sourceOnlyBlocked = 0;
+
+        for (const std::uint32_t id : sourceProtectedIds)
+        {
+            if (id == 0 ||
+                id == UINT32_MAX ||
+                id >= g_loadedHighWater)
+            {
+                continue;
+            }
+
+            if (!std::binary_search(
+                    g_loadedHandleIds.begin(),
+                    g_loadedHandleIds.end(),
+                    id))
+            {
+                ++sourceOnlyBlocked;
+            }
+        }
+
+        // sourceProtectedIds is already deduplicated by G1, so the
+        // source-only count does not require another uniqueness pass.
+
+        std::uint64_t candidateReusable = 0;
+        std::uint64_t candidateRanges = 0;
+        std::uint32_t nextId = 1;
+
+        for (const std::uint32_t blockedId : blocked)
+        {
+            if (nextId < blockedId)
+            {
+                candidateReusable +=
+                    static_cast<std::uint64_t>(blockedId) -
+                    static_cast<std::uint64_t>(nextId);
+                ++candidateRanges;
+            }
+
+            if (blockedId >= nextId)
+                nextId = blockedId + 1u;
+        }
+
+        if (nextId < g_loadedHighWater)
+        {
+            candidateReusable +=
+                static_cast<std::uint64_t>(g_loadedHighWater) -
+                static_cast<std::uint64_t>(nextId);
+            ++candidateRanges;
+        }
+
+        diagnostic.valid = true;
+        diagnostic.loadedHighWater = g_loadedHighWater;
+        diagnostic.loadedHandleIds =
+            static_cast<std::uint64_t>(g_loadedHandleIds.size());
+        diagnostic.sourceProtectedIds =
+            static_cast<std::uint64_t>(sourceProtectedIds.size());
+        diagnostic.ledgerProtectedIds =
+            static_cast<std::uint64_t>(ledgerProtected.size());
+        diagnostic.blockedUniqueIds =
+            static_cast<std::uint64_t>(blocked.size());
+        diagnostic.sourceOnlyBlockedIds = sourceOnlyBlocked;
+        diagnostic.candidateReusableIds = candidateReusable;
+        diagnostic.candidateRanges = candidateRanges;
+        diagnostic.legacyReusableIds =
+            g_persistentIdReuse.GetReusableIDCount();
+        diagnostic.legacyRanges =
+            static_cast<std::uint64_t>(
+                g_persistentIdReuse.GetRangeCount());
+
+        LOG_INFO(
+            "PersistentIdFix: candidate pool diagnostic: generation=%llu highWater=%u loadedH=%llu sourceProtected=%llu ledgerProtected=%llu blockedUnique=%llu sourceOnlyBlocked=%llu candidateReusable=%llu candidateRanges=%llu legacyReusable=%llu legacyRanges=%llu deltaReusable=%lld",
+            static_cast<unsigned long long>(diagnostic.loadGeneration),
+            diagnostic.loadedHighWater,
+            static_cast<unsigned long long>(diagnostic.loadedHandleIds),
+            static_cast<unsigned long long>(diagnostic.sourceProtectedIds),
+            static_cast<unsigned long long>(diagnostic.ledgerProtectedIds),
+            static_cast<unsigned long long>(diagnostic.blockedUniqueIds),
+            static_cast<unsigned long long>(diagnostic.sourceOnlyBlockedIds),
+            static_cast<unsigned long long>(diagnostic.candidateReusableIds),
+            static_cast<unsigned long long>(diagnostic.candidateRanges),
+            static_cast<unsigned long long>(diagnostic.legacyReusableIds),
+            static_cast<unsigned long long>(diagnostic.legacyRanges),
+            static_cast<long long>(diagnostic.legacyReusableIds) -
+                static_cast<long long>(diagnostic.candidateReusableIds));
+
+        return diagnostic;
     }
 
     void SetSessionNetMode(EPluginNetMode netMode)
@@ -652,6 +875,8 @@ namespace PersistentIdFixSystem
         g_nextLiveStatisticsRefreshTime = {};
 
         g_persistentIdSubsystem = nullptr;
+        g_loadedHandleIds.clear();
+        g_loadedHighWater = 0;
 
         g_persistentIdReuse.Clear();
         g_reusePoolReady = false;

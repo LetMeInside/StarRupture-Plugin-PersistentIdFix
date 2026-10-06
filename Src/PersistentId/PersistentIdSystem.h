@@ -2,6 +2,8 @@
 
 #include "plugin.h"
 
+#include <vector>
+
 namespace PersistentIdFixSystem
 {
     struct AssignmentLedgerSnapshot
@@ -14,6 +16,22 @@ namespace PersistentIdFixSystem
         std::uint64_t currentSubsystemBurned = 0;
         std::uint64_t foreignSubsystemAssigned = 0;
         std::uint64_t foreignSubsystemBurned = 0;
+    };
+
+    struct CandidatePoolDiagnostic
+    {
+        bool valid = false;
+        std::uint64_t loadGeneration = 0;
+        std::uint32_t loadedHighWater = 0;
+        std::uint64_t loadedHandleIds = 0;
+        std::uint64_t sourceProtectedIds = 0;
+        std::uint64_t ledgerProtectedIds = 0;
+        std::uint64_t blockedUniqueIds = 0;
+        std::uint64_t sourceOnlyBlockedIds = 0;
+        std::uint64_t candidateReusableIds = 0;
+        std::uint64_t candidateRanges = 0;
+        std::uint64_t legacyReusableIds = 0;
+        std::uint64_t legacyRanges = 0;
     };
 
     void Configure(
@@ -29,6 +47,10 @@ namespace PersistentIdFixSystem
 
     AssignmentLedgerSnapshot GetAssignmentLedgerSnapshot();
     void LogAssignmentLedger(const char* phase);
+
+    CandidatePoolDiagnostic BuildCandidatePoolDiagnostic(
+        std::uint64_t loadGeneration,
+        const std::vector<std::uint32_t>& sourceProtectedIds);
 
     void SetSessionNetMode(EPluginNetMode netMode);
 

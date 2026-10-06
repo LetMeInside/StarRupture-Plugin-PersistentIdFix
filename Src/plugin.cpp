@@ -393,6 +393,19 @@ static void OnTick(
             LOG_WARN(
                 "PersistentIdFix: protected-ID publication was not accepted for the ready generation");
         }
+        else
+        {
+            const auto candidate =
+                PersistentIdFixSystem::BuildCandidatePoolDiagnostic(
+                    g_publishedProtectedGeneration,
+                    g_publishedProtectedIds);
+
+            if (!candidate.valid)
+            {
+                LOG_WARN(
+                    "PersistentIdFix: certified candidate-pool diagnostic was not accepted");
+            }
+        }
 
         PersistentIdFixSystem::LogAssignmentLedger(
             "ready-transition");
