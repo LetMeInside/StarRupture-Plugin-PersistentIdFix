@@ -13,6 +13,11 @@ namespace PersistentIdFixSystem
 
     void SetSessionNetMode(EPluginNetMode netMode);
 
+    // Returns the concrete current game-world role when available.
+    // Unknown remains fail-closed; this accessor does not manufacture
+    // authority from process type or startup heuristics.
+    EPluginNetMode GetSessionNetMode();
+
     void OnSaveLoaded();
 
     void Tick();

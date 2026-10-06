@@ -58,6 +58,25 @@ namespace PersistentIdFixSourceReadObserver
         CertificationState baseCoreReplicationCertification =
             CertificationState::InventoryUnavailable;
 
+        // Aggregate coverage applies only to the retained load generation.
+        // It does not prove that this generation belongs to the currently
+        // active authoritative ChimeraMain world and must not be used as
+        // an allocator/reuse activation decision by itself.
+        bool sourceCoverageComplete = false;
+
+        // F2 attaches a load generation to the currently active
+        // ChimeraMain world. This is still diagnostic state only:
+        // authority/NetMode and allocator gates remain separate.
+        bool gameWorldAttached = false;
+        std::uint64_t attachedLoadGeneration = 0;
+        bool coverageAttachedToCurrentGeneration = false;
+
+        std::uint64_t certifiedSections = 0;
+        std::uint64_t pendingSections = 0;
+        std::uint64_t failedSections = 0;
+        std::uint64_t absentUnsupportedSections = 0;
+        std::uint64_t inventoryUnavailableSections = 0;
+
         std::uint64_t successfulReads = 0;
         std::uint64_t recognizedSuccessfulReads = 0;
         std::uint64_t failedReads = 0;
@@ -90,6 +109,12 @@ namespace PersistentIdFixSourceReadObserver
     // reused as coverage for the new generation.
     void BeginLoadGeneration(
         void* saveSubsystem);
+
+    // Called only from the plugin's actual ChimeraMain lifecycle.
+    // The begin operation snapshots the current load-generation number;
+    // the end operation invalidates only that world attachment.
+    void AttachCurrentGenerationToGameWorld();
+    void DetachGameWorld();
 
     CoverageSnapshot GetCoverageSnapshot();
 

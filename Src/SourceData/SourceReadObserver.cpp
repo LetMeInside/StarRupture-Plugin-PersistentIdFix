@@ -25,6 +25,8 @@ namespace
     static_assert(sizeof(FStringView) == 0x10);
 
     std::atomic<std::uint64_t> g_loadGeneration{ 0 };
+    std::atomic<bool> g_gameWorldAttached{ false };
+    std::atomic<std::uint64_t> g_attachedLoadGeneration{ 0 };
 
     std::atomic<bool> g_inventoryCaptured{ false };
     std::atomic<bool> g_inventoryValid{ false };
@@ -389,6 +391,35 @@ namespace
             return "<invalid>";
         }
     }
+
+    void CountCertificationState(
+        PersistentIdFixSourceReadObserver::CertificationState state,
+        PersistentIdFixSourceReadObserver::CoverageSnapshot& snapshot)
+    {
+        using PersistentIdFixSourceReadObserver::CertificationState;
+
+        switch (state)
+        {
+        case CertificationState::Certified:
+            ++snapshot.certifiedSections;
+            break;
+        case CertificationState::Pending:
+            ++snapshot.pendingSections;
+            break;
+        case CertificationState::Failed:
+            ++snapshot.failedSections;
+            break;
+        case CertificationState::AbsentUnsupported:
+            ++snapshot.absentUnsupportedSections;
+            break;
+        case CertificationState::InventoryUnavailable:
+            ++snapshot.inventoryUnavailableSections;
+            break;
+        default:
+            ++snapshot.failedSections;
+            break;
+        }
+    }
 }
 
 namespace PersistentIdFixSourceReadObserver
@@ -582,6 +613,15 @@ namespace PersistentIdFixSourceReadObserver
             g_loadGeneration.load(
                 std::memory_order_relaxed);
 
+        snapshot.gameWorldAttached =
+            g_gameWorldAttached.load(std::memory_order_relaxed);
+        snapshot.attachedLoadGeneration =
+            g_attachedLoadGeneration.load(std::memory_order_relaxed);
+        snapshot.coverageAttachedToCurrentGeneration =
+            snapshot.gameWorldAttached &&
+            snapshot.loadGeneration != 0 &&
+            snapshot.attachedLoadGeneration == snapshot.loadGeneration;
+
         snapshot.inventoryCaptured =
             g_inventoryCaptured.load(std::memory_order_relaxed);
         snapshot.inventoryValid =
@@ -727,6 +767,37 @@ namespace PersistentIdFixSourceReadObserver
                 snapshot.baseCoreReplicationHelperReads,
                 independent.baseCoreReplication);
 
+        CountCertificationState(
+            snapshot.massCertification,
+            snapshot);
+        CountCertificationState(
+            snapshot.buildingCustomNamesCertification,
+            snapshot);
+        CountCertificationState(
+            snapshot.gameStateDataCertification,
+            snapshot);
+        CountCertificationState(
+            snapshot.antennasDataCertification,
+            snapshot);
+        CountCertificationState(
+            snapshot.ziplineReplicatorCertification,
+            snapshot);
+        CountCertificationState(
+            snapshot.ziplineSubsystemCertification,
+            snapshot);
+        CountCertificationState(
+            snapshot.baseCoreReplicationCertification,
+            snapshot);
+
+        snapshot.sourceCoverageComplete =
+            snapshot.inventoryCaptured &&
+            snapshot.inventoryValid &&
+            snapshot.certifiedSections == 7 &&
+            snapshot.pendingSections == 0 &&
+            snapshot.failedSections == 0 &&
+            snapshot.absentUnsupportedSections == 0 &&
+            snapshot.inventoryUnavailableSections == 0;
+
         return snapshot;
     }
 
@@ -770,6 +841,25 @@ namespace PersistentIdFixSourceReadObserver
             CertificationStateName(snapshot.baseCoreReplicationCertification));
 
         LOG_INFO(
+            "PersistentIdFix: source coverage [%s]: complete=%u certified=%llu pending=%llu failed=%llu absentUnsupported=%llu inventoryUnavailable=%llu",
+            phase != nullptr ? phase : "<null>",
+            snapshot.sourceCoverageComplete ? 1u : 0u,
+            static_cast<unsigned long long>(snapshot.certifiedSections),
+            static_cast<unsigned long long>(snapshot.pendingSections),
+            static_cast<unsigned long long>(snapshot.failedSections),
+            static_cast<unsigned long long>(snapshot.absentUnsupportedSections),
+            static_cast<unsigned long long>(snapshot.inventoryUnavailableSections));
+
+        LOG_INFO(
+            "PersistentIdFix: source attachment [%s]: gameWorld=%u generation=%llu attachedGeneration=%llu current=%u coverageComplete=%u",
+            phase != nullptr ? phase : "<null>",
+            snapshot.gameWorldAttached ? 1u : 0u,
+            static_cast<unsigned long long>(snapshot.loadGeneration),
+            static_cast<unsigned long long>(snapshot.attachedLoadGeneration),
+            snapshot.coverageAttachedToCurrentGeneration ? 1u : 0u,
+            snapshot.sourceCoverageComplete ? 1u : 0u);
+
+        LOG_INFO(
             "PersistentIdFix: source sections [%s]: Mass=%llu CustomNames=%llu GameState=%llu Antennas=%llu ZiplineReplicator=%llu ZiplineSubsystem=%llu BaseCoreReplication=%llu",
             phase != nullptr ? phase : "<null>",
             static_cast<unsigned long long>(snapshot.massReads),
@@ -788,6 +878,9 @@ namespace PersistentIdFixSourceReadObserver
         void* saveSubsystem)
     {
         ResetObservationCounters();
+
+        g_gameWorldAttached.store(false, std::memory_order_relaxed);
+        g_attachedLoadGeneration.store(0, std::memory_order_relaxed);
 
         const std::uint64_t generation =
             g_loadGeneration.fetch_add(
@@ -809,9 +902,49 @@ namespace PersistentIdFixSourceReadObserver
             inventoryValid ? 1u : 0u);
     }
 
+    void AttachCurrentGenerationToGameWorld()
+    {
+        const std::uint64_t generation =
+            g_loadGeneration.load(std::memory_order_relaxed);
+
+        if (generation == 0)
+        {
+            g_gameWorldAttached.store(false, std::memory_order_relaxed);
+            g_attachedLoadGeneration.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        g_attachedLoadGeneration.store(
+            generation,
+            std::memory_order_relaxed);
+        g_gameWorldAttached.store(true, std::memory_order_relaxed);
+
+        LOG_INFO(
+            "PersistentIdFix: source generation attached to game world: %llu",
+            static_cast<unsigned long long>(generation));
+    }
+
+    void DetachGameWorld()
+    {
+        const std::uint64_t generation =
+            g_attachedLoadGeneration.load(std::memory_order_relaxed);
+
+        g_gameWorldAttached.store(false, std::memory_order_relaxed);
+        g_attachedLoadGeneration.store(0, std::memory_order_relaxed);
+
+        if (generation != 0)
+        {
+            LOG_INFO(
+                "PersistentIdFix: source generation detached from game world: %llu",
+                static_cast<unsigned long long>(generation));
+        }
+    }
+
     void Reset()
     {
         ResetObservationCounters();
+        g_gameWorldAttached.store(false, std::memory_order_relaxed);
+        g_attachedLoadGeneration.store(0, std::memory_order_relaxed);
         g_loadGeneration.store(0, std::memory_order_relaxed);
     }
 }

@@ -34,6 +34,8 @@ static uintptr_t g_onPreLoadMapAddress = 0;
 
 static uintptr_t g_setIDHandlePairAddress = 0;
 
+static bool g_authoritativeWorldReadyObserved = false;
+
 static bool GetSaveDataDetour(
     void* saveSubsystem,
     void* sectionName,
@@ -55,6 +57,8 @@ static void OnPreLoadMapDetour(
     // Reset before native OnPreLoadMap broadcasts OnPreSaveLoaded.
     // Any GetSaveData calls made by that delegate therefore belong to
     // the fresh generation rather than inheriting prior-world state.
+    g_authoritativeWorldReadyObserved = false;
+
     PersistentIdFixSourceReadObserver::BeginLoadGeneration(
         saveSubsystem);
 
@@ -68,6 +72,102 @@ static void OnPreLoadMapDetour(
 
 static bool g_networkSessionActive = false;
 static bool g_gameWorldActive = false;
+
+enum class AuthorityReadiness : std::uint8_t
+{
+    Unresolved = 0,
+    Authoritative,
+    RemoteClient
+};
+
+static const char* NetModeName(EPluginNetMode netMode)
+{
+    switch (netMode)
+    {
+    case EPluginNetMode::Standalone:
+        return "Standalone";
+    case EPluginNetMode::ListenServer:
+        return "ListenServer";
+    case EPluginNetMode::DedicatedServer:
+        return "DedicatedServer";
+    case EPluginNetMode::Client:
+        return "Client";
+    default:
+        return "Unknown";
+    }
+}
+
+static AuthorityReadiness GetAuthorityReadiness(
+    EPluginNetMode netMode)
+{
+    switch (netMode)
+    {
+    case EPluginNetMode::Standalone:
+    case EPluginNetMode::ListenServer:
+    case EPluginNetMode::DedicatedServer:
+        return AuthorityReadiness::Authoritative;
+
+    case EPluginNetMode::Client:
+        return AuthorityReadiness::RemoteClient;
+
+    default:
+        return AuthorityReadiness::Unresolved;
+    }
+}
+
+static const char* AuthorityReadinessName(
+    AuthorityReadiness readiness)
+{
+    switch (readiness)
+    {
+    case AuthorityReadiness::Authoritative:
+        return "Authoritative";
+    case AuthorityReadiness::RemoteClient:
+        return "RemoteClient";
+    default:
+        return "Unresolved";
+    }
+}
+
+static bool IsAuthoritativeWorldReady()
+{
+    const auto coverage =
+        PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+    const EPluginNetMode netMode =
+        PersistentIdFixSystem::GetSessionNetMode();
+
+    return
+        coverage.sourceCoverageComplete &&
+        coverage.coverageAttachedToCurrentGeneration &&
+        GetAuthorityReadiness(netMode) ==
+            AuthorityReadiness::Authoritative;
+}
+
+static void LogReadiness(
+    const char* phase)
+{
+    const auto coverage =
+        PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+    const EPluginNetMode netMode =
+        PersistentIdFixSystem::GetSessionNetMode();
+
+    const AuthorityReadiness authority =
+        GetAuthorityReadiness(netMode);
+
+    const bool authoritativeWorldReady =
+        IsAuthoritativeWorldReady();
+
+    LOG_INFO(
+        "PersistentIdFix: readiness [%s]: netMode=%s authority=%s sourceCoverage=%u currentGeneration=%u authoritativeWorldReady=%u",
+        phase != nullptr ? phase : "<null>",
+        NetModeName(netMode),
+        AuthorityReadinessName(authority),
+        coverage.sourceCoverageComplete ? 1u : 0u,
+        coverage.coverageAttachedToCurrentGeneration ? 1u : 0u,
+        authoritativeWorldReady ? 1u : 0u);
+}
 
 #ifndef MODLOADER_BUILD_TAG
 #define MODLOADER_BUILD_TAG "1.2.0"
@@ -106,7 +206,19 @@ static void OnTick(
 
     if (g_gameWorldActive)
     {
+        const EPluginNetMode before =
+            PersistentIdFixSystem::GetSessionNetMode();
+
         PersistentIdFixSystem::SetSessionNetMode(netMode);
+
+        const EPluginNetMode after =
+            PersistentIdFixSystem::GetSessionNetMode();
+
+        if (before == EPluginNetMode::Unknown &&
+            after != EPluginNetMode::Unknown)
+        {
+            LogReadiness("role-settled");
+        }
     }
 
     /*
@@ -147,6 +259,18 @@ static void OnTick(
         }
     }
 
+    if (g_gameWorldActive &&
+        !g_authoritativeWorldReadyObserved &&
+        IsAuthoritativeWorldReady())
+    {
+        g_authoritativeWorldReadyObserved = true;
+
+        LOG_INFO(
+            "PersistentIdFix: authoritative world readiness became true during active gameplay");
+
+        LogReadiness("ready-transition");
+    }
+
     if (netMode == EPluginNetMode::Unknown)
         return;
 
@@ -185,6 +309,8 @@ static void OnWorldBeginPlay(SDK::UWorld* world)
      * network state becomes usable.
      */
     g_gameWorldActive = true;
+
+    PersistentIdFixSourceReadObserver::AttachCurrentGenerationToGameWorld();
 
     /*
      * Server/listen-server sessions normally have their final NetMode
@@ -234,6 +360,9 @@ static void OnSaveLoaded()
 
     PersistentIdFixSourceReadObserver::LogCoverage(
         "save-loaded");
+
+    LogReadiness(
+        "save-loaded");
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +386,20 @@ static void OnAfterWorldEndPlay(
 
     PersistentIdFixSourceReadObserver::LogCoverage(
         "world-end");
+
+    LogReadiness(
+        "world-end");
+
+    /*
+     * Detach source coverage only when this callback is ending the
+     * actual active game world. OnPreLoadMap can start an incoming
+     * generation before an outgoing menu/intermediate world ends;
+     * those callbacks must not invalidate the incoming generation.
+     */
+    if (g_gameWorldActive)
+    {
+        PersistentIdFixSourceReadObserver::DetachGameWorld();
+    }
 
     /*
      * The actual game world has ended. Prevent OnTick() from starting a new
@@ -592,6 +735,7 @@ extern "C"
 
             g_networkSessionActive = false;
             g_gameWorldActive = false;
+            g_authoritativeWorldReadyObserved = false;
 
 #ifdef MODLOADER_CLIENT_BUILD
 
@@ -718,6 +862,7 @@ extern "C"
 
         g_networkSessionActive = false;
         g_gameWorldActive = false;
+        g_authoritativeWorldReadyObserved = false;
 
         PersistentIdFixSourceReadObserver::Reset();
         PersistentIdFixMassFragmentClassifier::ResetDescriptorRegistry();
@@ -741,6 +886,7 @@ extern "C"
             PersistentIdFixNetwork::Shutdown();
             g_networkSessionActive = false;
             g_gameWorldActive = false;
+            g_authoritativeWorldReadyObserved = false;
 
 #ifdef MODLOADER_CLIENT_BUILD
             PersistentIdFixUI::Shutdown();

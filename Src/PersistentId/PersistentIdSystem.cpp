@@ -342,6 +342,11 @@ namespace PersistentIdFixSystem
         }
     }
 
+    EPluginNetMode GetSessionNetMode()
+    {
+        return GetEffectiveSessionNetMode();
+    }
+
     void OnSaveLoaded()
     {
         if (!InitializeSession())
