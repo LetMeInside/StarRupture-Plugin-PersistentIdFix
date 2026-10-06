@@ -13,6 +13,8 @@
 
 #include <cstdint>
 #include <chrono>
+#include <mutex>
+#include <vector>
 
 namespace
 {
@@ -29,9 +31,85 @@ namespace
 
     static EPluginNetMode g_sessionNetMode = EPluginNetMode::Unknown;
 
+    enum class LedgerEntryKind : std::uint8_t
+    {
+        Assigned = 0,
+        Burned
+    };
+
+    struct LedgerEntry
+    {
+        SDK::UCrMassPersistentIDSubsystem* subsystem = nullptr;
+        std::uint32_t id = 0;
+        LedgerEntryKind kind = LedgerEntryKind::Assigned;
+    };
+
+    static std::mutex g_assignmentLedgerMutex;
+    static std::vector<LedgerEntry> g_assignmentLedger;
+    static std::uint64_t g_assignmentLedgerGeneration = 0;
+    static bool g_assignmentLedgerHealthy = true;
+
     static std::chrono::steady_clock::time_point g_nextStatisticsLogTime{};
     static std::chrono::steady_clock::time_point g_nextLiveStatisticsRefreshTime{};
     static bool g_statisticsTimerActive = false;
+
+    static void ResetAssignmentLedger(
+        std::uint64_t loadGeneration)
+    {
+        std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
+        g_assignmentLedger.clear();
+        g_assignmentLedgerGeneration = loadGeneration;
+        g_assignmentLedgerHealthy = true;
+    }
+
+    static bool RecordLedgerEntry(
+        SDK::UCrMassPersistentIDSubsystem* subsystem,
+        std::uint32_t id,
+        LedgerEntryKind kind)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
+            g_assignmentLedger.push_back({ subsystem, id, kind });
+            return true;
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
+            g_assignmentLedgerHealthy = false;
+            return false;
+        }
+    }
+
+    static void RecordAssignedId(
+        SDK::UCrMassPersistentIDSubsystem* subsystem,
+        std::uint32_t id)
+    {
+        if (!RecordLedgerEntry(
+                subsystem,
+                id,
+                LedgerEntryKind::Assigned))
+        {
+            LOG_ERROR(
+                "PersistentIdFix: assignment ledger failed to record assigned ID %u; future certified activation must remain fail-closed",
+                id);
+        }
+    }
+
+    static void RecordBurnedId(
+        SDK::UCrMassPersistentIDSubsystem* subsystem,
+        std::uint32_t id)
+    {
+        if (!RecordLedgerEntry(
+                subsystem,
+                id,
+                LedgerEntryKind::Burned))
+        {
+            LOG_ERROR(
+                "PersistentIdFix: assignment ledger failed to record burned ID %u; future certified activation must remain fail-closed",
+                id);
+        }
+    }
 
     static EPluginNetMode GetEffectiveSessionNetMode()
     {
@@ -317,6 +395,8 @@ namespace PersistentIdFixSystem
         g_sessionActive = false;
         g_sessionNetMode = EPluginNetMode::Unknown;
 
+        ResetAssignmentLedger(0);
+
         g_statisticsTimerActive = false;
         g_nextStatisticsLogTime = {};
         g_nextLiveStatisticsRefreshTime = {};
@@ -326,6 +406,73 @@ namespace PersistentIdFixSystem
         g_setIDHandlePair = nullptr;
         g_originalGetOrAddIDForHandle = nullptr;
         g_systemSelf = nullptr;
+    }
+
+    void BeginLoadGeneration(
+        std::uint64_t loadGeneration)
+    {
+        ResetAssignmentLedger(loadGeneration);
+
+        LOG_INFO(
+            "PersistentIdFix: assignment ledger generation started: %llu",
+            static_cast<unsigned long long>(loadGeneration));
+    }
+
+    AssignmentLedgerSnapshot GetAssignmentLedgerSnapshot()
+    {
+        AssignmentLedgerSnapshot snapshot;
+
+        std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
+
+        snapshot.loadGeneration = g_assignmentLedgerGeneration;
+        snapshot.healthy = g_assignmentLedgerHealthy;
+
+        for (const LedgerEntry& entry : g_assignmentLedger)
+        {
+            const bool currentSubsystem =
+                g_persistentIdSubsystem != nullptr &&
+                entry.subsystem == g_persistentIdSubsystem;
+
+            if (entry.kind == LedgerEntryKind::Assigned)
+            {
+                ++snapshot.assignedEntries;
+
+                if (currentSubsystem)
+                    ++snapshot.currentSubsystemAssigned;
+                else
+                    ++snapshot.foreignSubsystemAssigned;
+            }
+            else
+            {
+                ++snapshot.burnedEntries;
+
+                if (currentSubsystem)
+                    ++snapshot.currentSubsystemBurned;
+                else
+                    ++snapshot.foreignSubsystemBurned;
+            }
+        }
+
+        return snapshot;
+    }
+
+    void LogAssignmentLedger(
+        const char* phase)
+    {
+        const AssignmentLedgerSnapshot snapshot =
+            GetAssignmentLedgerSnapshot();
+
+        LOG_INFO(
+            "PersistentIdFix: assignment ledger [%s]: generation=%llu healthy=%u assigned=%llu burned=%llu currentAssigned=%llu currentBurned=%llu foreignAssigned=%llu foreignBurned=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.loadGeneration),
+            snapshot.healthy ? 1u : 0u,
+            static_cast<unsigned long long>(snapshot.assignedEntries),
+            static_cast<unsigned long long>(snapshot.burnedEntries),
+            static_cast<unsigned long long>(snapshot.currentSubsystemAssigned),
+            static_cast<unsigned long long>(snapshot.currentSubsystemBurned),
+            static_cast<unsigned long long>(snapshot.foreignSubsystemAssigned),
+            static_cast<unsigned long long>(snapshot.foreignSubsystemBurned));
     }
 
     void SetSessionNetMode(EPluginNetMode netMode)
@@ -684,6 +831,9 @@ namespace PersistentIdFixSystem
         switch (g_persistentIdReuse.TryAllocate(handle, *returnValue))
         {
         case PersistentIdAllocationResult::Allocated:
+            RecordAssignedId(
+                persistentIDSubsystem,
+                returnValue->ID);
             PersistentIdFixStats::RecordAssignment();
             return returnValue;
 
@@ -725,6 +875,10 @@ namespace PersistentIdFixSystem
 
         if (g_setIDHandlePair == nullptr)
         {
+            RecordBurnedId(
+                persistentIDSubsystem,
+                persistentId.ID);
+
             LOG_ERROR(
                 "PersistentIdFix: SetIDHandlePair is unavailable");
 
@@ -736,6 +890,10 @@ namespace PersistentIdFixSystem
             &persistentId,
             handle))
         {
+            RecordBurnedId(
+                persistentIDSubsystem,
+                persistentId.ID);
+
             LOG_ERROR(
                 "PersistentIdFix: SetIDHandlePair failed for new ID %u "
                 "handle=(%u,%u)",
@@ -814,6 +972,10 @@ namespace PersistentIdFixSystem
         }
 
         *returnValue = persistentId;
+
+        RecordAssignedId(
+            persistentIDSubsystem,
+            persistentId.ID);
 
         PersistentIdFixStats::RecordAssignment();
 

@@ -69,6 +69,12 @@ static void OnPreLoadMapDetour(
     PersistentIdFixSourceReadObserver::BeginLoadGeneration(
         saveSubsystem);
 
+    const auto coverage =
+        PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+    PersistentIdFixSystem::BeginLoadGeneration(
+        coverage.loadGeneration);
+
     if (g_originalOnPreLoadMap != nullptr)
     {
         g_originalOnPreLoadMap(
@@ -387,6 +393,9 @@ static void OnTick(
             LOG_WARN(
                 "PersistentIdFix: protected-ID publication was not accepted for the ready generation");
         }
+
+        PersistentIdFixSystem::LogAssignmentLedger(
+            "ready-transition");
     }
 
     if (netMode == EPluginNetMode::Unknown)
@@ -476,6 +485,9 @@ static void OnSaveLoaded()
 {
     PersistentIdFixSystem::OnSaveLoaded();
 
+    PersistentIdFixSystem::LogAssignmentLedger(
+        "save-loaded");
+
     PersistentIdFixSourceReadObserver::LogCoverage(
         "save-loaded");
 
@@ -526,6 +538,9 @@ static void OnAfterWorldEndPlay(
      */
     g_gameWorldActive = false;
     ResetProtectedIdPublication();
+
+    PersistentIdFixSystem::LogAssignmentLedger(
+        "world-end");
 
     PersistentIdFixSystem::EndSession();
 
