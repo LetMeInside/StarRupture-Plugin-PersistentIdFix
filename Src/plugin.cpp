@@ -4,6 +4,7 @@
 #include "Config/Config.h"
 #include "Network/Network.h"
 #include "Native/Fingerprints.h"
+#include "SourceData/SourceReadObserver.h"
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
@@ -35,10 +36,8 @@ static bool GetSaveDataDetour(
     const void* structType,
     void* destination)
 {
-    if (g_originalGetSaveData == nullptr)
-        return false;
-
-    return g_originalGetSaveData(
+    return PersistentIdFixSourceReadObserver::ObserveGetSaveData(
+        g_originalGetSaveData,
         saveSubsystem,
         sectionName,
         structType,
@@ -207,6 +206,14 @@ static void OnWorldBeginPlay(SDK::UWorld* world)
     }
 }
 
+static void OnSaveLoaded()
+{
+    PersistentIdFixSystem::OnSaveLoaded();
+
+    PersistentIdFixSourceReadObserver::LogCoverage(
+        "save-loaded");
+}
+
 // ---------------------------------------------------------------------------
 // World-end callback.
 //
@@ -225,6 +232,9 @@ static void OnAfterWorldEndPlay(
     LOG_INFO(
         "PersistentIdFix: world ended: %s",
         worldName != nullptr ? worldName : "<null>");
+
+    PersistentIdFixSourceReadObserver::LogCoverage(
+        "world-end");
 
     /*
      * The actual game world has ended. Prevent OnTick() from starting a new
@@ -475,7 +485,7 @@ extern "C"
                 "PersistentIdFix: registered OnWorldBeginPlay callback");
 
             g_self->hooks->World->RegisterOnSaveLoaded(
-                &PersistentIdFixSystem::OnSaveLoaded);
+                &OnSaveLoaded);
 
             LOG_INFO(
                 "PersistentIdFix: registered OnSaveLoaded callback");
@@ -576,7 +586,7 @@ extern "C"
                     &OnWorldBeginPlay);
 
                 g_self->hooks->World->UnregisterOnSaveLoaded(
-                    &PersistentIdFixSystem::OnSaveLoaded);
+                    &OnSaveLoaded);
 
                 g_self->hooks->World->UnregisterOnAfterWorldEndPlay(
                     &OnAfterWorldEndPlay);
@@ -622,6 +632,7 @@ extern "C"
         g_networkSessionActive = false;
         g_gameWorldActive = false;
 
+        PersistentIdFixSourceReadObserver::Reset();
         PersistentIdFixSystem::Reset();
 
         g_self = nullptr;
@@ -662,7 +673,7 @@ extern "C"
                         &OnWorldBeginPlay);
 
                     g_self->hooks->World->UnregisterOnSaveLoaded(
-                        &PersistentIdFixSystem::OnSaveLoaded);
+                        &OnSaveLoaded);
 
                     g_self->hooks->World->UnregisterOnAfterWorldEndPlay(
                         &OnAfterWorldEndPlay);
@@ -683,6 +694,7 @@ extern "C"
                 }
             }
 
+            PersistentIdFixSourceReadObserver::Reset();
             PersistentIdFixSystem::Reset();
             g_gameWorldActive = false;
 

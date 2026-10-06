@@ -111,6 +111,7 @@
     <ClInclude Include="UI\UI.h" />
     <ClInclude Include="Native\Fingerprints.h" />
     <ClInclude Include="Native\NativeIdLookup.h" />
+    <ClInclude Include="SourceData\SourceReadObserver.h" />
     <ClInclude Include="PersistentId\PersistentIdReuse.h" />
     <ClInclude Include="plugin.h" />
     <ClInclude Include="plugin_helpers.h" />
@@ -129,6 +130,7 @@
     <ClCompile Include="Config\Config.cpp" />
     <ClCompile Include="PersistentId\PersistentIdSystem.cpp" />
     <ClCompile Include="Native\Fingerprints.cpp" />
+    <ClCompile Include="SourceData\SourceReadObserver.cpp" />
     <ClCompile Include="Network\Network.cpp" />
     <ClCompile Include="Stats\Stats.cpp" />
     <ClCompile Include="UI\UI.cpp" />
