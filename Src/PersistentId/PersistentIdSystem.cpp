@@ -546,6 +546,7 @@ namespace PersistentIdFixSystem
         }
 
         *returnValue = {};
+        returnValue->ID = UINT32_MAX;
 
         if (subsystem == nullptr)
         {
@@ -652,42 +653,22 @@ namespace PersistentIdFixSystem
         }
 
         /*
-         * On a local multiplayer session, the game can call
-         * GetOrAddIDForHandle before OnSaveLoaded has built the PersistentIdFix
-         * reuse pool. This was observed in the listen-server test:
+         * On a local authority session, the game can call
+         * GetOrAddIDForHandle before the reusable-ID pool is ready.
          *
-         *     MaxID=1256
-         *     reuse pool not yet built
-         *
-         * During this initialization window the native allocator remains
-         * authoritative. OnSaveLoaded will subsequently inspect the resulting
-         * persistent-ID state and build the reuse pool from it.
-         *
-         * The same fallback also protects us if persistent-ID initialization
-         * unexpectedly has not completed for another local reason.
+         * Do not delegate new allocations to the native allocator during this
+         * window: the native implementation increments MaxID without guarding
+         * the invalid 0xFFFFFFFF persistent-ID sentinel. With no reusable pool
+         * available yet, fall through to the bounded monotonic path below.
          */
         if (!g_reusePoolReady)
         {
             LOG_INFO(
                 "PersistentIdFix: GetOrAddIDForHandle before reuse pool was built; "
-                "delegating to native allocator: handle=(%u,%u) MaxID=%u",
+                "using bounded monotonic allocation: handle=(%u,%u) MaxID=%u",
                 handle.Index,
                 handle.SerialNumber,
                 persistentIDSubsystem->MaxID);
-
-            if (g_originalGetOrAddIDForHandle == nullptr)
-            {
-                LOG_ERROR(
-                    "PersistentIdFix: native GetOrAddIDForHandle is unavailable "
-                    "during persistent ID initialization");
-
-                return returnValue;
-            }
-
-            return g_originalGetOrAddIDForHandle(
-                subsystem,
-                returnValue,
-                handle);
         }
 
         /*
@@ -710,15 +691,19 @@ namespace PersistentIdFixSystem
         }
 
         /*
-         * No reusable IDs remain.
+         * No reusable IDs remain, or the reusable-ID pool is not ready yet.
          *
-         * Allocate exactly as the native function does.
+         * Use bounded monotonic allocation while preserving the native mapping
+         * update path. Unlike the native allocator, never advance MaxID into the
+         * invalid 0xFFFFFFFF persistent-ID sentinel.
          */
-        if (persistentIDSubsystem->MaxID == UINT32_MAX)
+        if (persistentIDSubsystem->MaxID >= UINT32_MAX - 1u)
         {
             LOG_ERROR(
                 "PersistentIdFix: persistent ID space exhausted; "
-                "no reusable IDs remain and MaxID is UINT32_MAX");
+                "no reusable IDs remain and MaxID=%u cannot advance without "
+                "reaching the invalid 0xFFFFFFFF persistent ID",
+                persistentIDSubsystem->MaxID);
 
             return returnValue;
         }
