@@ -31,6 +31,10 @@ namespace
     static_assert(sizeof(FCrZiplineSaveData) == 0x50);
     static_assert(sizeof(FBaseCoreReplicationSaveData) == 0x38);
     static_assert(sizeof(FCrBaseCoreSaveData) == 0x28);
+    static_assert(sizeof(FGameStateSaveData) == 0x490);
+    static_assert(sizeof(FCrCharacterPlayersBaseSaveData) == 0x50);
+    static_assert(sizeof(FCrCharacterPlayerBaseSaveDataPerPlayer) == 0x6F0);
+    static_assert(sizeof(FCrPlayersMapMenuState) == 0x50);
 
     struct SectionState
     {
@@ -43,12 +47,13 @@ namespace
         std::atomic<std::uint64_t> ZeroValues{0};
         std::atomic<std::uint64_t> InvalidSentinels{0};
         std::atomic<std::uint64_t> ContainerFailures{0};
+        std::atomic<std::uint64_t> IncompleteCoverage{0};
     };
 
-    std::array<SectionState, 5> g_states;
+    std::array<SectionState, 6> g_states;
 
     std::mutex g_valuesMutex;
-    std::array<std::vector<std::uint32_t>, 5> g_values;
+    std::array<std::vector<std::uint32_t>, 6> g_values;
 
     struct DescriptorProfile
     {
@@ -57,20 +62,31 @@ namespace
         std::int32_t ExpectedSize;
     };
 
-    constexpr std::array<DescriptorProfile, 5> kProfiles{{
+    constexpr std::array<DescriptorProfile, 6> kProfiles{{
         { Section::BuildingCustomNames, L"/Script/Chimera.BuildingCustomNameSaveData", 0x58 },
         { Section::AntennasData, L"/Script/Chimera.CrAntennaSaveData", 0x50 },
         { Section::ZiplineReplicator, L"/Script/Chimera.CrZiplineReplicatorSaveData", 0x50 },
         { Section::ZiplineSubsystem, L"/Script/Chimera.CrZiplineSaveData", 0x50 },
-        { Section::BaseCoreReplication, L"/Script/Chimera.BaseCoreReplicationSaveData", 0x38 }
+        { Section::BaseCoreReplication, L"/Script/Chimera.BaseCoreReplicationSaveData", 0x38 },
+        { Section::GameStateData, L"/Script/Chimera.GameStateSaveData", 0x490 }
     }};
 
     using StaticFindObjectSafeByNameFn =
         UObject* (__fastcall*)(UClass*, UObject*, const wchar_t*, bool);
 
     std::mutex g_registryMutex;
-    std::array<const UScriptStruct*, 5> g_descriptors{};
+    std::array<const UScriptStruct*, 6> g_descriptors{};
     bool g_registryReady = false;
+
+    std::atomic<std::uint64_t> g_gameStatePlayers{0};
+    std::atomic<std::uint64_t> g_gameStateFloorValues{0};
+    std::atomic<std::uint64_t> g_gameStateAntennaFogValues{0};
+    std::atomic<std::uint64_t> g_gameStateDevicePayloads{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceEmpty{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceMalformed{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceUnknownPresent{0};
+    std::atomic<std::uint64_t> g_gameStateOpaqueStoreEntries{0};
+    std::atomic<std::uint64_t> g_gameStateDiscoveredBuildingValues{0};
 
     std::size_t Index(Section section)
     {
@@ -447,6 +463,7 @@ namespace
         result.zeroValues = state.ZeroValues.load(std::memory_order_relaxed);
         result.invalidSentinels = state.InvalidSentinels.load(std::memory_order_relaxed);
         result.containerFailures = state.ContainerFailures.load(std::memory_order_relaxed);
+        result.incompleteCoverage = state.IncompleteCoverage.load(std::memory_order_relaxed);
         return result;
     }
 
@@ -462,6 +479,7 @@ namespace
         state.ZeroValues.store(0, std::memory_order_relaxed);
         state.InvalidSentinels.store(0, std::memory_order_relaxed);
         state.ContainerFailures.store(0, std::memory_order_relaxed);
+        state.IncompleteCoverage.store(0, std::memory_order_relaxed);
     }
 
     void LogSection(
@@ -470,7 +488,7 @@ namespace
         const SectionSnapshot& snapshot)
     {
         LOG_INFO(
-            "PersistentIdFix: source collector %s [%s]: readFailed=%llu attempts=%llu success=%llu failed=%llu schemaMismatch=%llu values=%llu zero=%llu invalidSentinel=%llu containerFailures=%llu",
+            "PersistentIdFix: source collector %s [%s]: readFailed=%llu attempts=%llu success=%llu failed=%llu schemaMismatch=%llu values=%llu zero=%llu invalidSentinel=%llu containerFailures=%llu incomplete=%llu",
             name,
             phase != nullptr ? phase : "<null>",
             static_cast<unsigned long long>(snapshot.readFailures),
@@ -481,7 +499,8 @@ namespace
             static_cast<unsigned long long>(snapshot.values),
             static_cast<unsigned long long>(snapshot.zeroValues),
             static_cast<unsigned long long>(snapshot.invalidSentinels),
-            static_cast<unsigned long long>(snapshot.containerFailures));
+            static_cast<unsigned long long>(snapshot.containerFailures),
+            static_cast<unsigned long long>(snapshot.incompleteCoverage));
     }
 }
 
@@ -556,7 +575,7 @@ namespace PersistentIdFixIndependentSourceCollector
         g_registryReady = true;
 
         LOG_INFO(
-            "PersistentIdFix: independent fixed-source descriptor registry ready: profiles=5");
+            "PersistentIdFix: independent source descriptor registry ready: profiles=6");
 
         return true;
     }
@@ -699,6 +718,188 @@ namespace PersistentIdFixIndependentSourceCollector
             });
     }
 
+    bool ObserveGameState(
+        const UScriptStruct* structType,
+        const FGameStateSaveData* data)
+    {
+        SectionState& state = State(Section::GameStateData);
+        state.Attempts.fetch_add(1, std::memory_order_relaxed);
+
+        if (!ValidateRoot(Section::GameStateData, structType, data))
+        {
+            state.Failures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        std::vector<std::uint32_t> staged;
+        std::uint64_t players = 0;
+        std::uint64_t floorValues = 0;
+        std::uint64_t antennaFogValues = 0;
+        std::uint64_t devicePayloads = 0;
+        std::uint64_t deviceEmpty = 0;
+        std::uint64_t deviceMalformed = 0;
+        std::uint64_t deviceUnknownPresent = 0;
+        std::uint64_t opaqueStoreEntries = 0;
+        std::uint64_t discoveredBuildingValues = 0;
+
+        try
+        {
+            const auto& savedPlayers =
+                data->AllCharactersBaseSaveData.AllPlayersSaveData;
+
+            if (!CheckedSparseMap(
+                    Section::GameStateData,
+                    savedPlayers,
+                    [&](const auto& pair)
+                    {
+                        const auto& player = pair.Value();
+                        ++players;
+
+                        if (!Emit(
+                                staged,
+                                player.FloorPersistentEntityID.ID))
+                        {
+                            return false;
+                        }
+                        ++floorValues;
+
+                        if (!CheckedEach(
+                                Section::GameStateData,
+                                player.MapMenuState.AntennasUncoveredFogOfWar,
+                                [&](const std::uint32_t value)
+                                {
+                                    if (!Emit(staged, value))
+                                        return false;
+                                    ++antennaFogValues;
+                                    return true;
+                                }))
+                        {
+                            return false;
+                        }
+
+                        const auto countOpaqueMap =
+                            [&](const auto& values) -> bool
+                            {
+                                return CheckedSparseMap(
+                                    Section::GameStateData,
+                                    values,
+                                    [&](const auto&)
+                                    {
+                                        ++opaqueStoreEntries;
+                                        return true;
+                                    });
+                            };
+
+                        if (!countOpaqueMap(
+                                player.GemsStoreState.ItemsInstancesSaveData) ||
+                            !countOpaqueMap(
+                                player.GemsStoreState.SlotedItemsInstancesSaveData) ||
+                            !countOpaqueMap(
+                                player.ItemsStoreState.ItemsInstancesSaveData) ||
+                            !countOpaqueMap(
+                                player.ItemsStoreState.SlotedItemsInstancesSaveData))
+                        {
+                            return false;
+                        }
+
+                        return CheckedEach(
+                            Section::GameStateData,
+                            player.DiscoveredBuildings,
+                            [&](const std::int32_t)
+                            {
+                                ++discoveredBuildingValues;
+                                return true;
+                            });
+                    }))
+            {
+                state.Failures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            if (!CheckedSparseMap(
+                    Section::GameStateData,
+                    data->DevicesCustomData,
+                    [&](const auto& pair)
+                    {
+                        ++devicePayloads;
+
+                        const FInstancedStruct& payload = pair.Value();
+                        const bool hasType = payload.ScriptStruct != nullptr;
+                        const bool hasMemory = payload.StructMemory != nullptr;
+
+                        if (!hasType && !hasMemory)
+                        {
+                            ++deviceEmpty;
+                            return true;
+                        }
+
+                        if (hasType != hasMemory)
+                        {
+                            ++deviceMalformed;
+                            return false;
+                        }
+
+                        ++deviceUnknownPresent;
+                        return true;
+                    }))
+            {
+                g_gameStateDeviceMalformed.fetch_add(
+                    deviceMalformed,
+                    std::memory_order_relaxed);
+                state.Failures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            if (!Commit(Section::GameStateData, staged))
+            {
+                state.Failures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            g_gameStatePlayers.fetch_add(players, std::memory_order_relaxed);
+            g_gameStateFloorValues.fetch_add(
+                floorValues,
+                std::memory_order_relaxed);
+            g_gameStateAntennaFogValues.fetch_add(
+                antennaFogValues,
+                std::memory_order_relaxed);
+            g_gameStateDevicePayloads.fetch_add(
+                devicePayloads,
+                std::memory_order_relaxed);
+            g_gameStateDeviceEmpty.fetch_add(
+                deviceEmpty,
+                std::memory_order_relaxed);
+            g_gameStateDeviceMalformed.fetch_add(
+                deviceMalformed,
+                std::memory_order_relaxed);
+            g_gameStateDeviceUnknownPresent.fetch_add(
+                deviceUnknownPresent,
+                std::memory_order_relaxed);
+            g_gameStateOpaqueStoreEntries.fetch_add(
+                opaqueStoreEntries,
+                std::memory_order_relaxed);
+            g_gameStateDiscoveredBuildingValues.fetch_add(
+                discoveredBuildingValues,
+                std::memory_order_relaxed);
+
+            if (deviceUnknownPresent != 0 ||
+                opaqueStoreEntries != 0 ||
+                discoveredBuildingValues != 0)
+            {
+                state.IncompleteCoverage.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
+
+            return true;
+        }
+        catch (...)
+        {
+            state.Failures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
     Snapshot GetSnapshot()
     {
         Snapshot result;
@@ -707,6 +908,26 @@ namespace PersistentIdFixIndependentSourceCollector
         result.ziplineReplicator = SnapshotOf(Section::ZiplineReplicator);
         result.ziplineSubsystem = SnapshotOf(Section::ZiplineSubsystem);
         result.baseCoreReplication = SnapshotOf(Section::BaseCoreReplication);
+        result.gameStateData = SnapshotOf(Section::GameStateData);
+
+        result.gameStatePlayers =
+            g_gameStatePlayers.load(std::memory_order_relaxed);
+        result.gameStateFloorValues =
+            g_gameStateFloorValues.load(std::memory_order_relaxed);
+        result.gameStateAntennaFogValues =
+            g_gameStateAntennaFogValues.load(std::memory_order_relaxed);
+        result.gameStateDevicePayloads =
+            g_gameStateDevicePayloads.load(std::memory_order_relaxed);
+        result.gameStateDeviceEmpty =
+            g_gameStateDeviceEmpty.load(std::memory_order_relaxed);
+        result.gameStateDeviceMalformed =
+            g_gameStateDeviceMalformed.load(std::memory_order_relaxed);
+        result.gameStateDeviceUnknownPresent =
+            g_gameStateDeviceUnknownPresent.load(std::memory_order_relaxed);
+        result.gameStateOpaqueStoreEntries =
+            g_gameStateOpaqueStoreEntries.load(std::memory_order_relaxed);
+        result.gameStateDiscoveredBuildingValues =
+            g_gameStateDiscoveredBuildingValues.load(std::memory_order_relaxed);
         return result;
     }
 
@@ -734,12 +955,39 @@ namespace PersistentIdFixIndependentSourceCollector
             phase,
             "BaseCoreReplication",
             snapshot.baseCoreReplication);
+        LogSection(
+            phase,
+            "GameState",
+            snapshot.gameStateData);
+
+        LOG_INFO(
+            "PersistentIdFix: GameState source details [%s]: players=%llu floor=%llu antennaFog=%llu devicePayloads=%llu deviceEmpty=%llu deviceMalformed=%llu deviceUnknown=%llu opaqueStoreEntries=%llu discoveredBuildings=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.gameStatePlayers),
+            static_cast<unsigned long long>(snapshot.gameStateFloorValues),
+            static_cast<unsigned long long>(snapshot.gameStateAntennaFogValues),
+            static_cast<unsigned long long>(snapshot.gameStateDevicePayloads),
+            static_cast<unsigned long long>(snapshot.gameStateDeviceEmpty),
+            static_cast<unsigned long long>(snapshot.gameStateDeviceMalformed),
+            static_cast<unsigned long long>(snapshot.gameStateDeviceUnknownPresent),
+            static_cast<unsigned long long>(snapshot.gameStateOpaqueStoreEntries),
+            static_cast<unsigned long long>(snapshot.gameStateDiscoveredBuildingValues));
     }
 
     void Reset()
     {
         for (std::size_t i = 0; i < g_states.size(); ++i)
             ResetSectionState(static_cast<Section>(i));
+
+        g_gameStatePlayers.store(0, std::memory_order_relaxed);
+        g_gameStateFloorValues.store(0, std::memory_order_relaxed);
+        g_gameStateAntennaFogValues.store(0, std::memory_order_relaxed);
+        g_gameStateDevicePayloads.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceEmpty.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceMalformed.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceUnknownPresent.store(0, std::memory_order_relaxed);
+        g_gameStateOpaqueStoreEntries.store(0, std::memory_order_relaxed);
+        g_gameStateDiscoveredBuildingValues.store(0, std::memory_order_relaxed);
 
         std::lock_guard<std::mutex> lock(g_valuesMutex);
         for (auto& values : g_values)

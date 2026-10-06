@@ -12,6 +12,7 @@ namespace SDK
     struct FCrZiplineReplicatorSaveData;
     struct FCrZiplineSaveData;
     struct FBaseCoreReplicationSaveData;
+    struct FGameStateSaveData;
 }
 
 namespace PersistentIdFixIndependentSourceCollector
@@ -22,7 +23,8 @@ namespace PersistentIdFixIndependentSourceCollector
         AntennasData,
         ZiplineReplicator,
         ZiplineSubsystem,
-        BaseCoreReplication
+        BaseCoreReplication,
+        GameStateData
     };
 
     struct SectionSnapshot
@@ -36,6 +38,7 @@ namespace PersistentIdFixIndependentSourceCollector
         std::uint64_t zeroValues = 0;
         std::uint64_t invalidSentinels = 0;
         std::uint64_t containerFailures = 0;
+        std::uint64_t incompleteCoverage = 0;
     };
 
     struct Snapshot
@@ -45,6 +48,17 @@ namespace PersistentIdFixIndependentSourceCollector
         SectionSnapshot ziplineReplicator;
         SectionSnapshot ziplineSubsystem;
         SectionSnapshot baseCoreReplication;
+        SectionSnapshot gameStateData;
+
+        std::uint64_t gameStatePlayers = 0;
+        std::uint64_t gameStateFloorValues = 0;
+        std::uint64_t gameStateAntennaFogValues = 0;
+        std::uint64_t gameStateDevicePayloads = 0;
+        std::uint64_t gameStateDeviceEmpty = 0;
+        std::uint64_t gameStateDeviceMalformed = 0;
+        std::uint64_t gameStateDeviceUnknownPresent = 0;
+        std::uint64_t gameStateOpaqueStoreEntries = 0;
+        std::uint64_t gameStateDiscoveredBuildingValues = 0;
     };
 
     bool InitializeDescriptorRegistry(IPluginEngineEvents* engineEvents);
@@ -72,6 +86,10 @@ namespace PersistentIdFixIndependentSourceCollector
     bool ObserveBaseCoreReplication(
         const SDK::UScriptStruct* structType,
         const SDK::FBaseCoreReplicationSaveData* data);
+
+    bool ObserveGameState(
+        const SDK::UScriptStruct* structType,
+        const SDK::FGameStateSaveData* data);
 
     Snapshot GetSnapshot();
     void LogSnapshot(const char* phase);

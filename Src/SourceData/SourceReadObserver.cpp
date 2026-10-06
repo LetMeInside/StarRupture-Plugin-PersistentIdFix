@@ -145,6 +145,10 @@ namespace PersistentIdFixSourceReadObserver
 
             switch (section)
             {
+            case SourceSection::GameStateData:
+                PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                    PersistentIdFixIndependentSourceCollector::Section::GameStateData);
+                break;
             case SourceSection::BuildingCustomNames:
                 PersistentIdFixIndependentSourceCollector::RecordReadFailure(
                     PersistentIdFixIndependentSourceCollector::Section::BuildingCustomNames);
@@ -191,6 +195,12 @@ namespace PersistentIdFixSourceReadObserver
 
             switch (section)
             {
+            case SourceSection::GameStateData:
+                PersistentIdFixIndependentSourceCollector::ObserveGameState(
+                    descriptor,
+                    static_cast<const SDK::FGameStateSaveData*>(destination));
+                break;
+
             case SourceSection::BuildingCustomNames:
                 PersistentIdFixIndependentSourceCollector::ObserveBuildingCustomNames(
                     descriptor,
