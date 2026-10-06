@@ -1,5 +1,8 @@
 ﻿#include "SourceReadObserver.h"
 
+#include "MassFragmentClassifier.h"
+#include "SDK/Chimera_structs.hpp"
+
 #include "plugin_helpers.h"
 
 #include <atomic>
@@ -146,6 +149,15 @@ namespace PersistentIdFixSourceReadObserver
             1,
             std::memory_order_relaxed);
 
+        if (section == SourceSection::Mass)
+        {
+            // Native GetSaveData has successfully reconstructed the typed Mass
+            // destination. Inspect it synchronously before the caller resumes.
+            PersistentIdFixMassFragmentClassifier::ObserveMassSaveData(
+                static_cast<const SDK::UScriptStruct*>(structType),
+                static_cast<const SDK::FCrMassSaveData*>(destination));
+        }
+
         if (section != SourceSection::Unknown)
         {
             g_recognizedSuccessfulReads.fetch_add(
@@ -268,6 +280,8 @@ namespace PersistentIdFixSourceReadObserver
             static_cast<unsigned long long>(snapshot.ziplineReplicatorReads),
             static_cast<unsigned long long>(snapshot.ziplineSubsystemReads),
             static_cast<unsigned long long>(snapshot.baseCoreReplicationHelperReads));
+
+        PersistentIdFixMassFragmentClassifier::LogSnapshot(phase);
     }
 
     void Reset()
@@ -311,5 +325,7 @@ namespace PersistentIdFixSourceReadObserver
         g_baseCoreReplicationHelperReads.store(
             0,
             std::memory_order_relaxed);
+
+        PersistentIdFixMassFragmentClassifier::Reset();
     }
 }
