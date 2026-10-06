@@ -1,6 +1,7 @@
 ﻿#include "MassFragmentClassifier.h"
 
 #include "plugin_helpers.h"
+#include "IndependentSourceCollector.h"
 
 #include "SDK/Chimera_structs.hpp"
 #include "SDK/AuActorPlacement_structs.hpp"
@@ -1631,11 +1632,21 @@ namespace PersistentIdFixMassFragmentClassifier
             static_cast<unsigned long long>(g_resolvedTagRegistry.size()),
             g_massSaveDataDescriptor,
             reinterpret_cast<void*>(resolverAddress));
+
+        if (!PersistentIdFixIndependentSourceCollector::InitializeDescriptorRegistry(
+                engineEvents))
+        {
+            LOG_WARN(
+                "PersistentIdFix: independent fixed-source descriptor registry unavailable; reuse coverage will remain incomplete");
+        }
+
         return true;
     }
 
     void ResetDescriptorRegistry()
     {
+        PersistentIdFixIndependentSourceCollector::ResetDescriptorRegistry();
+
         std::lock_guard<std::mutex> lock(g_registryMutex);
         g_descriptorRegistryReady = false;
         g_massSaveDataDescriptor = nullptr;

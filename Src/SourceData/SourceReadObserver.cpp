@@ -1,6 +1,7 @@
 ﻿#include "SourceReadObserver.h"
 
 #include "MassFragmentClassifier.h"
+#include "IndependentSourceCollector.h"
 #include "SDK/Chimera_structs.hpp"
 
 #include "plugin_helpers.h"
@@ -142,6 +143,32 @@ namespace PersistentIdFixSourceReadObserver
                 1,
                 std::memory_order_relaxed);
 
+            switch (section)
+            {
+            case SourceSection::BuildingCustomNames:
+                PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                    PersistentIdFixIndependentSourceCollector::Section::BuildingCustomNames);
+                break;
+            case SourceSection::AntennasData:
+                PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                    PersistentIdFixIndependentSourceCollector::Section::AntennasData);
+                break;
+            case SourceSection::ZiplineReplicator:
+                PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                    PersistentIdFixIndependentSourceCollector::Section::ZiplineReplicator);
+                break;
+            case SourceSection::ZiplineSubsystem:
+                PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                    PersistentIdFixIndependentSourceCollector::Section::ZiplineSubsystem);
+                break;
+            case SourceSection::BaseCoreReplicationHelper:
+                PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                    PersistentIdFixIndependentSourceCollector::Section::BaseCoreReplication);
+                break;
+            default:
+                break;
+            }
+
             return false;
         }
 
@@ -156,6 +183,47 @@ namespace PersistentIdFixSourceReadObserver
             PersistentIdFixMassFragmentClassifier::ObserveMassSaveData(
                 static_cast<const SDK::UScriptStruct*>(structType),
                 static_cast<const SDK::FCrMassSaveData*>(destination));
+        }
+        else
+        {
+            const SDK::UScriptStruct* descriptor =
+                static_cast<const SDK::UScriptStruct*>(structType);
+
+            switch (section)
+            {
+            case SourceSection::BuildingCustomNames:
+                PersistentIdFixIndependentSourceCollector::ObserveBuildingCustomNames(
+                    descriptor,
+                    static_cast<const SDK::FBuildingCustomNameSaveData*>(destination));
+                break;
+
+            case SourceSection::AntennasData:
+                PersistentIdFixIndependentSourceCollector::ObserveAntennas(
+                    descriptor,
+                    static_cast<const SDK::FCrAntennaSaveData*>(destination));
+                break;
+
+            case SourceSection::ZiplineReplicator:
+                PersistentIdFixIndependentSourceCollector::ObserveZiplineReplicator(
+                    descriptor,
+                    static_cast<const SDK::FCrZiplineReplicatorSaveData*>(destination));
+                break;
+
+            case SourceSection::ZiplineSubsystem:
+                PersistentIdFixIndependentSourceCollector::ObserveZiplineSubsystem(
+                    descriptor,
+                    static_cast<const SDK::FCrZiplineSaveData*>(destination));
+                break;
+
+            case SourceSection::BaseCoreReplicationHelper:
+                PersistentIdFixIndependentSourceCollector::ObserveBaseCoreReplication(
+                    descriptor,
+                    static_cast<const SDK::FBaseCoreReplicationSaveData*>(destination));
+                break;
+
+            default:
+                break;
+            }
         }
 
         if (section != SourceSection::Unknown)
@@ -282,6 +350,7 @@ namespace PersistentIdFixSourceReadObserver
             static_cast<unsigned long long>(snapshot.baseCoreReplicationHelperReads));
 
         PersistentIdFixMassFragmentClassifier::LogSnapshot(phase);
+        PersistentIdFixIndependentSourceCollector::LogSnapshot(phase);
     }
 
     void Reset()
@@ -327,5 +396,6 @@ namespace PersistentIdFixSourceReadObserver
             std::memory_order_relaxed);
 
         PersistentIdFixMassFragmentClassifier::Reset();
+        PersistentIdFixIndependentSourceCollector::Reset();
     }
 }

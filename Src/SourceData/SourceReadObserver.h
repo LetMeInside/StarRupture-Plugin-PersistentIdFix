@@ -37,8 +37,8 @@ namespace PersistentIdFixSourceReadObserver
     //
     // The section-name identity is captured before invoking the native
     // function because its by-value FString argument is destroyed by the
-    // callee. Step 3A deliberately treats structType and destination as
-    // opaque and records coverage only after successful native conversion.
+    // callee. Successful certified sections are inspected synchronously after
+    // native conversion and before control returns to the native consumer.
     bool ObserveGetSaveData(
         GetSaveDataFn original,
         void* saveSubsystem,

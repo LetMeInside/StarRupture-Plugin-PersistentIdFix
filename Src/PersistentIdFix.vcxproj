@@ -113,6 +113,7 @@
     <ClInclude Include="Native\NativeIdLookup.h" />
     <ClInclude Include="SourceData\SourceReadObserver.h" />
     <ClInclude Include="SourceData\MassFragmentClassifier.h" />
+    <ClInclude Include="SourceData\IndependentSourceCollector.h" />
     <ClInclude Include="PersistentId\PersistentIdReuse.h" />
     <ClInclude Include="plugin.h" />
     <ClInclude Include="plugin_helpers.h" />
@@ -133,6 +134,7 @@
     <ClCompile Include="Native\Fingerprints.cpp" />
     <ClCompile Include="SourceData\SourceReadObserver.cpp" />
     <ClCompile Include="SourceData\MassFragmentClassifier.cpp" />
+    <ClCompile Include="SourceData\IndependentSourceCollector.cpp" />
     <ClCompile Include="Network\Network.cpp" />
     <ClCompile Include="Stats\Stats.cpp" />
     <ClCompile Include="UI\UI.cpp" />
