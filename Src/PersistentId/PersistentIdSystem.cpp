@@ -679,6 +679,50 @@ namespace PersistentIdFixSystem
             static_cast<std::uint64_t>(
                 g_persistentIdReuse.GetRangeCount());
 
+        if (!g_persistentIdReuse.StagePoolFromBlockedIds(
+                blocked,
+                g_loadedHighWater))
+        {
+            LOG_ERROR(
+                "PersistentIdFix: staged certified pool construction failed");
+            g_persistentIdReuse.ClearStagedPool();
+            diagnostic.valid = false;
+            return diagnostic;
+        }
+
+        diagnostic.stagedReusableIds =
+            g_persistentIdReuse.GetStagedReusableIDCount();
+        diagnostic.stagedRanges =
+            static_cast<std::uint64_t>(
+                g_persistentIdReuse.GetStagedRangeCount());
+
+        diagnostic.stagedHasFirstRange =
+            g_persistentIdReuse.GetStagedFirstRange(
+                diagnostic.stagedFirst,
+                diagnostic.stagedFirstLast);
+
+        diagnostic.stagedHasLastRange =
+            g_persistentIdReuse.GetStagedLastRange(
+                diagnostic.stagedLastFirst,
+                diagnostic.stagedLast);
+
+        if (diagnostic.stagedReusableIds !=
+                diagnostic.candidateReusableIds ||
+            diagnostic.stagedRanges !=
+                diagnostic.candidateRanges)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: staged certified pool disagrees with candidate arithmetic: stagedReusable=%llu candidateReusable=%llu stagedRanges=%llu candidateRanges=%llu",
+                static_cast<unsigned long long>(diagnostic.stagedReusableIds),
+                static_cast<unsigned long long>(diagnostic.candidateReusableIds),
+                static_cast<unsigned long long>(diagnostic.stagedRanges),
+                static_cast<unsigned long long>(diagnostic.candidateRanges));
+
+            g_persistentIdReuse.ClearStagedPool();
+            diagnostic.valid = false;
+            return diagnostic;
+        }
+
         LOG_INFO(
             "PersistentIdFix: candidate pool diagnostic: generation=%llu highWater=%u loadedH=%llu sourceProtected=%llu ledgerProtected=%llu blockedUnique=%llu sourceOnlyBlocked=%llu candidateReusable=%llu candidateRanges=%llu legacyReusable=%llu legacyRanges=%llu deltaReusable=%lld",
             static_cast<unsigned long long>(diagnostic.loadGeneration),
@@ -694,6 +738,20 @@ namespace PersistentIdFixSystem
             static_cast<unsigned long long>(diagnostic.legacyRanges),
             static_cast<long long>(diagnostic.legacyReusableIds) -
                 static_cast<long long>(diagnostic.candidateReusableIds));
+
+        LOG_INFO(
+            "PersistentIdFix: staged certified pool: generation=%llu reusable=%llu ranges=%llu first=%u-%u hasFirst=%u last=%u-%u hasLast=%u activeLegacyReusable=%llu activeLegacyRanges=%llu",
+            static_cast<unsigned long long>(diagnostic.loadGeneration),
+            static_cast<unsigned long long>(diagnostic.stagedReusableIds),
+            static_cast<unsigned long long>(diagnostic.stagedRanges),
+            diagnostic.stagedFirst,
+            diagnostic.stagedFirstLast,
+            diagnostic.stagedHasFirstRange ? 1u : 0u,
+            diagnostic.stagedLastFirst,
+            diagnostic.stagedLast,
+            diagnostic.stagedHasLastRange ? 1u : 0u,
+            static_cast<unsigned long long>(diagnostic.legacyReusableIds),
+            static_cast<unsigned long long>(diagnostic.legacyRanges));
 
         return diagnostic;
     }

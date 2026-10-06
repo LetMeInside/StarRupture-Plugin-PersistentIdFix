@@ -32,6 +32,14 @@ namespace PersistentIdFixSystem
         std::uint64_t candidateRanges = 0;
         std::uint64_t legacyReusableIds = 0;
         std::uint64_t legacyRanges = 0;
+        std::uint64_t stagedReusableIds = 0;
+        std::uint64_t stagedRanges = 0;
+        bool stagedHasFirstRange = false;
+        std::uint32_t stagedFirst = 0;
+        std::uint32_t stagedFirstLast = 0;
+        bool stagedHasLastRange = false;
+        std::uint32_t stagedLastFirst = 0;
+        std::uint32_t stagedLast = 0;
     };
 
     void Configure(
