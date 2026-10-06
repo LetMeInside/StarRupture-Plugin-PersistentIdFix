@@ -15,13 +15,35 @@ IPluginSelf* g_self = nullptr;
 IPluginSelf* GetSelf() { return g_self; }
 
 static HookHandle g_getOrAddIDForHandleHook = nullptr;
+static HookHandle g_getSaveDataHook = nullptr;
 
 // SDK hook output; passed to PersistentIdFixSystem for native delegation.
 static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
 
+// Native source-read observer trampoline. Step 2 is intentionally passive:
+// it forwards the call unchanged and does not inspect or retain source data.
+static GetSaveDataFn g_originalGetSaveData = nullptr;
+
 static uintptr_t g_getOrAddIDForHandleAddress = 0;
+static uintptr_t g_getSaveDataAddress = 0;
 
 static uintptr_t g_setIDHandlePairAddress = 0;
+
+static bool GetSaveDataDetour(
+    void* saveSubsystem,
+    void* sectionName,
+    const void* structType,
+    void* destination)
+{
+    if (g_originalGetSaveData == nullptr)
+        return false;
+
+    return g_originalGetSaveData(
+        saveSubsystem,
+        sectionName,
+        structType,
+        destination);
+}
 
 static bool g_networkSessionActive = false;
 static bool g_gameWorldActive = false;
@@ -279,6 +301,9 @@ void OnPluginLoadHooks(
 
     g_setIDHandlePairAddress =
         addresses.setIDHandlePair;
+
+    g_getSaveDataAddress =
+        addresses.getSaveData;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +371,13 @@ extern "C"
                 break;
             }
 
+            if (g_getSaveDataAddress == 0)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: GetSaveData address was not resolved");
+                break;
+            }
+
             if (g_self->hooks->Hooks == nullptr)
             {
                 LOG_ERROR(
@@ -360,6 +392,38 @@ extern "C"
             LOG_INFO(
                 "PersistentIdFix: SetIDHandlePair resolved at %p",
                 reinterpret_cast<void*>(g_setIDHandlePairAddress));
+
+            LOG_INFO(
+                "PersistentIdFix: GetSaveData resolved at %p",
+                reinterpret_cast<void*>(g_getSaveDataAddress));
+
+            //
+            // Install GetSaveData source-read observer hook.
+            //
+            // Step 2 deliberately forwards every call unchanged. Collection
+            // and coverage tracking are introduced in later guarded changes.
+            //
+            g_getSaveDataHook =
+                g_self->hooks->Hooks->Install(
+                    g_getSaveDataAddress,
+                    reinterpret_cast<void*>(&GetSaveDataDetour),
+                    reinterpret_cast<void**>(
+                        &g_originalGetSaveData));
+
+            if (g_getSaveDataHook == nullptr ||
+                g_originalGetSaveData == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: failed to install GetSaveData hook");
+
+                g_getSaveDataHook = nullptr;
+                g_originalGetSaveData = nullptr;
+
+                break;
+            }
+
+            LOG_INFO(
+                "PersistentIdFix: GetSaveData observer hook installed");
 
             //
             // Install GetOrAddIDForHandle hook
@@ -532,6 +596,18 @@ extern "C"
             g_originalGetOrAddIDForHandle = nullptr;
         }
 
+        if (g_getSaveDataHook != nullptr)
+        {
+            if (g_self->hooks->Hooks != nullptr)
+            {
+                g_self->hooks->Hooks->Remove(
+                    g_getSaveDataHook);
+            }
+
+            g_getSaveDataHook = nullptr;
+            g_originalGetSaveData = nullptr;
+        }
+
         if (bInitConfig)
         {
             //
@@ -598,6 +674,13 @@ extern "C"
                     g_self->hooks->Hooks->Remove(
                         g_getOrAddIDForHandleHook);
                 }
+
+                if (g_getSaveDataHook != nullptr &&
+                    g_self->hooks->Hooks != nullptr)
+                {
+                    g_self->hooks->Hooks->Remove(
+                        g_getSaveDataHook);
+                }
             }
 
             PersistentIdFixSystem::Reset();
@@ -606,7 +689,11 @@ extern "C"
             g_getOrAddIDForHandleHook = nullptr;
             g_originalGetOrAddIDForHandle = nullptr;
 
+            g_getSaveDataHook = nullptr;
+            g_originalGetSaveData = nullptr;
+
             g_getOrAddIDForHandleAddress = 0;
+            g_getSaveDataAddress = 0;
             g_setIDHandlePairAddress = 0;
 
             g_self = nullptr;

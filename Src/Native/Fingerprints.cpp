@@ -31,11 +31,59 @@ namespace PersistentIdFixFingerprints
 
         uintptr_t getOrAddIDForHandleAddress = 0;
         uintptr_t setIDHandlePairAddress = 0;
+        uintptr_t getSaveDataAddress = 0;
 
         uintptr_t getOrAddFingerprintMapAddress = 0;
         uintptr_t getOrAddFingerprintBucketAddress = 0;
         uintptr_t getOrAddFingerprintElementAddress = 0;
         uintptr_t getOrAddFingerprintMaxIDAddress = 0;
+
+        PluginScanRequest req = PLUGIN_SCAN_REQUEST_INIT;
+
+        // UCrSaveSubsystem::GetSaveData:
+        //
+        // Audited Hotfix 0.3.5 entry sequence, shared by Client and Server.
+        //
+        //   48 89 6C 24 10      mov [rsp+10h],rbp
+        //   48 89 74 24 18      mov [rsp+18h],rsi
+        //   57                  push rdi
+        //   41 56               push r14
+        //   41 57               push r15
+        //   48 83 EC 50         sub rsp,50h
+        //   8B 42 08            mov eax,[rdx+08h]
+        //   48 8D 79 30         lea rdi,[rcx+30h]
+        //   49 8B E9            mov rbp,r9
+        //   4D 8B F0            mov r14,r8
+        //   48 8B F2            mov rsi,rdx
+        //
+        // The function consumes a by-value FString section name, a UStruct*
+        // describing the destination type, and an initialized destination.
+        // PersistentIdFix observes successful native reads before the caller
+        // resumes; Step 2 installs only the passive hook infrastructure.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::GetSaveData";
+        req.pattern =
+            "48 89 6C 24 10 "
+            "48 89 74 24 18 "
+            "57 "
+            "41 56 "
+            "41 57 "
+            "48 83 EC 50 "
+            "8B 42 08 "
+            "48 8D 79 30 "
+            "49 8B E9 "
+            "4D 8B F0 "
+            "48 8B F2";
+
+        req.kind =
+            PLUGIN_SCAN_FUNCTION_START;
+
+        getSaveDataAddress =
+            scanner->Resolve(self, &req);
+
+        if (getSaveDataAddress == 0)
+            return false;
 
         // SetIDHandlePair:
         //
@@ -67,7 +115,7 @@ namespace PersistentIdFixFingerprints
         //
         // A successful result must resolve to the function start.
 
-        PluginScanRequest req = PLUGIN_SCAN_REQUEST_INIT;
+        req = PLUGIN_SCAN_REQUEST_INIT;
         req.hookName =
             "PersistentIdFix::SetIDHandlePair";
         req.pattern =
@@ -361,6 +409,7 @@ namespace PersistentIdFixFingerprints
 
         addresses.getOrAddIDForHandle = getOrAddIDForHandleAddress;
         addresses.setIDHandlePair = setIDHandlePairAddress;
+        addresses.getSaveData = getSaveDataAddress;
 
         return true;
     }
