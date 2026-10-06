@@ -111,6 +111,42 @@ namespace
     std::mutex g_semanticValuesMutex;
     std::vector<std::uint32_t> g_semanticValues;
 
+    std::atomic<std::uint64_t> g_tagClassified{0};
+    std::atomic<std::uint64_t> g_tagEmpty{0};
+    std::atomic<std::uint64_t> g_tagMalformed{0};
+    std::atomic<std::uint64_t> g_tagUnsupported{0};
+    std::atomic<std::uint64_t> g_tagSchemaMismatches{0};
+    std::atomic<std::uint64_t> g_tagContainerFailures{0};
+
+    std::atomic<std::uint64_t> g_identityAttempts{0};
+    std::atomic<std::uint64_t> g_identitySuccesses{0};
+    std::atomic<std::uint64_t> g_identityFailures{0};
+    std::atomic<std::uint64_t> g_identityValues{0};
+    std::atomic<std::uint64_t> g_identityZeroValues{0};
+    std::atomic<std::uint64_t> g_identityInvalidSentinels{0};
+    std::atomic<std::uint64_t> g_identityContainerFailures{0};
+
+    std::mutex g_identityValuesMutex;
+    std::vector<std::uint32_t> g_identitySourceValues;
+
+    std::atomic<std::uint64_t> g_massRemainderAttempts{0};
+    std::atomic<std::uint64_t> g_massRemainderSuccesses{0};
+    std::atomic<std::uint64_t> g_massRemainderFailures{0};
+    std::atomic<std::uint64_t> g_massRemainderValues{0};
+    std::atomic<std::uint64_t> g_massRemainderZeroValues{0};
+    std::atomic<std::uint64_t> g_massRemainderInvalidSentinels{0};
+    std::atomic<std::uint64_t> g_massRemainderContainerFailures{0};
+
+    std::atomic<std::uint64_t> g_stabilityValues{0};
+    std::atomic<std::uint64_t> g_electricityValues{0};
+    std::atomic<std::uint64_t> g_logisticsValues{0};
+    std::atomic<std::uint64_t> g_waveValues{0};
+    std::atomic<std::uint64_t> g_spawnOwnershipValues{0};
+    std::atomic<std::uint64_t> g_foundableValues{0};
+
+    std::mutex g_massRemainderValuesMutex;
+    std::vector<std::uint32_t> g_massRemainderSourceValues;
+
     const std::array<RegistryEntry, 27>& Registry()
     {
         static const std::array<RegistryEntry, 27> registry{{
@@ -145,6 +181,38 @@ namespace
         return registry;
     }
 
+    struct TagRegistryEntry
+    {
+        const char* FullName;
+        const char* ImmediateBaseFullName;
+    };
+
+    const std::array<TagRegistryEntry, 12>& TagRegistry()
+    {
+        static const std::array<TagRegistryEntry, 12> registry{{
+            { "ScriptStruct ChimeraMassCommon.CrMassSavableTag", "ScriptStruct MassEntity.MassTag" },
+            { "ScriptStruct Chimera.CrMassEnviroWaveStageGrowbackTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrBuildingInfectionNonZeroTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrMassInEnviroWaveTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrBuildingBaseCoreUnavailableTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrBuildingInfectionActiveTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrMassEnviroWaveStagePrewaveTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrMassEnviroWaveStageMovingTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrMassEnviroWaveStageFadeoutTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrMassEnviroWaveTypeHeatTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrMassEnviroWaveTypeColdTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" },
+            { "ScriptStruct Chimera.CrMassTemperatureUpdatingTag", "ScriptStruct ChimeraMassCommon.CrMassSavableTag" }
+        }};
+        return registry;
+    }
+
+    struct ResolvedTagRegistryEntry
+    {
+        const TagRegistryEntry* Profile = nullptr;
+        const UScriptStruct* Descriptor = nullptr;
+        const UStruct* ExpectedBase = nullptr;
+    };
+
     struct ResolvedRegistryEntry
     {
         const RegistryEntry* Profile = nullptr;
@@ -158,6 +226,8 @@ namespace
     static std::mutex g_registryMutex;
     static std::vector<ResolvedRegistryEntry> g_resolvedRegistry;
     static std::unordered_map<const UScriptStruct*, std::size_t> g_registryByPointer;
+    static std::vector<ResolvedTagRegistryEntry> g_resolvedTagRegistry;
+    static std::unordered_map<const UScriptStruct*, std::size_t> g_tagRegistryByPointer;
     static const UScriptStruct* g_massSaveDataDescriptor = nullptr;
     static bool g_descriptorRegistryReady = false;
 
@@ -189,6 +259,29 @@ namespace
             return nullptr;
 
         return &g_resolvedRegistry[it->second];
+    }
+
+    const ResolvedTagRegistryEntry* FindResolvedTagEntry(const UScriptStruct* descriptor)
+    {
+        if (descriptor == nullptr || !g_descriptorRegistryReady)
+            return nullptr;
+        const auto it = g_tagRegistryByPointer.find(descriptor);
+        return it == g_tagRegistryByPointer.end()
+            ? nullptr
+            : &g_resolvedTagRegistry[it->second];
+    }
+
+    bool ValidateTagDescriptor(
+        const UScriptStruct* descriptor,
+        const ResolvedTagRegistryEntry& resolved)
+    {
+        return descriptor != nullptr &&
+            resolved.Profile != nullptr &&
+            descriptor == resolved.Descriptor &&
+            descriptor->SuperStruct == resolved.ExpectedBase &&
+            descriptor->Size == 1 &&
+            descriptor->MinAlignment == 1 &&
+            descriptor->ChildProperties == nullptr;
     }
 
     bool ValidateDescriptor(
@@ -306,12 +399,21 @@ namespace
         return IsReadableRange(data, countWide * sizeof(T));
     }
 
+    void RecordContainerFailure(std::atomic<std::uint64_t>* counter)
+    {
+        if (counter != nullptr)
+            counter->fetch_add(1, std::memory_order_relaxed);
+    }
+
     template <typename T, typename Visitor>
-    bool CheckedEach(const TArray<T>& values, Visitor&& visitor)
+    bool CheckedEach(
+        const TArray<T>& values,
+        Visitor&& visitor,
+        std::atomic<std::uint64_t>* failureCounter = &g_semanticContainerFailures)
     {
         if (!ValidateArray(values))
         {
-            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            RecordContainerFailure(failureCounter);
             return false;
         }
 
@@ -320,7 +422,7 @@ namespace
         {
             if (!values.IsValidIndex(index))
             {
-                g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+                RecordContainerFailure(failureCounter);
                 return false;
             }
 
@@ -334,7 +436,8 @@ namespace
     template <typename K, typename V, typename Visitor>
     bool CheckedSparseMap(
         const TMap<K, V>& values,
-        Visitor&& visitor)
+        Visitor&& visitor,
+        std::atomic<std::uint64_t>* failureCounter = &g_semanticContainerFailures)
     {
         const std::int32_t live = values.Num();
         const std::int32_t allocated = values.NumAllocated();
@@ -346,7 +449,7 @@ namespace
             live > allocated ||
             allocated > capacity)
         {
-            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            RecordContainerFailure(failureCounter);
             return false;
         }
 
@@ -356,7 +459,7 @@ namespace
             flags.Num() != allocated ||
             flags.Max() < flags.Num())
         {
-            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            RecordContainerFailure(failureCounter);
             return false;
         }
 
@@ -364,7 +467,7 @@ namespace
         {
             if (live != 0)
             {
-                g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+                RecordContainerFailure(failureCounter);
                 return false;
             }
             return true;
@@ -372,7 +475,7 @@ namespace
 
         if (!values.IsValid() || flags.GetData() == nullptr)
         {
-            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            RecordContainerFailure(failureCounter);
             return false;
         }
 
@@ -381,7 +484,7 @@ namespace
         if (wordCount >
             (std::numeric_limits<std::size_t>::max)() / sizeof(std::uint32_t))
         {
-            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            RecordContainerFailure(failureCounter);
             return false;
         }
 
@@ -389,7 +492,42 @@ namespace
                 flags.GetData(),
                 wordCount * sizeof(std::uint32_t)))
         {
-            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            RecordContainerFailure(failureCounter);
+            return false;
+        }
+
+        struct SparseDataHeader
+        {
+            const void* Data;
+            std::int32_t Num;
+            std::int32_t Max;
+        };
+        static_assert(sizeof(SparseDataHeader) == 0x10);
+
+        using PairType = typename TMap<K, V>::ElementType;
+        using SlotType = UC::ContainerImpl::SetElement<PairType>;
+
+        const auto& sparseData =
+            *reinterpret_cast<const SparseDataHeader*>(&values);
+
+        if (sparseData.Num != allocated ||
+            sparseData.Max != capacity ||
+            sparseData.Data == nullptr ||
+            (reinterpret_cast<std::uintptr_t>(sparseData.Data) %
+                alignof(SlotType)) != 0)
+        {
+            RecordContainerFailure(failureCounter);
+            return false;
+        }
+
+        const auto allocatedWide = static_cast<std::size_t>(allocated);
+        if (allocatedWide >
+            (std::numeric_limits<std::size_t>::max)() / sizeof(SlotType) ||
+            !IsReadableRange(
+                sparseData.Data,
+                allocatedWide * sizeof(SlotType)))
+        {
+            RecordContainerFailure(failureCounter);
             return false;
         }
 
@@ -403,7 +541,7 @@ namespace
 
         if (visited != live)
         {
-            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            RecordContainerFailure(failureCounter);
             return false;
         }
 
@@ -717,6 +855,490 @@ namespace
         }
     }
 
+    bool ObserveTag(const FInstancedStruct& payload)
+    {
+        g_tagPayloads.fetch_add(1, std::memory_order_relaxed);
+
+        const UScriptStruct* type = payload.ScriptStruct;
+        const bool hasType = type != nullptr;
+        const bool hasMemory = payload.StructMemory != nullptr;
+
+        if (!hasType && !hasMemory)
+        {
+            g_tagEmpty.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+
+        if (hasType != hasMemory)
+        {
+            g_tagMalformed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        const ResolvedTagRegistryEntry* resolved = FindResolvedTagEntry(type);
+        if (resolved == nullptr || resolved->Profile == nullptr)
+        {
+            g_tagUnsupported.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        if (!ValidateTagDescriptor(type, *resolved) ||
+            !IsReadableRange(payload.StructMemory, 1))
+        {
+            g_tagSchemaMismatches.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        g_tagClassified.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool CommitEntityIdentities(const FCrMassSaveData& mass)
+    {
+        g_identityAttempts.fetch_add(1, std::memory_order_relaxed);
+
+        std::vector<std::uint32_t> staged;
+        try
+        {
+            if (!CheckedSparseMap(
+                    mass.Entities,
+                    [&](const auto& pair)
+                    {
+                        return EmitNumeric(staged, pair.Key().ID);
+                    },
+                    &g_identityContainerFailures))
+            {
+                g_identityFailures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            std::uint64_t zeros = 0;
+            std::uint64_t sentinels = 0;
+            for (const std::uint32_t value : staged)
+            {
+                if (value == 0)
+                    ++zeros;
+                if (value == (std::numeric_limits<std::uint32_t>::max)())
+                    ++sentinels;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_identityValuesMutex);
+                g_identitySourceValues.insert(
+                    g_identitySourceValues.end(),
+                    staged.begin(),
+                    staged.end());
+            }
+
+            g_identityValues.fetch_add(
+                static_cast<std::uint64_t>(staged.size()),
+                std::memory_order_relaxed);
+            g_identityZeroValues.fetch_add(zeros, std::memory_order_relaxed);
+            g_identityInvalidSentinels.fetch_add(
+                sentinels,
+                std::memory_order_relaxed);
+            g_identitySuccesses.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        catch (...)
+        {
+            g_identityFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
+    struct MassRemainderDomainCounts
+    {
+        std::uint64_t stability = 0;
+        std::uint64_t electricity = 0;
+        std::uint64_t logistics = 0;
+        std::uint64_t wave = 0;
+        std::uint64_t spawnOwnership = 0;
+        std::uint64_t foundable = 0;
+    };
+
+    bool EmitMassRemainder(
+        std::vector<std::uint32_t>& staged,
+        std::uint32_t value,
+        std::uint64_t& domainCount)
+    {
+        if (!EmitNumeric(staged, value))
+            return false;
+
+        ++domainCount;
+        return true;
+    }
+
+    template <typename T>
+    bool CollectMassPidArray(
+        const TArray<T>& values,
+        std::vector<std::uint32_t>& staged,
+        std::uint64_t& domainCount)
+    {
+        return CheckedEach(
+            values,
+            [&](const T& value)
+            {
+                return EmitMassRemainder(
+                    staged,
+                    value.ID,
+                    domainCount);
+            },
+            &g_massRemainderContainerFailures);
+    }
+
+    bool CollectMassRemainderValues(
+        const FCrMassSaveData& mass,
+        std::vector<std::uint32_t>& staged,
+        MassRemainderDomainCounts& counts)
+    {
+        const auto& stability = mass.StabilitySubsystemState;
+        const auto& graph = stability.GraphData;
+
+        if (!CheckedSparseMap(
+                graph.Neighbours,
+                [&](const auto& pair)
+                {
+                    return EmitMassRemainder(
+                            staged,
+                            pair.Key().ID,
+                            counts.stability) &&
+                        CollectMassPidArray(
+                            pair.Value().Values,
+                            staged,
+                            counts.stability);
+                },
+                &g_massRemainderContainerFailures) ||
+            !CheckedSparseMap(
+                graph.NodeDatas,
+                [&](const auto& pair)
+                {
+                    return EmitMassRemainder(
+                        staged,
+                        pair.Key().ID,
+                        counts.stability);
+                },
+                &g_massRemainderContainerFailures) ||
+            !EmitMassRemainder(
+                staged,
+                graph.GroundNode.ID,
+                counts.stability))
+        {
+            return false;
+        }
+
+        if (!CheckedSparseMap(
+                stability.CustomConnectionData,
+                [&](const auto& pair)
+                {
+                    const auto& value = pair.Value();
+
+                    if (!EmitMassRemainder(
+                            staged,
+                            pair.Key().ID,
+                            counts.stability) ||
+                        !CollectMassPidArray(
+                            value.Ramps,
+                            staged,
+                            counts.stability) ||
+                        !CollectMassPidArray(
+                            value.Buildings,
+                            staged,
+                            counts.stability))
+                    {
+                        return false;
+                    }
+
+                    return CheckedSparseMap(
+                        value.SocketConnections,
+                        [&](const auto& socketPair)
+                        {
+                            return CollectMassPidArray(
+                                socketPair.Value().Values,
+                                staged,
+                                counts.stability);
+                        },
+                        &g_massRemainderContainerFailures);
+                },
+                &g_massRemainderContainerFailures))
+        {
+            return false;
+        }
+
+        const auto collectStabilityPidArrayMap =
+            [&](const auto& values) -> bool
+            {
+                return CheckedSparseMap(
+                    values,
+                    [&](const auto& pair)
+                    {
+                        return EmitMassRemainder(
+                                staged,
+                                pair.Key().ID,
+                                counts.stability) &&
+                            CollectMassPidArray(
+                                pair.Value().Values,
+                                staged,
+                                counts.stability);
+                    },
+                    &g_massRemainderContainerFailures);
+            };
+
+        if (!collectStabilityPidArrayMap(stability.RampConnectionData) ||
+            !collectStabilityPidArrayMap(stability.BuildingFoundationData))
+        {
+            return false;
+        }
+
+        const auto& electricity = mass.ElectricitySubsystemState;
+
+        if (!CheckedSparseMap(
+                electricity.NodeData,
+                [&](const auto& pair)
+                {
+                    const auto& node = pair.Value();
+
+                    if (!EmitMassRemainder(
+                            staged,
+                            pair.Key().UId.ID,
+                            counts.electricity) ||
+                        !EmitMassRemainder(
+                            staged,
+                            node.Handle.ID,
+                            counts.electricity))
+                    {
+                        return false;
+                    }
+
+                    return CheckedEach(
+                        node.NeighbourData,
+                        [&](const auto& neighbour)
+                        {
+                            return EmitMassRemainder(
+                                    staged,
+                                    neighbour.Neighbour.ID,
+                                    counts.electricity) &&
+                                CollectMassPidArray(
+                                    neighbour.Connectors,
+                                    staged,
+                                    counts.electricity);
+                        },
+                        &g_massRemainderContainerFailures);
+                },
+                &g_massRemainderContainerFailures))
+        {
+            return false;
+        }
+
+        if (!CheckedSparseMap(
+                electricity.SubgraphData,
+                [&](const auto& pair)
+                {
+                    const auto& value = pair.Value();
+                    return CollectMassPidArray(
+                            value.Nodes,
+                            staged,
+                            counts.electricity) &&
+                        CollectMassPidArray(
+                            value.Connectors,
+                            staged,
+                            counts.electricity);
+                },
+                &g_massRemainderContainerFailures) ||
+            !CheckedSparseMap(
+                electricity.ConnectorData,
+                [&](const auto& pair)
+                {
+                    const auto& value = pair.Value();
+                    return EmitMassRemainder(
+                            staged,
+                            pair.Key().ID,
+                            counts.electricity) &&
+                        EmitMassRemainder(
+                            staged,
+                            value.Node1.ID,
+                            counts.electricity) &&
+                        EmitMassRemainder(
+                            staged,
+                            value.Node2.ID,
+                            counts.electricity);
+                },
+                &g_massRemainderContainerFailures))
+        {
+            return false;
+        }
+
+        const auto& logistics = mass.LogisticsRequestSubsystemState;
+
+        if (!CheckedSparseMap(
+                logistics.RequestData,
+                [&](const auto& pair)
+                {
+                    const auto& request = pair.Value();
+
+                    if (!EmitMassRemainder(
+                            staged,
+                            pair.Key().ID,
+                            counts.logistics) ||
+                        !EmitMassRemainder(
+                            staged,
+                            request.UId.ID,
+                            counts.logistics) ||
+                        !EmitMassRemainder(
+                            staged,
+                            request.RequesterEntity.ID,
+                            counts.logistics))
+                    {
+                        return false;
+                    }
+
+                    return CheckedEach(
+                        request.RuntimeData,
+                        [&](const auto& runtime)
+                        {
+                            return EmitMassRemainder(
+                                    staged,
+                                    runtime.AgentEntity.ID,
+                                    counts.logistics) &&
+                                EmitMassRemainder(
+                                    staged,
+                                    runtime.ItemSource.ID,
+                                    counts.logistics) &&
+                                EmitMassRemainder(
+                                    staged,
+                                    runtime.ItemDestination.ID,
+                                    counts.logistics);
+                        },
+                        &g_massRemainderContainerFailures);
+                },
+                &g_massRemainderContainerFailures) ||
+            !CheckedSparseMap(
+                logistics.StorageToItemsInTransfer,
+                [&](const auto& pair)
+                {
+                    return EmitMassRemainder(
+                        staged,
+                        pair.Key().ID,
+                        counts.logistics);
+                },
+                &g_massRemainderContainerFailures))
+        {
+            return false;
+        }
+
+        if (!CollectMassPidArray(
+                mass.EnviroWaveSubsystemState.EntitiesInWave.Values,
+                staged,
+                counts.wave) ||
+            !CheckedSparseMap(
+                mass.BuildingSpawnPointsSaveData.SpawnPointOwnerships,
+                [&](const auto& pair)
+                {
+                    return EmitMassRemainder(
+                        staged,
+                        pair.Key().ID,
+                        counts.spawnOwnership);
+                },
+                &g_massRemainderContainerFailures) ||
+            !CheckedSparseMap(
+                mass.FoundableEntitiesSpawnData,
+                [&](const auto& pair)
+                {
+                    return EmitMassRemainder(
+                        staged,
+                        pair.Key().ID,
+                        counts.foundable);
+                },
+                &g_massRemainderContainerFailures) ||
+            !CheckedSparseMap(
+                mass.FoundableEntityToPersistentIdMap,
+                [&](const auto& pair)
+                {
+                    return EmitMassRemainder(
+                        staged,
+                        pair.Value().ID,
+                        counts.foundable);
+                },
+                &g_massRemainderContainerFailures))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool CommitMassRemainderValues(const FCrMassSaveData& mass)
+    {
+        g_massRemainderAttempts.fetch_add(1, std::memory_order_relaxed);
+
+        std::vector<std::uint32_t> staged;
+        MassRemainderDomainCounts counts{};
+
+        try
+        {
+            if (!CollectMassRemainderValues(mass, staged, counts))
+            {
+                g_massRemainderFailures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            std::uint64_t zeros = 0;
+            std::uint64_t sentinels = 0;
+            for (const std::uint32_t value : staged)
+            {
+                if (value == 0)
+                    ++zeros;
+                if (value == (std::numeric_limits<std::uint32_t>::max)())
+                    ++sentinels;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_massRemainderValuesMutex);
+                g_massRemainderSourceValues.insert(
+                    g_massRemainderSourceValues.end(),
+                    staged.begin(),
+                    staged.end());
+            }
+
+            g_massRemainderValues.fetch_add(
+                static_cast<std::uint64_t>(staged.size()),
+                std::memory_order_relaxed);
+            g_massRemainderZeroValues.fetch_add(
+                zeros,
+                std::memory_order_relaxed);
+            g_massRemainderInvalidSentinels.fetch_add(
+                sentinels,
+                std::memory_order_relaxed);
+
+            g_stabilityValues.fetch_add(
+                counts.stability,
+                std::memory_order_relaxed);
+            g_electricityValues.fetch_add(
+                counts.electricity,
+                std::memory_order_relaxed);
+            g_logisticsValues.fetch_add(
+                counts.logistics,
+                std::memory_order_relaxed);
+            g_waveValues.fetch_add(
+                counts.wave,
+                std::memory_order_relaxed);
+            g_spawnOwnershipValues.fetch_add(
+                counts.spawnOwnership,
+                std::memory_order_relaxed);
+            g_foundableValues.fetch_add(
+                counts.foundable,
+                std::memory_order_relaxed);
+
+            g_massRemainderSuccesses.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        catch (...)
+        {
+            g_massRemainderFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
     void ObservePayload(const FInstancedStruct& payload)
     {
         g_massPayloads.fetch_add(1, std::memory_order_relaxed);
@@ -796,6 +1418,8 @@ namespace PersistentIdFixMassFragmentClassifier
         g_massSaveDataDescriptor = nullptr;
         g_registryByPointer.clear();
         g_resolvedRegistry.clear();
+        g_tagRegistryByPointer.clear();
+        g_resolvedTagRegistry.clear();
 
         if (engineEvents == nullptr ||
             engineEvents->GetStaticFindObjectSafeByNameAddress == nullptr)
@@ -950,12 +1574,61 @@ namespace PersistentIdFixMassFragmentClassifier
             g_registryByPointer.emplace(descriptor, index);
         }
 
+        const auto& tagRegistry = TagRegistry();
+        g_resolvedTagRegistry.reserve(tagRegistry.size());
+        g_tagRegistryByPointer.reserve(tagRegistry.size());
+
+        for (const TagRegistryEntry& profile : tagRegistry)
+        {
+            const std::wstring path = NativePathFromProfileName(profile.FullName);
+            const std::wstring basePath = NativePathFromProfileName(profile.ImmediateBaseFullName);
+
+            UObject* object =
+                path.empty() ? nullptr :
+                findSafe(scriptStructClass, nullptr, path.c_str(), true);
+            UObject* baseObject =
+                basePath.empty() ? nullptr :
+                findSafe(scriptStructClass, nullptr, basePath.c_str(), true);
+
+            if (object == nullptr || baseObject == nullptr)
+            {
+                LOG_WARN(
+                    "PersistentIdFix: tag descriptor registry lookup failed for %s",
+                    profile.FullName);
+                g_resolvedTagRegistry.clear();
+                g_tagRegistryByPointer.clear();
+                return false;
+            }
+
+            const UScriptStruct* descriptor =
+                reinterpret_cast<const UScriptStruct*>(object);
+            ResolvedTagRegistryEntry resolved{
+                &profile,
+                descriptor,
+                reinterpret_cast<const UStruct*>(baseObject) };
+
+            if (!ValidateTagDescriptor(descriptor, resolved))
+            {
+                LOG_WARN(
+                    "PersistentIdFix: tag descriptor schema mismatch for %s",
+                    profile.FullName);
+                g_resolvedTagRegistry.clear();
+                g_tagRegistryByPointer.clear();
+                return false;
+            }
+
+            const std::size_t index = g_resolvedTagRegistry.size();
+            g_resolvedTagRegistry.push_back(resolved);
+            g_tagRegistryByPointer.emplace(descriptor, index);
+        }
+
         g_massSaveDataDescriptor = massDescriptor;
         g_descriptorRegistryReady = true;
 
         LOG_INFO(
-            "PersistentIdFix: Mass descriptor registry ready: profiles=%llu Mass=%p resolver=%p",
+            "PersistentIdFix: Mass descriptor registry ready: profiles=%llu tags=%llu Mass=%p resolver=%p",
             static_cast<unsigned long long>(g_resolvedRegistry.size()),
+            static_cast<unsigned long long>(g_resolvedTagRegistry.size()),
             g_massSaveDataDescriptor,
             reinterpret_cast<void*>(resolverAddress));
         return true;
@@ -968,6 +1641,8 @@ namespace PersistentIdFixMassFragmentClassifier
         g_massSaveDataDescriptor = nullptr;
         g_registryByPointer.clear();
         g_resolvedRegistry.clear();
+        g_tagRegistryByPointer.clear();
+        g_resolvedTagRegistry.clear();
     }
 
     bool IsDescriptorRegistryReady()
@@ -1017,6 +1692,18 @@ namespace PersistentIdFixMassFragmentClassifier
             return;
         }
 
+        if (!CommitEntityIdentities(*massSaveData))
+        {
+            LOG_WARN(
+                "PersistentIdFix: Mass entity identity collection failed");
+        }
+
+        if (!CommitMassRemainderValues(*massSaveData))
+        {
+            LOG_WARN(
+                "PersistentIdFix: fixed-layout Mass remainder collection failed");
+        }
+
         const auto& entities = massSaveData->Entities;
         const std::int32_t expected = entities.Num();
         const std::int32_t allocated = entities.NumAllocated();
@@ -1042,10 +1729,17 @@ namespace PersistentIdFixMassFragmentClassifier
             for (const FInstancedStruct& payload : entity.FragmentValues)
                 ObservePayload(payload);
 
-            // Tags are a separate domain in Step 3C.
-            g_tagPayloads.fetch_add(
-                static_cast<std::uint64_t>(entity.Tags.Num()),
-                std::memory_order_relaxed);
+            if (!CheckedEach(
+                    entity.Tags,
+                    [&](const FInstancedStruct& tag)
+                    {
+                        return ObserveTag(tag);
+                    },
+                    &g_tagContainerFailures))
+            {
+                LOG_WARN(
+                    "PersistentIdFix: Mass tag collection incomplete for entity");
+            }
         }
 
         if (visited != expected)
@@ -1080,6 +1774,36 @@ namespace PersistentIdFixMassFragmentClassifier
         snapshot.semanticZeroValues = g_semanticZeroValues.load(std::memory_order_relaxed);
         snapshot.semanticInvalidSentinels = g_semanticInvalidSentinels.load(std::memory_order_relaxed);
         snapshot.semanticContainerFailures = g_semanticContainerFailures.load(std::memory_order_relaxed);
+
+        snapshot.tagClassified = g_tagClassified.load(std::memory_order_relaxed);
+        snapshot.tagEmpty = g_tagEmpty.load(std::memory_order_relaxed);
+        snapshot.tagMalformed = g_tagMalformed.load(std::memory_order_relaxed);
+        snapshot.tagUnsupported = g_tagUnsupported.load(std::memory_order_relaxed);
+        snapshot.tagSchemaMismatches = g_tagSchemaMismatches.load(std::memory_order_relaxed);
+        snapshot.tagContainerFailures = g_tagContainerFailures.load(std::memory_order_relaxed);
+
+        snapshot.identityAttempts = g_identityAttempts.load(std::memory_order_relaxed);
+        snapshot.identitySuccesses = g_identitySuccesses.load(std::memory_order_relaxed);
+        snapshot.identityFailures = g_identityFailures.load(std::memory_order_relaxed);
+        snapshot.identityValues = g_identityValues.load(std::memory_order_relaxed);
+        snapshot.identityZeroValues = g_identityZeroValues.load(std::memory_order_relaxed);
+        snapshot.identityInvalidSentinels = g_identityInvalidSentinels.load(std::memory_order_relaxed);
+        snapshot.identityContainerFailures = g_identityContainerFailures.load(std::memory_order_relaxed);
+
+        snapshot.massRemainderAttempts = g_massRemainderAttempts.load(std::memory_order_relaxed);
+        snapshot.massRemainderSuccesses = g_massRemainderSuccesses.load(std::memory_order_relaxed);
+        snapshot.massRemainderFailures = g_massRemainderFailures.load(std::memory_order_relaxed);
+        snapshot.massRemainderValues = g_massRemainderValues.load(std::memory_order_relaxed);
+        snapshot.massRemainderZeroValues = g_massRemainderZeroValues.load(std::memory_order_relaxed);
+        snapshot.massRemainderInvalidSentinels = g_massRemainderInvalidSentinels.load(std::memory_order_relaxed);
+        snapshot.massRemainderContainerFailures = g_massRemainderContainerFailures.load(std::memory_order_relaxed);
+
+        snapshot.stabilityValues = g_stabilityValues.load(std::memory_order_relaxed);
+        snapshot.electricityValues = g_electricityValues.load(std::memory_order_relaxed);
+        snapshot.logisticsValues = g_logisticsValues.load(std::memory_order_relaxed);
+        snapshot.waveValues = g_waveValues.load(std::memory_order_relaxed);
+        snapshot.spawnOwnershipValues = g_spawnOwnershipValues.load(std::memory_order_relaxed);
+        snapshot.foundableValues = g_foundableValues.load(std::memory_order_relaxed);
         return snapshot;
     }
 
@@ -1112,6 +1836,45 @@ namespace PersistentIdFixMassFragmentClassifier
             static_cast<unsigned long long>(snapshot.semanticZeroValues),
             static_cast<unsigned long long>(snapshot.semanticInvalidSentinels),
             static_cast<unsigned long long>(snapshot.semanticContainerFailures));
+
+        LOG_INFO(
+            "PersistentIdFix: Mass tags [%s]: payloads=%llu classified=%llu empty=%llu malformed=%llu unsupported=%llu schemaMismatch=%llu containerFailures=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.tagPayloads),
+            static_cast<unsigned long long>(snapshot.tagClassified),
+            static_cast<unsigned long long>(snapshot.tagEmpty),
+            static_cast<unsigned long long>(snapshot.tagMalformed),
+            static_cast<unsigned long long>(snapshot.tagUnsupported),
+            static_cast<unsigned long long>(snapshot.tagSchemaMismatches),
+            static_cast<unsigned long long>(snapshot.tagContainerFailures));
+
+        LOG_INFO(
+            "PersistentIdFix: Mass entity identities [%s]: attempts=%llu success=%llu failed=%llu values=%llu zero=%llu invalidSentinel=%llu containerFailures=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.identityAttempts),
+            static_cast<unsigned long long>(snapshot.identitySuccesses),
+            static_cast<unsigned long long>(snapshot.identityFailures),
+            static_cast<unsigned long long>(snapshot.identityValues),
+            static_cast<unsigned long long>(snapshot.identityZeroValues),
+            static_cast<unsigned long long>(snapshot.identityInvalidSentinels),
+            static_cast<unsigned long long>(snapshot.identityContainerFailures));
+
+        LOG_INFO(
+            "PersistentIdFix: Mass fixed remainder PIDs [%s]: attempts=%llu success=%llu failed=%llu values=%llu zero=%llu invalidSentinel=%llu containerFailures=%llu stability=%llu electricity=%llu logistics=%llu wave=%llu spawn=%llu foundable=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.massRemainderAttempts),
+            static_cast<unsigned long long>(snapshot.massRemainderSuccesses),
+            static_cast<unsigned long long>(snapshot.massRemainderFailures),
+            static_cast<unsigned long long>(snapshot.massRemainderValues),
+            static_cast<unsigned long long>(snapshot.massRemainderZeroValues),
+            static_cast<unsigned long long>(snapshot.massRemainderInvalidSentinels),
+            static_cast<unsigned long long>(snapshot.massRemainderContainerFailures),
+            static_cast<unsigned long long>(snapshot.stabilityValues),
+            static_cast<unsigned long long>(snapshot.electricityValues),
+            static_cast<unsigned long long>(snapshot.logisticsValues),
+            static_cast<unsigned long long>(snapshot.waveValues),
+            static_cast<unsigned long long>(snapshot.spawnOwnershipValues),
+            static_cast<unsigned long long>(snapshot.foundableValues));
     }
 
     void Reset()
@@ -1136,7 +1899,49 @@ namespace PersistentIdFixMassFragmentClassifier
         g_semanticInvalidSentinels.store(0, std::memory_order_relaxed);
         g_semanticContainerFailures.store(0, std::memory_order_relaxed);
 
-        std::lock_guard<std::mutex> lock(g_semanticValuesMutex);
-        g_semanticValues.clear();
+        g_tagClassified.store(0, std::memory_order_relaxed);
+        g_tagEmpty.store(0, std::memory_order_relaxed);
+        g_tagMalformed.store(0, std::memory_order_relaxed);
+        g_tagUnsupported.store(0, std::memory_order_relaxed);
+        g_tagSchemaMismatches.store(0, std::memory_order_relaxed);
+        g_tagContainerFailures.store(0, std::memory_order_relaxed);
+
+        g_identityAttempts.store(0, std::memory_order_relaxed);
+        g_identitySuccesses.store(0, std::memory_order_relaxed);
+        g_identityFailures.store(0, std::memory_order_relaxed);
+        g_identityValues.store(0, std::memory_order_relaxed);
+        g_identityZeroValues.store(0, std::memory_order_relaxed);
+        g_identityInvalidSentinels.store(0, std::memory_order_relaxed);
+        g_identityContainerFailures.store(0, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(g_semanticValuesMutex);
+            g_semanticValues.clear();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_identityValuesMutex);
+            g_identitySourceValues.clear();
+        }
+
+        g_massRemainderAttempts.store(0, std::memory_order_relaxed);
+        g_massRemainderSuccesses.store(0, std::memory_order_relaxed);
+        g_massRemainderFailures.store(0, std::memory_order_relaxed);
+        g_massRemainderValues.store(0, std::memory_order_relaxed);
+        g_massRemainderZeroValues.store(0, std::memory_order_relaxed);
+        g_massRemainderInvalidSentinels.store(0, std::memory_order_relaxed);
+        g_massRemainderContainerFailures.store(0, std::memory_order_relaxed);
+
+        g_stabilityValues.store(0, std::memory_order_relaxed);
+        g_electricityValues.store(0, std::memory_order_relaxed);
+        g_logisticsValues.store(0, std::memory_order_relaxed);
+        g_waveValues.store(0, std::memory_order_relaxed);
+        g_spawnOwnershipValues.store(0, std::memory_order_relaxed);
+        g_foundableValues.store(0, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(g_massRemainderValuesMutex);
+            g_massRemainderSourceValues.clear();
+        }
     }
 }
