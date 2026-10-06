@@ -777,6 +777,12 @@ namespace PersistentIdFixIndependentSourceCollector
                             return false;
                         }
 
+                        // The item-instance JSON wrappers are diagnostic-only.
+                        // For this audited binary/SDK pair, FAuItemInstance
+                        // contributes no base save payload and the only concrete
+                        // descendant (FAuWeaponItemInstance) saves only ammo
+                        // state and bFirstShotExecuted; none is a persistent-ID
+                        // source.
                         const auto countOpaqueMap =
                             [&](const auto& values) -> bool
                             {
@@ -802,6 +808,11 @@ namespace PersistentIdFixIndependentSourceCollector
                             return false;
                         }
 
+                        // DiscoveredBuildings contains building-data discovery
+                        // identifiers, not entity persistent IDs. Native
+                        // DiscoverBuilding reads the int32 identifier from the
+                        // supplied building-data object and stores it in this
+                        // array; save/load copy the array unchanged.
                         return CheckedEach(
                             Section::GameStateData,
                             player.DiscoveredBuildings,
@@ -882,9 +893,10 @@ namespace PersistentIdFixIndependentSourceCollector
                 discoveredBuildingValues,
                 std::memory_order_relaxed);
 
-            if (deviceUnknownPresent != 0 ||
-                opaqueStoreEntries != 0 ||
-                discoveredBuildingValues != 0)
+            // Item-store wrappers and DiscoveredBuildings are certified
+            // non-PID domains for this audited binary/SDK pair. A present
+            // unknown DevicesCustomData payload remains fail-closed.
+            if (deviceUnknownPresent != 0)
             {
                 state.IncompleteCoverage.fetch_add(
                     1,
