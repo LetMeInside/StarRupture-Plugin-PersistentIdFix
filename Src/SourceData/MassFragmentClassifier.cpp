@@ -11,10 +11,17 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <type_traits>
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
 
 namespace
 {
@@ -92,6 +99,17 @@ namespace
     std::atomic<std::uint64_t> g_entitySlotsVisited{0};
     std::atomic<std::uint64_t> g_entityCountMismatches{0};
     std::atomic<std::uint64_t> g_tagPayloads{0};
+
+    std::atomic<std::uint64_t> g_semanticAttempts{0};
+    std::atomic<std::uint64_t> g_semanticSuccesses{0};
+    std::atomic<std::uint64_t> g_semanticFailures{0};
+    std::atomic<std::uint64_t> g_semanticNumericValues{0};
+    std::atomic<std::uint64_t> g_semanticZeroValues{0};
+    std::atomic<std::uint64_t> g_semanticInvalidSentinels{0};
+    std::atomic<std::uint64_t> g_semanticContainerFailures{0};
+
+    std::mutex g_semanticValuesMutex;
+    std::vector<std::uint32_t> g_semanticValues;
 
     const std::array<RegistryEntry, 27>& Registry()
     {
@@ -198,6 +216,507 @@ namespace
             descriptor->MinAlignment == profile.ExpectedMinAlignment;
     }
 
+    bool IsReadableRange(const void* pointer, std::size_t byteCount)
+    {
+        if (byteCount == 0)
+            return true;
+        if (pointer == nullptr)
+            return false;
+
+        const auto start = reinterpret_cast<std::uintptr_t>(pointer);
+        if (start > (std::numeric_limits<std::uintptr_t>::max)() - byteCount)
+            return false;
+
+        const auto end = start + byteCount;
+        auto cursor = start;
+
+        while (cursor < end)
+        {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(
+                    reinterpret_cast<const void*>(cursor),
+                    &info,
+                    sizeof(info)) == 0)
+            {
+                return false;
+            }
+
+            if (info.State != MEM_COMMIT ||
+                (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+            {
+                return false;
+            }
+
+            const DWORD readable =
+                PAGE_READONLY |
+                PAGE_READWRITE |
+                PAGE_WRITECOPY |
+                PAGE_EXECUTE_READ |
+                PAGE_EXECUTE_READWRITE |
+                PAGE_EXECUTE_WRITECOPY;
+
+            if ((info.Protect & readable) == 0)
+                return false;
+
+            const auto regionStart =
+                reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+            const auto regionSize =
+                static_cast<std::uintptr_t>(info.RegionSize);
+
+            if (regionStart > (std::numeric_limits<std::uintptr_t>::max)() - regionSize)
+                return false;
+
+            const auto regionEnd = regionStart + regionSize;
+            if (regionEnd <= cursor)
+                return false;
+
+            cursor = regionEnd < end ? regionEnd : end;
+        }
+
+        return true;
+    }
+
+    template <typename T>
+    bool ValidateArray(const TArray<T>& values)
+    {
+        const std::int32_t count = values.Num();
+        const std::int32_t capacity = values.Max();
+
+        if (count < 0 || capacity < 0 || count > capacity)
+            return false;
+
+        const T* data = values.GetDataPtr();
+
+        if (capacity > 0 && data == nullptr)
+            return false;
+
+        if (count == 0)
+            return true;
+
+        if (data == nullptr ||
+            (reinterpret_cast<std::uintptr_t>(data) % alignof(T)) != 0)
+        {
+            return false;
+        }
+
+        const auto countWide = static_cast<std::size_t>(count);
+        if (countWide > (std::numeric_limits<std::size_t>::max)() / sizeof(T))
+            return false;
+
+        return IsReadableRange(data, countWide * sizeof(T));
+    }
+
+    template <typename T, typename Visitor>
+    bool CheckedEach(const TArray<T>& values, Visitor&& visitor)
+    {
+        if (!ValidateArray(values))
+        {
+            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        const std::int32_t count = values.Num();
+        for (std::int32_t index = 0; index < count; ++index)
+        {
+            if (!values.IsValidIndex(index))
+            {
+                g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            if (!visitor(values[index]))
+                return false;
+        }
+
+        return true;
+    }
+
+    template <typename K, typename V, typename Visitor>
+    bool CheckedSparseMap(
+        const TMap<K, V>& values,
+        Visitor&& visitor)
+    {
+        const std::int32_t live = values.Num();
+        const std::int32_t allocated = values.NumAllocated();
+        const std::int32_t capacity = values.Max();
+
+        if (live < 0 ||
+            allocated < 0 ||
+            capacity < 0 ||
+            live > allocated ||
+            allocated > capacity)
+        {
+            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        const auto& flags = values.GetAllocationFlags();
+        if (flags.Num() < 0 ||
+            flags.Max() < 0 ||
+            flags.Num() != allocated ||
+            flags.Max() < flags.Num())
+        {
+            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        if (allocated == 0)
+        {
+            if (live != 0)
+            {
+                g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            return true;
+        }
+
+        if (!values.IsValid() || flags.GetData() == nullptr)
+        {
+            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        const auto wordCount =
+            (static_cast<std::size_t>(allocated) + 31u) / 32u;
+        if (wordCount >
+            (std::numeric_limits<std::size_t>::max)() / sizeof(std::uint32_t))
+        {
+            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        if (!IsReadableRange(
+                flags.GetData(),
+                wordCount * sizeof(std::uint32_t)))
+        {
+            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        std::int32_t visited = 0;
+        for (auto it = begin(values); it != end(values); ++it)
+        {
+            ++visited;
+            if (!visitor(*it))
+                return false;
+        }
+
+        if (visited != live)
+        {
+            g_semanticContainerFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool EmitNumeric(
+        std::vector<std::uint32_t>& staged,
+        std::uint32_t value)
+    {
+        try
+        {
+            staged.push_back(value);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool CollectSemanticValues(
+        const RegistryEntry& profile,
+        const std::uint8_t* memory,
+        std::vector<std::uint32_t>& staged)
+    {
+        if (memory == nullptr)
+            return false;
+
+        const std::string_view name(profile.FullName);
+
+        if (name == "ScriptStruct AuActorPlacement.AuSplineConnectionFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FAuSplineConnectionFragment*>(memory);
+            return EmitNumeric(staged, f.StartEntity.ID) &&
+                EmitNumeric(staged, f.EndEntity.ID);
+        }
+
+        if (name == "ScriptStruct Chimera.CrBuildingInfectionFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrBuildingInfectionFragment*>(memory);
+
+            if (!CheckedEach(
+                    f.StandaloneInfectionEntities,
+                    [&](const FCrMassPersistentEntityID& value)
+                    {
+                        return EmitNumeric(staged, value.ID);
+                    }))
+            {
+                return false;
+            }
+
+            return EmitNumeric(staged, f.InfectionEntityHandle.ID);
+        }
+
+        if (name == "ScriptStruct Chimera.CrHeaterCoolerFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrHeaterCoolerFragment*>(memory);
+
+            return CheckedEach(
+                f.Connections,
+                [&](const FCrHeaterCoolerConnectionData& value)
+                {
+                    return EmitNumeric(staged, value.Entity.ID);
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrLogisticsAgentFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrLogisticsAgentFragment*>(memory);
+
+            if (!EmitNumeric(staged, f.RequestUId.ID) ||
+                !EmitNumeric(staged, f.CurrentMovementStart.ID) ||
+                !EmitNumeric(staged, f.CurrentMovementTarget.ID))
+            {
+                return false;
+            }
+
+            return CheckedEach(
+                f.CurrentPath,
+                [&](const FCrLogisticsPathSegmentData& value)
+                {
+                    return EmitNumeric(staged, value.Start.Entity.ID) &&
+                        EmitNumeric(staged, value.Connection.Entity.ID) &&
+                        EmitNumeric(staged, value.End.Entity.ID);
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrLogisticsIntersectionFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrLogisticsIntersectionFragment*>(memory);
+
+            if (!CheckedEach(
+                    f.State.Items,
+                    [&](const FCrLogisticsIntersectionItem& value)
+                    {
+                        return EmitNumeric(staged, value.Entity.Entity.ID) &&
+                            EmitNumeric(staged, value.TargetLine.Entity.ID);
+                    }) ||
+                !CheckedEach(
+                    f.State.WaitingItems,
+                    [&](const FCrMassEntityReplicationHelper& value)
+                    {
+                        return EmitNumeric(staged, value.Entity.ID);
+                    }))
+            {
+                return false;
+            }
+
+            return CheckedEach(
+                f.CachedMoveSpeedPerLine,
+                [&](const FCrLogisticsIntersectionMoveSpeedPerLine& value)
+                {
+                    return EmitNumeric(staged, value.Entity.Entity.ID);
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrLogisticsLineFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrLogisticsLineFragment*>(memory);
+
+            if (!CheckedEach(
+                    f.State.OrderedItems,
+                    [&](const FCrLogisticsLineItem& value)
+                    {
+                        return EmitNumeric(staged, value.Entity.Entity.ID);
+                    }))
+            {
+                return false;
+            }
+
+            return CheckedEach(
+                f.State.WaitingItems,
+                [&](const FCrLogisticsLineWaitingItem& value)
+                {
+                    return EmitNumeric(staged, value.Entity.Entity.ID);
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrLogisticsRequestContainerFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrLogisticsRequestContainerFragment*>(memory);
+
+            if (!CheckedEach(
+                    f.Requests,
+                    [&](const FCrMassPersistentEntityID& value)
+                    {
+                        return EmitNumeric(staged, value.ID);
+                    }))
+            {
+                return false;
+            }
+
+            return CheckedEach(
+                f.PendingRequests,
+                [&](const FCrLogisticsRequestData& request)
+                {
+                    if (!EmitNumeric(staged, request.UId.ID) ||
+                        !EmitNumeric(staged, request.RequesterEntity.ID))
+                    {
+                        return false;
+                    }
+
+                    return CheckedEach(
+                        request.RuntimeData,
+                        [&](const FCrLogisticsRequestRuntimeData& runtime)
+                        {
+                            return EmitNumeric(staged, runtime.AgentEntity.ID) &&
+                                EmitNumeric(staged, runtime.ItemSource.ID) &&
+                                EmitNumeric(staged, runtime.ItemDestination.ID);
+                        });
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrLogisticsRoundaboutFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrLogisticsRoundaboutFragment*>(memory);
+
+            return CheckedEach(
+                f.State.Items,
+                [&](const FCrLogisticsRoundaboutItem& value)
+                {
+                    return EmitNumeric(staged, value.Entity.Entity.ID);
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrLogisticsSocketsFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrLogisticsSocketsFragment*>(memory);
+
+            return CheckedEach(
+                f.Sockets,
+                [&](const FCrLogisticsSocketRuntimeData& value)
+                {
+                    return EmitNumeric(
+                        staged,
+                        value.SocketPairInvisibleConnector.ID);
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrLogisticsVerticalConnectorFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrLogisticsVerticalConnectorFragment*>(memory);
+
+            if (!CheckedEach(
+                    f.State.OrderedItems,
+                    [&](const FCrLogisticsIntersectionItem& value)
+                    {
+                        return EmitNumeric(staged, value.Entity.Entity.ID) &&
+                            EmitNumeric(staged, value.TargetLine.Entity.ID);
+                    }))
+            {
+                return false;
+            }
+
+            return CheckedEach(
+                f.CachedMoveSpeedPerLine,
+                [&](const FCrLogisticsIntersectionMoveSpeedPerLine& value)
+                {
+                    return EmitNumeric(staged, value.Entity.Entity.ID);
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrMassBuildingBaseCoreFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrMassBuildingBaseCoreFragment*>(memory);
+            return EmitNumeric(staged, f.DeconstructionTimerInstigator.ID);
+        }
+
+        if (name == "ScriptStruct Chimera.CrMassTemperatureFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrMassTemperatureFragment*>(memory);
+
+            return CheckedSparseMap(
+                f.Modifiers.Modifiers,
+                [&](const auto& pair)
+                {
+                    return EmitNumeric(staged, pair.Key().ID);
+                });
+        }
+
+        if (name == "ScriptStruct Chimera.CrStandaloneInfectionFragment")
+        {
+            const auto& f =
+                *reinterpret_cast<const FCrStandaloneInfectionFragment*>(memory);
+            return EmitNumeric(staged, f.InfectedBuilding.ID);
+        }
+
+        return false;
+    }
+
+    bool CommitSemanticValues(
+        const RegistryEntry& profile,
+        const std::uint8_t* memory)
+    {
+        g_semanticAttempts.fetch_add(1, std::memory_order_relaxed);
+
+        std::vector<std::uint32_t> staged;
+        try
+        {
+            if (!CollectSemanticValues(profile, memory, staged))
+            {
+                g_semanticFailures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            std::uint64_t zeros = 0;
+            std::uint64_t sentinels = 0;
+            for (const std::uint32_t value : staged)
+            {
+                if (value == 0)
+                    ++zeros;
+                if (value == (std::numeric_limits<std::uint32_t>::max)())
+                    ++sentinels;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_semanticValuesMutex);
+                g_semanticValues.insert(
+                    g_semanticValues.end(),
+                    staged.begin(),
+                    staged.end());
+            }
+
+            g_semanticNumericValues.fetch_add(
+                static_cast<std::uint64_t>(staged.size()),
+                std::memory_order_relaxed);
+            g_semanticZeroValues.fetch_add(zeros, std::memory_order_relaxed);
+            g_semanticInvalidSentinels.fetch_add(
+                sentinels,
+                std::memory_order_relaxed);
+            g_semanticSuccesses.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        catch (...)
+        {
+            g_semanticFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
     void ObservePayload(const FInstancedStruct& payload)
     {
         g_massPayloads.fetch_add(1, std::memory_order_relaxed);
@@ -249,9 +768,22 @@ namespace
 
         g_classifiedPayloads.fetch_add(1, std::memory_order_relaxed);
         if (resolved->Profile->Class == FragmentClass::PidBearing)
+        {
             g_pidBearingPayloads.fetch_add(1, std::memory_order_relaxed);
+
+            if (!CommitSemanticValues(
+                    *resolved->Profile,
+                    payload.StructMemory))
+            {
+                LOG_WARN(
+                    "PersistentIdFix: Mass semantic PID collection failed: descriptor=%p",
+                    type);
+            }
+        }
         else
+        {
             g_pidFreePayloads.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 namespace PersistentIdFixMassFragmentClassifier
@@ -541,6 +1073,13 @@ namespace PersistentIdFixMassFragmentClassifier
         snapshot.entitySlotsVisited = g_entitySlotsVisited.load(std::memory_order_relaxed);
         snapshot.entityCountMismatches = g_entityCountMismatches.load(std::memory_order_relaxed);
         snapshot.tagPayloads = g_tagPayloads.load(std::memory_order_relaxed);
+        snapshot.semanticAttempts = g_semanticAttempts.load(std::memory_order_relaxed);
+        snapshot.semanticSuccesses = g_semanticSuccesses.load(std::memory_order_relaxed);
+        snapshot.semanticFailures = g_semanticFailures.load(std::memory_order_relaxed);
+        snapshot.semanticNumericValues = g_semanticNumericValues.load(std::memory_order_relaxed);
+        snapshot.semanticZeroValues = g_semanticZeroValues.load(std::memory_order_relaxed);
+        snapshot.semanticInvalidSentinels = g_semanticInvalidSentinels.load(std::memory_order_relaxed);
+        snapshot.semanticContainerFailures = g_semanticContainerFailures.load(std::memory_order_relaxed);
         return snapshot;
     }
 
@@ -562,6 +1101,17 @@ namespace PersistentIdFixMassFragmentClassifier
             static_cast<unsigned long long>(snapshot.entitySlotsVisited),
             static_cast<unsigned long long>(snapshot.entityCountMismatches),
             static_cast<unsigned long long>(snapshot.tagPayloads));
+
+        LOG_INFO(
+            "PersistentIdFix: Mass semantic PIDs [%s]: attempts=%llu success=%llu failed=%llu values=%llu zero=%llu invalidSentinel=%llu containerFailures=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.semanticAttempts),
+            static_cast<unsigned long long>(snapshot.semanticSuccesses),
+            static_cast<unsigned long long>(snapshot.semanticFailures),
+            static_cast<unsigned long long>(snapshot.semanticNumericValues),
+            static_cast<unsigned long long>(snapshot.semanticZeroValues),
+            static_cast<unsigned long long>(snapshot.semanticInvalidSentinels),
+            static_cast<unsigned long long>(snapshot.semanticContainerFailures));
     }
 
     void Reset()
@@ -578,5 +1128,15 @@ namespace PersistentIdFixMassFragmentClassifier
         g_entitySlotsVisited.store(0, std::memory_order_relaxed);
         g_entityCountMismatches.store(0, std::memory_order_relaxed);
         g_tagPayloads.store(0, std::memory_order_relaxed);
+        g_semanticAttempts.store(0, std::memory_order_relaxed);
+        g_semanticSuccesses.store(0, std::memory_order_relaxed);
+        g_semanticFailures.store(0, std::memory_order_relaxed);
+        g_semanticNumericValues.store(0, std::memory_order_relaxed);
+        g_semanticZeroValues.store(0, std::memory_order_relaxed);
+        g_semanticInvalidSentinels.store(0, std::memory_order_relaxed);
+        g_semanticContainerFailures.store(0, std::memory_order_relaxed);
+
+        std::lock_guard<std::mutex> lock(g_semanticValuesMutex);
+        g_semanticValues.clear();
     }
 }
