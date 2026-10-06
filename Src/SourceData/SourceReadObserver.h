@@ -18,8 +18,46 @@ namespace PersistentIdFixSourceReadObserver
         BaseCoreReplicationHelper
     };
 
+    enum class CertificationState : std::uint8_t
+    {
+        InventoryUnavailable = 0,
+        AbsentUnsupported,
+        Pending,
+        Certified,
+        Failed
+    };
+
     struct CoverageSnapshot
     {
+        std::uint64_t loadGeneration = 0;
+
+        bool inventoryCaptured = false;
+        bool inventoryValid = false;
+        std::uint64_t inventoryEntries = 0;
+        std::uint64_t inventoryRecognized = 0;
+        bool inventoryMass = false;
+        bool inventoryBuildingCustomNames = false;
+        bool inventoryGameStateData = false;
+        bool inventoryAntennasData = false;
+        bool inventoryZiplineReplicator = false;
+        bool inventoryZiplineSubsystem = false;
+        bool inventoryBaseCoreReplicationHelper = false;
+
+        CertificationState massCertification =
+            CertificationState::InventoryUnavailable;
+        CertificationState buildingCustomNamesCertification =
+            CertificationState::InventoryUnavailable;
+        CertificationState gameStateDataCertification =
+            CertificationState::InventoryUnavailable;
+        CertificationState antennasDataCertification =
+            CertificationState::InventoryUnavailable;
+        CertificationState ziplineReplicatorCertification =
+            CertificationState::InventoryUnavailable;
+        CertificationState ziplineSubsystemCertification =
+            CertificationState::InventoryUnavailable;
+        CertificationState baseCoreReplicationCertification =
+            CertificationState::InventoryUnavailable;
+
         std::uint64_t successfulReads = 0;
         std::uint64_t recognizedSuccessfulReads = 0;
         std::uint64_t failedReads = 0;
@@ -45,6 +83,13 @@ namespace PersistentIdFixSourceReadObserver
         void* sectionName,
         const void* structType,
         void* destination);
+
+    // Starts a fresh passive observation generation immediately before
+    // UCrSaveSubsystem broadcasts OnPreSaveLoaded for an incoming map.
+    // This prevents observations from a previous world/load from being
+    // reused as coverage for the new generation.
+    void BeginLoadGeneration(
+        void* saveSubsystem);
 
     CoverageSnapshot GetCoverageSnapshot();
 

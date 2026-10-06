@@ -24,17 +24,63 @@ namespace
 
     static_assert(sizeof(FStringView) == 0x10);
 
+    std::atomic<std::uint64_t> g_loadGeneration{ 0 };
+
+    std::atomic<bool> g_inventoryCaptured{ false };
+    std::atomic<bool> g_inventoryValid{ false };
+    std::atomic<std::uint64_t> g_inventoryEntries{ 0 };
+    std::atomic<std::uint64_t> g_inventoryRecognized{ 0 };
+    std::atomic<bool> g_inventoryMass{ false };
+    std::atomic<bool> g_inventoryBuildingCustomNames{ false };
+    std::atomic<bool> g_inventoryGameStateData{ false };
+    std::atomic<bool> g_inventoryAntennasData{ false };
+    std::atomic<bool> g_inventoryZiplineReplicator{ false };
+    std::atomic<bool> g_inventoryZiplineSubsystem{ false };
+    std::atomic<bool> g_inventoryBaseCoreReplicationHelper{ false };
+
     std::atomic<std::uint64_t> g_successfulReads{ 0 };
     std::atomic<std::uint64_t> g_recognizedSuccessfulReads{ 0 };
     std::atomic<std::uint64_t> g_failedReads{ 0 };
 
     std::atomic<std::uint64_t> g_massReads{ 0 };
+    std::atomic<std::uint64_t> g_massReadFailures{ 0 };
     std::atomic<std::uint64_t> g_buildingCustomNameReads{ 0 };
     std::atomic<std::uint64_t> g_gameStateDataReads{ 0 };
     std::atomic<std::uint64_t> g_antennasDataReads{ 0 };
     std::atomic<std::uint64_t> g_ziplineReplicatorReads{ 0 };
     std::atomic<std::uint64_t> g_ziplineSubsystemReads{ 0 };
     std::atomic<std::uint64_t> g_baseCoreReplicationHelperReads{ 0 };
+
+    void ResetObservationCounters()
+    {
+        g_inventoryCaptured.store(false, std::memory_order_relaxed);
+        g_inventoryValid.store(false, std::memory_order_relaxed);
+        g_inventoryEntries.store(0, std::memory_order_relaxed);
+        g_inventoryRecognized.store(0, std::memory_order_relaxed);
+        g_inventoryMass.store(false, std::memory_order_relaxed);
+        g_inventoryBuildingCustomNames.store(false, std::memory_order_relaxed);
+        g_inventoryGameStateData.store(false, std::memory_order_relaxed);
+        g_inventoryAntennasData.store(false, std::memory_order_relaxed);
+        g_inventoryZiplineReplicator.store(false, std::memory_order_relaxed);
+        g_inventoryZiplineSubsystem.store(false, std::memory_order_relaxed);
+        g_inventoryBaseCoreReplicationHelper.store(false, std::memory_order_relaxed);
+
+        g_successfulReads.store(0, std::memory_order_relaxed);
+        g_recognizedSuccessfulReads.store(0, std::memory_order_relaxed);
+        g_failedReads.store(0, std::memory_order_relaxed);
+
+        g_massReads.store(0, std::memory_order_relaxed);
+        g_massReadFailures.store(0, std::memory_order_relaxed);
+        g_buildingCustomNameReads.store(0, std::memory_order_relaxed);
+        g_gameStateDataReads.store(0, std::memory_order_relaxed);
+        g_antennasDataReads.store(0, std::memory_order_relaxed);
+        g_ziplineReplicatorReads.store(0, std::memory_order_relaxed);
+        g_ziplineSubsystemReads.store(0, std::memory_order_relaxed);
+        g_baseCoreReplicationHelperReads.store(0, std::memory_order_relaxed);
+
+        PersistentIdFixMassFragmentClassifier::Reset();
+        PersistentIdFixIndependentSourceCollector::Reset();
+    }
 
     bool EqualsSection(
         const FStringView& value,
@@ -66,6 +112,143 @@ namespace
             value.Data,
             expected,
             expectedLength) == 0;
+    }
+
+    bool CaptureInventory(
+        const void* saveSubsystem)
+    {
+        if (saveSubsystem == nullptr)
+            return false;
+
+        // Audited Hotfix 0.3.5 layout:
+        //   UCrSaveSubsystem::SaveData = +0x30
+        //   FCrSaveGameData::ItemData = +0x00
+        //
+        // PostLoadGameFile assigns the incoming FCrSaveGameData into
+        // this retained field before OnPreLoadMap begins the map
+        // transition. Copy only section-name presence into plugin-owned
+        // atomics; never retain FString or JSON-wrapper pointers.
+        const auto* saveData =
+            reinterpret_cast<const SDK::FCrSaveGameData*>(
+                static_cast<const std::byte*>(saveSubsystem) + 0x30);
+
+        const auto& itemData = saveData->ItemData;
+
+        const std::int32_t live = itemData.Num();
+        const std::int32_t allocated = itemData.NumAllocated();
+        const std::int32_t capacity = itemData.Max();
+
+        if (live < 0 ||
+            allocated < 0 ||
+            capacity < 0 ||
+            live > allocated ||
+            allocated > capacity)
+        {
+            return false;
+        }
+
+        const auto& flags = itemData.GetAllocationFlags();
+
+        if (flags.Num() != allocated ||
+            flags.Num() < 0 ||
+            flags.Max() < flags.Num())
+        {
+            return false;
+        }
+
+        if (allocated > 0 && flags.GetData() == nullptr)
+            return false;
+
+        bool mass = false;
+        bool customNames = false;
+        bool gameState = false;
+        bool antennas = false;
+        bool ziplineReplicator = false;
+        bool ziplineSubsystem = false;
+        bool baseCore = false;
+
+        std::uint64_t recognized = 0;
+        std::int32_t visited = 0;
+
+        for (auto it = begin(itemData); it != end(itemData); ++it)
+        {
+            ++visited;
+
+            if (visited > live)
+                return false;
+
+            const auto& key = it->Key();
+            const auto& view =
+                *reinterpret_cast<const FStringView*>(&key);
+
+            auto mark =
+                [&](bool& value) -> bool
+                {
+                    if (value)
+                        return false;
+
+                    value = true;
+                    ++recognized;
+                    return true;
+                };
+
+            if (EqualsSection(view, L"Mass"))
+            {
+                if (!mark(mass))
+                    return false;
+            }
+            else if (EqualsSection(
+                view,
+                L"CrBuildingCustomNameSubsystem"))
+            {
+                if (!mark(customNames))
+                    return false;
+            }
+            else if (EqualsSection(view, L"GameStateData"))
+            {
+                if (!mark(gameState))
+                    return false;
+            }
+            else if (EqualsSection(view, L"AntennasData"))
+            {
+                if (!mark(antennas))
+                    return false;
+            }
+            else if (EqualsSection(view, L"CrZiplineReplicator"))
+            {
+                if (!mark(ziplineReplicator))
+                    return false;
+            }
+            else if (EqualsSection(view, L"CrZiplineSubsystem"))
+            {
+                if (!mark(ziplineSubsystem))
+                    return false;
+            }
+            else if (EqualsSection(
+                view,
+                L"BaseCoreReplicationHelperSaveData"))
+            {
+                if (!mark(baseCore))
+                    return false;
+            }
+        }
+
+        if (visited != live)
+            return false;
+
+        g_inventoryEntries.store(
+            static_cast<std::uint64_t>(live),
+            std::memory_order_relaxed);
+        g_inventoryRecognized.store(recognized, std::memory_order_relaxed);
+        g_inventoryMass.store(mass, std::memory_order_relaxed);
+        g_inventoryBuildingCustomNames.store(customNames, std::memory_order_relaxed);
+        g_inventoryGameStateData.store(gameState, std::memory_order_relaxed);
+        g_inventoryAntennasData.store(antennas, std::memory_order_relaxed);
+        g_inventoryZiplineReplicator.store(ziplineReplicator, std::memory_order_relaxed);
+        g_inventoryZiplineSubsystem.store(ziplineSubsystem, std::memory_order_relaxed);
+        g_inventoryBaseCoreReplicationHelper.store(baseCore, std::memory_order_relaxed);
+
+        return true;
     }
 
     PersistentIdFixSourceReadObserver::SourceSection CaptureSection(
@@ -110,6 +293,102 @@ namespace
 
         return SourceSection::Unknown;
     }
+
+    bool IndependentSectionComplete(
+        const PersistentIdFixIndependentSourceCollector::SectionSnapshot& section)
+    {
+        return
+            section.attempts > 0 &&
+            section.successes == section.attempts &&
+            section.readFailures == 0 &&
+            section.failures == 0 &&
+            section.schemaMismatches == 0 &&
+            section.containerFailures == 0 &&
+            section.incompleteCoverage == 0;
+    }
+
+    bool MassSectionComplete(
+        const PersistentIdFixMassFragmentClassifier::ClassificationSnapshot& mass)
+    {
+        return
+            mass.classifiedPayloads == mass.massPayloads &&
+            mass.malformedPayloads == 0 &&
+            mass.unsupportedPayloads == 0 &&
+            mass.schemaMismatches == 0 &&
+            mass.massDescriptorMismatches == 0 &&
+            mass.entityCountMismatches == 0 &&
+            mass.semanticFailures == 0 &&
+            mass.semanticContainerFailures == 0 &&
+            mass.tagMalformed == 0 &&
+            mass.tagUnsupported == 0 &&
+            mass.tagSchemaMismatches == 0 &&
+            mass.tagContainerFailures == 0 &&
+            mass.identityAttempts > 0 &&
+            mass.identitySuccesses == mass.identityAttempts &&
+            mass.identityFailures == 0 &&
+            mass.identityContainerFailures == 0 &&
+            mass.massRemainderAttempts > 0 &&
+            mass.massRemainderSuccesses == mass.massRemainderAttempts &&
+            mass.massRemainderFailures == 0 &&
+            mass.massRemainderContainerFailures == 0;
+    }
+
+    PersistentIdFixSourceReadObserver::CertificationState CertifyIndependent(
+        bool inventoryCaptured,
+        bool inventoryValid,
+        bool inventoryPresent,
+        std::uint64_t observedReads,
+        const PersistentIdFixIndependentSourceCollector::SectionSnapshot& section)
+    {
+        using PersistentIdFixSourceReadObserver::CertificationState;
+
+        if (!inventoryCaptured || !inventoryValid)
+            return CertificationState::InventoryUnavailable;
+
+        // Absence is deliberately not certified safe yet. Until a
+        // version/mode-specific omission policy is established, a
+        // missing protected-source section remains fail-closed.
+        if (!inventoryPresent)
+            return CertificationState::AbsentUnsupported;
+
+        if (section.readFailures != 0 ||
+            section.failures != 0 ||
+            section.schemaMismatches != 0 ||
+            section.containerFailures != 0 ||
+            section.incompleteCoverage != 0)
+        {
+            return CertificationState::Failed;
+        }
+
+        if (observedReads == 0 || section.attempts == 0)
+            return CertificationState::Pending;
+
+        return IndependentSectionComplete(section)
+            ? CertificationState::Certified
+            : CertificationState::Failed;
+    }
+
+    const char* CertificationStateName(
+        PersistentIdFixSourceReadObserver::CertificationState state)
+    {
+        using PersistentIdFixSourceReadObserver::CertificationState;
+
+        switch (state)
+        {
+        case CertificationState::InventoryUnavailable:
+            return "InventoryUnavailable";
+        case CertificationState::AbsentUnsupported:
+            return "AbsentUnsupported";
+        case CertificationState::Pending:
+            return "Pending";
+        case CertificationState::Certified:
+            return "Certified";
+        case CertificationState::Failed:
+            return "Failed";
+        default:
+            return "<invalid>";
+        }
+    }
 }
 
 namespace PersistentIdFixSourceReadObserver
@@ -145,6 +424,12 @@ namespace PersistentIdFixSourceReadObserver
 
             switch (section)
             {
+            case SourceSection::Mass:
+                g_massReadFailures.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                break;
+
             case SourceSection::GameStateData:
                 PersistentIdFixIndependentSourceCollector::RecordReadFailure(
                     PersistentIdFixIndependentSourceCollector::Section::GameStateData);
@@ -293,6 +578,33 @@ namespace PersistentIdFixSourceReadObserver
     {
         CoverageSnapshot snapshot;
 
+        snapshot.loadGeneration =
+            g_loadGeneration.load(
+                std::memory_order_relaxed);
+
+        snapshot.inventoryCaptured =
+            g_inventoryCaptured.load(std::memory_order_relaxed);
+        snapshot.inventoryValid =
+            g_inventoryValid.load(std::memory_order_relaxed);
+        snapshot.inventoryEntries =
+            g_inventoryEntries.load(std::memory_order_relaxed);
+        snapshot.inventoryRecognized =
+            g_inventoryRecognized.load(std::memory_order_relaxed);
+        snapshot.inventoryMass =
+            g_inventoryMass.load(std::memory_order_relaxed);
+        snapshot.inventoryBuildingCustomNames =
+            g_inventoryBuildingCustomNames.load(std::memory_order_relaxed);
+        snapshot.inventoryGameStateData =
+            g_inventoryGameStateData.load(std::memory_order_relaxed);
+        snapshot.inventoryAntennasData =
+            g_inventoryAntennasData.load(std::memory_order_relaxed);
+        snapshot.inventoryZiplineReplicator =
+            g_inventoryZiplineReplicator.load(std::memory_order_relaxed);
+        snapshot.inventoryZiplineSubsystem =
+            g_inventoryZiplineSubsystem.load(std::memory_order_relaxed);
+        snapshot.inventoryBaseCoreReplicationHelper =
+            g_inventoryBaseCoreReplicationHelper.load(std::memory_order_relaxed);
+
         snapshot.successfulReads =
             g_successfulReads.load(
                 std::memory_order_relaxed);
@@ -333,6 +645,88 @@ namespace PersistentIdFixSourceReadObserver
             g_baseCoreReplicationHelperReads.load(
                 std::memory_order_relaxed);
 
+        const auto independent =
+            PersistentIdFixIndependentSourceCollector::GetSnapshot();
+
+        const auto mass =
+            PersistentIdFixMassFragmentClassifier::GetSnapshot();
+
+        if (!snapshot.inventoryCaptured || !snapshot.inventoryValid)
+        {
+            snapshot.massCertification =
+                CertificationState::InventoryUnavailable;
+        }
+        else if (!snapshot.inventoryMass)
+        {
+            snapshot.massCertification =
+                CertificationState::AbsentUnsupported;
+        }
+        else if (g_massReadFailures.load(std::memory_order_relaxed) != 0)
+        {
+            snapshot.massCertification =
+                CertificationState::Failed;
+        }
+        else if (snapshot.massReads == 0)
+        {
+            snapshot.massCertification =
+                CertificationState::Pending;
+        }
+        else
+        {
+            snapshot.massCertification =
+                MassSectionComplete(mass)
+                ? CertificationState::Certified
+                : CertificationState::Failed;
+        }
+
+        snapshot.buildingCustomNamesCertification =
+            CertifyIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryBuildingCustomNames,
+                snapshot.buildingCustomNameReads,
+                independent.buildingCustomNames);
+
+        snapshot.gameStateDataCertification =
+            CertifyIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryGameStateData,
+                snapshot.gameStateDataReads,
+                independent.gameStateData);
+
+        snapshot.antennasDataCertification =
+            CertifyIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryAntennasData,
+                snapshot.antennasDataReads,
+                independent.antennasData);
+
+        snapshot.ziplineReplicatorCertification =
+            CertifyIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryZiplineReplicator,
+                snapshot.ziplineReplicatorReads,
+                independent.ziplineReplicator);
+
+        snapshot.ziplineSubsystemCertification =
+            CertifyIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryZiplineSubsystem,
+                snapshot.ziplineSubsystemReads,
+                independent.ziplineSubsystem);
+
+        snapshot.baseCoreReplicationCertification =
+            CertifyIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryBaseCoreReplicationHelper,
+                snapshot.baseCoreReplicationHelperReads,
+                independent.baseCoreReplication);
+
         return snapshot;
     }
 
@@ -342,11 +736,38 @@ namespace PersistentIdFixSourceReadObserver
             GetCoverageSnapshot();
 
         LOG_INFO(
-            "PersistentIdFix: source reads [%s]: successful=%llu recognized=%llu failed=%llu",
+            "PersistentIdFix: source reads [%s]: generation=%llu successful=%llu recognized=%llu failed=%llu",
             phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.loadGeneration),
             static_cast<unsigned long long>(snapshot.successfulReads),
             static_cast<unsigned long long>(snapshot.recognizedSuccessfulReads),
             static_cast<unsigned long long>(snapshot.failedReads));
+
+        LOG_INFO(
+            "PersistentIdFix: source inventory [%s]: captured=%u valid=%u entries=%llu recognized=%llu Mass=%u CustomNames=%u GameState=%u Antennas=%u ZiplineReplicator=%u ZiplineSubsystem=%u BaseCoreReplication=%u",
+            phase != nullptr ? phase : "<null>",
+            snapshot.inventoryCaptured ? 1u : 0u,
+            snapshot.inventoryValid ? 1u : 0u,
+            static_cast<unsigned long long>(snapshot.inventoryEntries),
+            static_cast<unsigned long long>(snapshot.inventoryRecognized),
+            snapshot.inventoryMass ? 1u : 0u,
+            snapshot.inventoryBuildingCustomNames ? 1u : 0u,
+            snapshot.inventoryGameStateData ? 1u : 0u,
+            snapshot.inventoryAntennasData ? 1u : 0u,
+            snapshot.inventoryZiplineReplicator ? 1u : 0u,
+            snapshot.inventoryZiplineSubsystem ? 1u : 0u,
+            snapshot.inventoryBaseCoreReplicationHelper ? 1u : 0u);
+
+        LOG_INFO(
+            "PersistentIdFix: source certification [%s]: Mass=%s CustomNames=%s GameState=%s Antennas=%s ZiplineReplicator=%s ZiplineSubsystem=%s BaseCoreReplication=%s",
+            phase != nullptr ? phase : "<null>",
+            CertificationStateName(snapshot.massCertification),
+            CertificationStateName(snapshot.buildingCustomNamesCertification),
+            CertificationStateName(snapshot.gameStateDataCertification),
+            CertificationStateName(snapshot.antennasDataCertification),
+            CertificationStateName(snapshot.ziplineReplicatorCertification),
+            CertificationStateName(snapshot.ziplineSubsystemCertification),
+            CertificationStateName(snapshot.baseCoreReplicationCertification));
 
         LOG_INFO(
             "PersistentIdFix: source sections [%s]: Mass=%llu CustomNames=%llu GameState=%llu Antennas=%llu ZiplineReplicator=%llu ZiplineSubsystem=%llu BaseCoreReplication=%llu",
@@ -363,49 +784,34 @@ namespace PersistentIdFixSourceReadObserver
         PersistentIdFixIndependentSourceCollector::LogSnapshot(phase);
     }
 
+    void BeginLoadGeneration(
+        void* saveSubsystem)
+    {
+        ResetObservationCounters();
+
+        const std::uint64_t generation =
+            g_loadGeneration.fetch_add(
+                1,
+                std::memory_order_relaxed) + 1;
+
+        g_inventoryCaptured.store(true, std::memory_order_relaxed);
+
+        const bool inventoryValid =
+            CaptureInventory(saveSubsystem);
+
+        g_inventoryValid.store(
+            inventoryValid,
+            std::memory_order_relaxed);
+
+        LOG_INFO(
+            "PersistentIdFix: source observation generation started: %llu inventoryValid=%u",
+            static_cast<unsigned long long>(generation),
+            inventoryValid ? 1u : 0u);
+    }
+
     void Reset()
     {
-        g_successfulReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_recognizedSuccessfulReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_failedReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_massReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_buildingCustomNameReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_gameStateDataReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_antennasDataReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_ziplineReplicatorReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_ziplineSubsystemReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        g_baseCoreReplicationHelperReads.store(
-            0,
-            std::memory_order_relaxed);
-
-        PersistentIdFixMassFragmentClassifier::Reset();
-        PersistentIdFixIndependentSourceCollector::Reset();
+        ResetObservationCounters();
+        g_loadGeneration.store(0, std::memory_order_relaxed);
     }
 }

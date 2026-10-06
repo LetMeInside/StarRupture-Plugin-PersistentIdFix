@@ -5,6 +5,7 @@
 #include "Network/Network.h"
 #include "Native/Fingerprints.h"
 #include "SourceData/SourceReadObserver.h"
+#include "SourceData/MassFragmentClassifier.h"
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
@@ -17,6 +18,7 @@ IPluginSelf* GetSelf() { return g_self; }
 
 static HookHandle g_getOrAddIDForHandleHook = nullptr;
 static HookHandle g_getSaveDataHook = nullptr;
+static HookHandle g_onPreLoadMapHook = nullptr;
 
 // SDK hook output; passed to PersistentIdFixSystem for native delegation.
 static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
@@ -24,9 +26,11 @@ static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
 // Native source-read observer trampoline. Step 2 is intentionally passive:
 // it forwards the call unchanged and does not inspect or retain source data.
 static GetSaveDataFn g_originalGetSaveData = nullptr;
+static OnPreLoadMapFn g_originalOnPreLoadMap = nullptr;
 
 static uintptr_t g_getOrAddIDForHandleAddress = 0;
 static uintptr_t g_getSaveDataAddress = 0;
+static uintptr_t g_onPreLoadMapAddress = 0;
 
 static uintptr_t g_setIDHandlePairAddress = 0;
 
@@ -42,6 +46,24 @@ static bool GetSaveDataDetour(
         sectionName,
         structType,
         destination);
+}
+
+static void OnPreLoadMapDetour(
+    void* saveSubsystem,
+    const void* mapName)
+{
+    // Reset before native OnPreLoadMap broadcasts OnPreSaveLoaded.
+    // Any GetSaveData calls made by that delegate therefore belong to
+    // the fresh generation rather than inheriting prior-world state.
+    PersistentIdFixSourceReadObserver::BeginLoadGeneration(
+        saveSubsystem);
+
+    if (g_originalOnPreLoadMap != nullptr)
+    {
+        g_originalOnPreLoadMap(
+            saveSubsystem,
+            mapName);
+    }
 }
 
 static bool g_networkSessionActive = false;
@@ -314,6 +336,9 @@ void OnPluginLoadHooks(
 
     g_getSaveDataAddress =
         addresses.getSaveData;
+
+    g_onPreLoadMapAddress =
+        addresses.onPreLoadMap;
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +413,13 @@ extern "C"
                 break;
             }
 
+            if (g_onPreLoadMapAddress == 0)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: OnPreLoadMap address was not resolved");
+                break;
+            }
+
             if (g_self->hooks->Hooks == nullptr)
             {
                 LOG_ERROR(
@@ -406,6 +438,49 @@ extern "C"
             LOG_INFO(
                 "PersistentIdFix: GetSaveData resolved at %p",
                 reinterpret_cast<void*>(g_getSaveDataAddress));
+
+            LOG_INFO(
+                "PersistentIdFix: OnPreLoadMap resolved at %p",
+                reinterpret_cast<void*>(g_onPreLoadMapAddress));
+
+            //
+            // Resolve and certify the finite Step 3C descriptor registry before
+            // any GetSaveData callback can attempt Mass fragment traversal.
+            //
+            if (!PersistentIdFixMassFragmentClassifier::InitializeDescriptorRegistry(
+                g_self->hooks->Engine))
+            {
+                LOG_WARN(
+                    "PersistentIdFix: Mass descriptor registry unavailable; Step 3C classification remains fail-closed");
+            }
+
+            //
+            // Install OnPreLoadMap generation-boundary hook.
+            //
+            // This remains observational: it only starts a fresh source
+            // observation generation before native OnPreSaveLoaded runs.
+            //
+            g_onPreLoadMapHook =
+                g_self->hooks->Hooks->Install(
+                    g_onPreLoadMapAddress,
+                    reinterpret_cast<void*>(&OnPreLoadMapDetour),
+                    reinterpret_cast<void**>(
+                        &g_originalOnPreLoadMap));
+
+            if (g_onPreLoadMapHook == nullptr ||
+                g_originalOnPreLoadMap == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: failed to install OnPreLoadMap hook");
+
+                g_onPreLoadMapHook = nullptr;
+                g_originalOnPreLoadMap = nullptr;
+
+                break;
+            }
+
+            LOG_INFO(
+                "PersistentIdFix: OnPreLoadMap generation hook installed");
 
             //
             // Install GetSaveData source-read observer hook.
@@ -618,6 +693,18 @@ extern "C"
             g_originalGetSaveData = nullptr;
         }
 
+        if (g_onPreLoadMapHook != nullptr)
+        {
+            if (g_self->hooks->Hooks != nullptr)
+            {
+                g_self->hooks->Hooks->Remove(
+                    g_onPreLoadMapHook);
+            }
+
+            g_onPreLoadMapHook = nullptr;
+            g_originalOnPreLoadMap = nullptr;
+        }
+
         if (bInitConfig)
         {
             //
@@ -633,6 +720,7 @@ extern "C"
         g_gameWorldActive = false;
 
         PersistentIdFixSourceReadObserver::Reset();
+        PersistentIdFixMassFragmentClassifier::ResetDescriptorRegistry();
         PersistentIdFixSystem::Reset();
 
         g_self = nullptr;
@@ -692,9 +780,17 @@ extern "C"
                     g_self->hooks->Hooks->Remove(
                         g_getSaveDataHook);
                 }
+
+                if (g_onPreLoadMapHook != nullptr &&
+                    g_self->hooks->Hooks != nullptr)
+                {
+                    g_self->hooks->Hooks->Remove(
+                        g_onPreLoadMapHook);
+                }
             }
 
             PersistentIdFixSourceReadObserver::Reset();
+            PersistentIdFixMassFragmentClassifier::ResetDescriptorRegistry();
             PersistentIdFixSystem::Reset();
             g_gameWorldActive = false;
 
@@ -704,8 +800,12 @@ extern "C"
             g_getSaveDataHook = nullptr;
             g_originalGetSaveData = nullptr;
 
+            g_onPreLoadMapHook = nullptr;
+            g_originalOnPreLoadMap = nullptr;
+
             g_getOrAddIDForHandleAddress = 0;
             g_getSaveDataAddress = 0;
+            g_onPreLoadMapAddress = 0;
             g_setIDHandlePairAddress = 0;
 
             g_self = nullptr;

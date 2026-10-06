@@ -32,6 +32,7 @@ namespace PersistentIdFixFingerprints
         uintptr_t getOrAddIDForHandleAddress = 0;
         uintptr_t setIDHandlePairAddress = 0;
         uintptr_t getSaveDataAddress = 0;
+        uintptr_t onPreLoadMapAddress = 0;
 
         uintptr_t getOrAddFingerprintMapAddress = 0;
         uintptr_t getOrAddFingerprintBucketAddress = 0;
@@ -83,6 +84,48 @@ namespace PersistentIdFixFingerprints
             scanner->Resolve(self, &req);
 
         if (getSaveDataAddress == 0)
+            return false;
+
+        // UCrSaveSubsystem::OnPreLoadMap:
+        //
+        // Audited Hotfix 0.3.5 entry sequence, shared by Client
+        // and Server. The compiler emits a redundant 0x40 REX prefix
+        // on push rbx, so include the complete two-byte instruction
+        // rather than matching from its second byte.
+        //
+        //   40 53                    push rbx
+        //   48 83 EC 20              sub rsp,20h
+        //   48 8B D9                 mov rbx,rcx
+        //   48 81 C1 78 01 00 00     add rcx,178h
+        //   E8 ?? ?? ?? ??           call OnPreSaveLoaded broadcast helper
+        //   48 8B 93 10 01 00 00     mov rdx,[rbx+110h]
+        //   48 85 D2                 test rdx,rdx
+        //   74 0C                    je cleanup-complete
+        //
+        // +0x178 is UCrSaveSubsystem::OnPreSaveLoaded and +0x110 is
+        // the pending load-map handle. The fixed structural bytes
+        // through the +0x110 read/test distinguish this function from
+        // the unrelated prologue collision observed in the Client.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::OnPreLoadMap";
+        req.pattern =
+            "40 53 "
+            "48 83 EC 20 "
+            "48 8B D9 "
+            "48 81 C1 78 01 00 00 "
+            "E8 ?? ?? ?? ?? "
+            "48 8B 93 10 01 00 00 "
+            "48 85 D2 "
+            "74 0C";
+
+        req.kind =
+            PLUGIN_SCAN_FUNCTION_START;
+
+        onPreLoadMapAddress =
+            scanner->Resolve(self, &req);
+
+        if (onPreLoadMapAddress == 0)
             return false;
 
         // SetIDHandlePair:
@@ -410,6 +453,7 @@ namespace PersistentIdFixFingerprints
         addresses.getOrAddIDForHandle = getOrAddIDForHandleAddress;
         addresses.setIDHandlePair = setIDHandlePairAddress;
         addresses.getSaveData = getSaveDataAddress;
+        addresses.onPreLoadMap = onPreLoadMapAddress;
 
         return true;
     }

@@ -12,6 +12,7 @@ namespace PersistentIdFixFingerprints
         uintptr_t getOrAddIDForHandle = 0;
         uintptr_t setIDHandlePair = 0;
         uintptr_t getSaveData = 0;
+        uintptr_t onPreLoadMap = 0;
     };
 
     bool Resolve(

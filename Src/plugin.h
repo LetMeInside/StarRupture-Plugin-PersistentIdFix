@@ -31,6 +31,16 @@ bool (*)(
     const void* structType,
     void* destination);
 
+// Native UCrSaveSubsystem::OnPreLoadMap ABI.
+//
+// The audited Hotfix 0.3.5 body receives the save subsystem in RCX.
+// RDX is forwarded opaquely so the detour does not depend on the
+// concrete map-name parameter representation.
+using OnPreLoadMapFn =
+void (*)(
+    void* saveSubsystem,
+    const void* mapName);
+
 extern "C"
 {
     __declspec(dllexport) PluginInfo* GetPluginInfo();
