@@ -53,6 +53,35 @@ namespace
     std::atomic<std::uint64_t> g_ziplineSubsystemReads{ 0 };
     std::atomic<std::uint64_t> g_baseCoreReplicationHelperReads{ 0 };
 
+    // Monotonic activity counters allow publication to prove that no
+    // GetSaveData observer frame was active or entered/exited while
+    // plugin-owned source vectors were being copied.
+    std::atomic<std::uint64_t> g_activeObserverFrames{ 0 };
+    std::atomic<std::uint64_t> g_observerFrameTransitions{ 0 };
+
+    struct ObserverFrameGuard
+    {
+        ObserverFrameGuard()
+        {
+            g_observerFrameTransitions.fetch_add(
+                1,
+                std::memory_order_seq_cst);
+            g_activeObserverFrames.fetch_add(
+                1,
+                std::memory_order_seq_cst);
+        }
+
+        ~ObserverFrameGuard()
+        {
+            g_activeObserverFrames.fetch_sub(
+                1,
+                std::memory_order_seq_cst);
+            g_observerFrameTransitions.fetch_add(
+                1,
+                std::memory_order_seq_cst);
+        }
+    };
+
     void ResetObservationCounters()
     {
         g_inventoryCaptured.store(false, std::memory_order_relaxed);
@@ -434,6 +463,8 @@ namespace PersistentIdFixSourceReadObserver
         if (original == nullptr)
             return false;
 
+        ObserverFrameGuard observerFrame;
+
         // This is the only information Step 3A reads before the native call.
         // Do not retain the FString pointer: native GetSaveData owns the
         // by-value argument lifetime and destroys it before returning.
@@ -798,6 +829,16 @@ namespace PersistentIdFixSourceReadObserver
             snapshot.absentUnsupportedSections == 0 &&
             snapshot.inventoryUnavailableSections == 0;
 
+        return snapshot;
+    }
+
+    ObserverActivitySnapshot GetObserverActivitySnapshot()
+    {
+        ObserverActivitySnapshot snapshot;
+        snapshot.activeFrames =
+            g_activeObserverFrames.load(std::memory_order_seq_cst);
+        snapshot.frameTransitions =
+            g_observerFrameTransitions.load(std::memory_order_seq_cst);
         return snapshot;
     }
 

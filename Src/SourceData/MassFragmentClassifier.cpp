@@ -1818,6 +1818,43 @@ namespace PersistentIdFixMassFragmentClassifier
         return snapshot;
     }
 
+    bool AppendCollectedValues(
+        std::vector<std::uint32_t>& destination)
+    {
+        try
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_semanticValuesMutex);
+                destination.insert(
+                    destination.end(),
+                    g_semanticValues.begin(),
+                    g_semanticValues.end());
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_identityValuesMutex);
+                destination.insert(
+                    destination.end(),
+                    g_identitySourceValues.begin(),
+                    g_identitySourceValues.end());
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_massRemainderValuesMutex);
+                destination.insert(
+                    destination.end(),
+                    g_massRemainderSourceValues.begin(),
+                    g_massRemainderSourceValues.end());
+            }
+
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     void LogSnapshot(const char* phase)
     {
         const ClassificationSnapshot snapshot = GetSnapshot();

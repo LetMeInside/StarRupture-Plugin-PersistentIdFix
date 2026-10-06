@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <cstdint>
+#include <vector>
 
 struct IPluginEngineEvents;
 
@@ -92,6 +93,11 @@ namespace PersistentIdFixIndependentSourceCollector
         const SDK::FGameStateSaveData* data);
 
     Snapshot GetSnapshot();
+
+    // Appends plugin-owned PID copies collected from all six
+    // independent protected sections.
+    bool AppendCollectedValues(std::vector<std::uint32_t>& destination);
+
     void LogSnapshot(const char* phase);
     void Reset();
 }

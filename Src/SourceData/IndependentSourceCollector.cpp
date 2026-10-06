@@ -943,6 +943,29 @@ namespace PersistentIdFixIndependentSourceCollector
         return result;
     }
 
+    bool AppendCollectedValues(
+        std::vector<std::uint32_t>& destination)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock(g_valuesMutex);
+
+            for (const auto& values : g_values)
+            {
+                destination.insert(
+                    destination.end(),
+                    values.begin(),
+                    values.end());
+            }
+
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     void LogSnapshot(const char* phase)
     {
         const Snapshot snapshot = GetSnapshot();

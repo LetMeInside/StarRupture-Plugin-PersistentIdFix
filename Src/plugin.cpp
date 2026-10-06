@@ -6,12 +6,16 @@
 #include "Native/Fingerprints.h"
 #include "SourceData/SourceReadObserver.h"
 #include "SourceData/MassFragmentClassifier.h"
+#include "SourceData/IndependentSourceCollector.h"
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
 #endif
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 IPluginSelf* g_self = nullptr;
 IPluginSelf* GetSelf() { return g_self; }
@@ -36,6 +40,8 @@ static uintptr_t g_setIDHandlePairAddress = 0;
 
 static bool g_authoritativeWorldReadyObserved = false;
 
+static void ResetProtectedIdPublication();
+
 static bool GetSaveDataDetour(
     void* saveSubsystem,
     void* sectionName,
@@ -58,6 +64,7 @@ static void OnPreLoadMapDetour(
     // Any GetSaveData calls made by that delegate therefore belong to
     // the fresh generation rather than inheriting prior-world state.
     g_authoritativeWorldReadyObserved = false;
+    ResetProtectedIdPublication();
 
     PersistentIdFixSourceReadObserver::BeginLoadGeneration(
         saveSubsystem);
@@ -72,6 +79,11 @@ static void OnPreLoadMapDetour(
 
 static bool g_networkSessionActive = false;
 static bool g_gameWorldActive = false;
+
+// G1 publication is diagnostic only. The allocator does not read this
+// vector yet.
+static std::vector<std::uint32_t> g_publishedProtectedIds;
+static std::uint64_t g_publishedProtectedGeneration = 0;
 
 enum class AuthorityReadiness : std::uint8_t
 {
@@ -142,6 +154,106 @@ static bool IsAuthoritativeWorldReady()
         coverage.coverageAttachedToCurrentGeneration &&
         GetAuthorityReadiness(netMode) ==
             AuthorityReadiness::Authoritative;
+}
+
+static bool PublishProtectedIds()
+{
+    const auto coverage =
+        PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+    if (!IsAuthoritativeWorldReady() ||
+        coverage.loadGeneration == 0)
+    {
+        return false;
+    }
+
+    const auto activityBefore =
+        PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
+
+    if (activityBefore.activeFrames != 0)
+    {
+        LOG_WARN(
+            "PersistentIdFix: protected-ID publication deferred: active observer frames=%llu",
+            static_cast<unsigned long long>(activityBefore.activeFrames));
+        return false;
+    }
+
+    std::vector<std::uint32_t> staged;
+
+    if (!PersistentIdFixMassFragmentClassifier::AppendCollectedValues(staged) ||
+        !PersistentIdFixIndependentSourceCollector::AppendCollectedValues(staged))
+    {
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication failed while copying collected source values");
+        return false;
+    }
+
+    const auto activityAfterA =
+        PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
+    const auto activityAfterB =
+        PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
+
+    if (activityAfterA.activeFrames != 0 ||
+        activityAfterB.activeFrames != 0 ||
+        activityAfterA.frameTransitions != activityBefore.frameTransitions ||
+        activityAfterB.frameTransitions != activityBefore.frameTransitions)
+    {
+        LOG_WARN(
+            "PersistentIdFix: protected-ID publication deferred: observer activity changed during copy");
+        return false;
+    }
+
+    const std::size_t occurrences = staged.size();
+
+    std::sort(staged.begin(), staged.end());
+    staged.erase(
+        std::unique(staged.begin(), staged.end()),
+        staged.end());
+
+    const std::uint32_t sentinel =
+        (std::numeric_limits<std::uint32_t>::max)();
+
+    const bool hasZero =
+        std::binary_search(staged.begin(), staged.end(), 0u);
+    const bool hasSentinel =
+        std::binary_search(staged.begin(), staged.end(), sentinel);
+
+    const std::size_t ordinaryUnique =
+        staged.size() -
+        (hasZero ? 1u : 0u) -
+        (hasSentinel ? 1u : 0u);
+
+    try
+    {
+        g_publishedProtectedIds = std::move(staged);
+        g_publishedProtectedGeneration = coverage.loadGeneration;
+    }
+    catch (...)
+    {
+        g_publishedProtectedIds.clear();
+        g_publishedProtectedGeneration = 0;
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication failed while committing staged values");
+        return false;
+    }
+
+    LOG_INFO(
+        "PersistentIdFix: protected-ID publication: generation=%llu occurrences=%llu unique=%llu ordinaryUnique=%llu zeroPresent=%u sentinelPresent=%u observerTransitions=%llu",
+        static_cast<unsigned long long>(g_publishedProtectedGeneration),
+        static_cast<unsigned long long>(occurrences),
+        static_cast<unsigned long long>(g_publishedProtectedIds.size()),
+        static_cast<unsigned long long>(ordinaryUnique),
+        hasZero ? 1u : 0u,
+        hasSentinel ? 1u : 0u,
+        static_cast<unsigned long long>(activityBefore.frameTransitions));
+
+    return true;
+}
+
+static void ResetProtectedIdPublication()
+{
+    g_publishedProtectedIds.clear();
+    g_publishedProtectedGeneration = 0;
 }
 
 static void LogReadiness(
@@ -269,6 +381,12 @@ static void OnTick(
             "PersistentIdFix: authoritative world readiness became true during active gameplay");
 
         LogReadiness("ready-transition");
+
+        if (!PublishProtectedIds())
+        {
+            LOG_WARN(
+                "PersistentIdFix: protected-ID publication was not accepted for the ready generation");
+        }
     }
 
     if (netMode == EPluginNetMode::Unknown)
@@ -407,6 +525,7 @@ static void OnAfterWorldEndPlay(
      * another intermediate world.
      */
     g_gameWorldActive = false;
+    ResetProtectedIdPublication();
 
     PersistentIdFixSystem::EndSession();
 
@@ -736,6 +855,7 @@ extern "C"
             g_networkSessionActive = false;
             g_gameWorldActive = false;
             g_authoritativeWorldReadyObserved = false;
+            ResetProtectedIdPublication();
 
 #ifdef MODLOADER_CLIENT_BUILD
 
@@ -863,6 +983,7 @@ extern "C"
         g_networkSessionActive = false;
         g_gameWorldActive = false;
         g_authoritativeWorldReadyObserved = false;
+        ResetProtectedIdPublication();
 
         PersistentIdFixSourceReadObserver::Reset();
         PersistentIdFixMassFragmentClassifier::ResetDescriptorRegistry();
@@ -887,6 +1008,7 @@ extern "C"
             g_networkSessionActive = false;
             g_gameWorldActive = false;
             g_authoritativeWorldReadyObserved = false;
+            ResetProtectedIdPublication();
 
 #ifdef MODLOADER_CLIENT_BUILD
             PersistentIdFixUI::Shutdown();

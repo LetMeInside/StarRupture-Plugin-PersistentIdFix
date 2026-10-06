@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <cstdint>
+#include <vector>
 
 struct IPluginEngineEvents;
 
@@ -79,6 +80,11 @@ namespace PersistentIdFixMassFragmentClassifier
         const SDK::FCrMassSaveData* massSaveData);
 
     ClassificationSnapshot GetSnapshot();
+
+    // Appends plugin-owned PID copies collected from the Mass source.
+    // No native save pointers are retained or revisited.
+    bool AppendCollectedValues(std::vector<std::uint32_t>& destination);
+
     void LogSnapshot(const char* phase);
     void Reset();
 }

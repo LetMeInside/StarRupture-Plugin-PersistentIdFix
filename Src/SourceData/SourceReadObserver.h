@@ -27,6 +27,12 @@ namespace PersistentIdFixSourceReadObserver
         Failed
     };
 
+    struct ObserverActivitySnapshot
+    {
+        std::uint64_t activeFrames = 0;
+        std::uint64_t frameTransitions = 0;
+    };
+
     struct CoverageSnapshot
     {
         std::uint64_t loadGeneration = 0;
@@ -117,6 +123,7 @@ namespace PersistentIdFixSourceReadObserver
     void DetachGameWorld();
 
     CoverageSnapshot GetCoverageSnapshot();
+    ObserverActivitySnapshot GetObserverActivitySnapshot();
 
     // Writes a compact observational snapshot. The phase label identifies
     // whether the snapshot was taken at Mass OnSaveLoaded or at world end.
