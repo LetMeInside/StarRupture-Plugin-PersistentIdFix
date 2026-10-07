@@ -317,15 +317,14 @@ namespace
     // ---------------------------------------------------------------------------
     // Persistent-ID subsystem initialisation.
     //
-    // Discovers the live UCrMassPersistentIDSubsystem and builds the reusable-ID
-    // pool from the IDs that were already consumed before this session started.
+    // Binds the allocator to the current gameplay world, snapshots the loaded
+    // ID map/high-water state, and prepares the baseline hole map. Loaded-save
+    // reuse remains disabled until serialized source coverage is certified and
+    // a protected candidate pool is staged and promoted.
     //
-    // This function is shared by:
-    //   - loaded-save initialisation via OnSaveLoaded()
-    //   - new-game initialisation via OnNewGame()
-    //
-    // The caller is responsible for ensuring that the persistent-ID subsystem
-    // belongs to the current world.
+    // New games enter through the same initialization path when the allocator
+    // is first observed empty. The caller is responsible for ensuring that the
+    // persistent-ID subsystem belongs to the current world.
     // ---------------------------------------------------------------------------
 
     static bool InitializeSession(SDK::UCrMassPersistentIDSubsystem* requestedSubsystem)

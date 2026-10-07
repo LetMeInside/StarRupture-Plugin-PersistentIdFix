@@ -32,8 +32,8 @@ static HookHandle g_onPreLoadMapHook = nullptr;
 static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
 static SetIDHandlePairFn g_originalSetIDHandlePair = nullptr;
 
-// Native source-read observer trampoline. Step 2 is intentionally passive:
-// it forwards the call unchanged and does not inspect or retain source data.
+// Native source-read observer trampolines. GetSaveData is observed so
+// serialized persistent-ID references can be certified before reuse activates.
 static GetSaveDataFn g_originalGetSaveData = nullptr;
 static OnPreLoadMapFn g_originalOnPreLoadMap = nullptr;
 
@@ -43,7 +43,7 @@ static uintptr_t g_onPreLoadMapAddress = 0;
 
 static uintptr_t g_setIDHandlePairAddress = 0;
 
-// H2 engine-owned early-attachment probe dependencies.
+// Engine-owned startup probe dependencies used to detect late attachment.
 static uintptr_t g_gEngineStorageAddress = 0;
 static uintptr_t g_getGameWorldAddress = 0;
 static uintptr_t g_hasBegunPlayAddress = 0;
@@ -98,8 +98,8 @@ static bool g_networkSessionActive = false;
 static bool g_gameWorldActive = false;
 static SDK::UWorld* g_gameWorld = nullptr;
 
-// G1 publication is diagnostic only. The allocator does not read this
-// vector yet.
+// Generation-bound protected IDs published from the certified serialized
+// source domains. Candidate-pool construction consumes this snapshot.
 static std::vector<std::uint32_t> g_publishedProtectedIds;
 static std::uint64_t g_publishedProtectedGeneration = 0;
 
@@ -1328,14 +1328,14 @@ extern "C"
                 reinterpret_cast<void*>(g_onPreLoadMapAddress));
 
             //
-            // Resolve and certify the finite Step 3C descriptor registry before
+            // Resolve and certify the finite Mass descriptor registry before
             // any GetSaveData callback can attempt Mass fragment traversal.
             //
             if (!PersistentIdFixMassFragmentClassifier::InitializeDescriptorRegistry(
                 g_self->hooks->Engine))
             {
                 LOG_WARN(
-                    "PersistentIdFix: Mass descriptor registry unavailable; Step 3C classification remains fail-closed");
+                    "PersistentIdFix: Mass descriptor registry unavailable; Mass classification remains fail-closed");
             }
 
             //
@@ -1369,8 +1369,8 @@ extern "C"
             //
             // Install GetSaveData source-read observer hook.
             //
-            // Step 2 deliberately forwards every call unchanged. Collection
-            // and coverage tracking are introduced in later guarded changes.
+            // The observer forwards the native call while collecting and
+            // certifying the recognized serialized persistent-ID sources.
             //
             g_getSaveDataHook =
                 g_self->hooks->Hooks->Install(
