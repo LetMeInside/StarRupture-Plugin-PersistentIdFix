@@ -60,6 +60,21 @@ namespace
 
     static EPluginNetMode g_sessionNetMode = EPluginNetMode::Unknown;
 
+    static void RevokeCertifiedPool(const char* reason)
+    {
+        const bool wasActive = g_certifiedPoolActive;
+
+        g_certifiedPoolActive = false;
+        g_persistentIdReuse.ClearStagedPool();
+
+        if (wasActive)
+        {
+            LOG_INFO(
+                "PersistentIdFix: certified reusable pool revoked: %s",
+                reason != nullptr ? reason : "<unspecified>");
+        }
+    }
+
     enum class LedgerEntryKind : std::uint8_t
     {
         Assigned = 0,
@@ -621,6 +636,9 @@ namespace PersistentIdFixSystem
     void BeginLoadGeneration(
         std::uint64_t loadGeneration)
     {
+        // A new source generation invalidates every prior reuse certificate.
+        RevokeCertifiedPool("new load generation");
+
         // A newly observed OnPreLoadMap boundary restores provenance.
         g_unboundAllocatorWarningLogged = false;
         g_lateAttachmentDetected.store(false);
@@ -1169,6 +1187,8 @@ namespace PersistentIdFixSystem
 
     void BeginGameWorld(SDK::UWorld* world)
     {
+        RevokeCertifiedPool("gameplay world binding changed");
+
         g_activeGameWorld = world;
         g_subsystemWorldVerified = false;
 
@@ -1707,6 +1727,34 @@ namespace PersistentIdFixSystem
          * session: it begins with no pre-existing holes, and same-session
          * recycling is intentionally prohibited.
          */
+        if (g_certifiedPoolActive)
+        {
+            const bool certifiedOwnershipValid =
+                g_sessionActive &&
+                g_persistentIdSubsystem != nullptr &&
+                persistentIDSubsystem == g_persistentIdSubsystem &&
+                g_persistentIdReuse.IsInitializedFor(
+                    persistentIDSubsystem) &&
+                g_activeGameWorld != nullptr &&
+                g_subsystemWorldVerified &&
+                ReadUObjectOuter(persistentIDSubsystem) ==
+                    g_activeGameWorld;
+
+            if (!certifiedOwnershipValid)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: certified reuse ownership check failed at allocation time; revoking reuse: caller=%p certifiedSubsystem=%p callerOuter=%p activeWorld=%p worldVerified=%u sessionActive=%u",
+                    static_cast<void*>(persistentIDSubsystem),
+                    static_cast<void*>(g_persistentIdSubsystem),
+                    ReadUObjectOuter(persistentIDSubsystem),
+                    static_cast<void*>(g_activeGameWorld),
+                    g_subsystemWorldVerified ? 1u : 0u,
+                    g_sessionActive ? 1u : 0u);
+
+                RevokeCertifiedPool("allocation-time ownership mismatch");
+            }
+        }
+
         if (g_certifiedPoolActive)
         {
             switch (g_persistentIdReuse.TryAllocate(handle, *returnValue))
