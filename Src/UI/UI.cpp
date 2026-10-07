@@ -9,16 +9,17 @@
 #include "plugin_helpers.h"
 
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 
 namespace
 {
 	WidgetHandle g_widget = nullptr;
-	bool g_visible = false;
+	std::atomic_bool g_visible{ false };
 	bool g_keybindRegistered = false;
-	bool g_lateAttachmentWarningPending = false;
-	bool g_lateAttachmentPopupOpened = false;
+	std::atomic_bool g_lateAttachmentWarningPending{ false };
+	std::atomic_bool g_lateAttachmentPopupOpened{ false };
 
 	PluginWindowHints g_hints = {};
 

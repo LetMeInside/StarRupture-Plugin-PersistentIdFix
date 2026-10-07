@@ -5,8 +5,10 @@
 #include "plugin_network_helpers.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <typeinfo>
 #include <vector>
 
@@ -61,22 +63,24 @@ namespace
 
     IPluginSelf* g_networkSelf = nullptr;
 
-    bool g_initialized = false;
-    bool g_sessionActive = false;
-    bool g_isServer = false;
+    std::atomic_bool g_initialized{ false };
+    std::atomic_bool g_sessionActive{ false };
+    std::atomic_bool g_isServer{ false };
 
     // Client-side state.
-    bool g_uiVisible = false;
-    bool g_serverReady = false;
+    std::atomic_bool g_uiVisible{ false };
+    std::atomic_bool g_serverReady{ false };
     bool g_hasRemoteSnapshot = false;
 
     PersistentIdFixStats::Snapshot g_remoteSnapshot = {};
+    std::mutex g_clientStateMutex;
 
     std::chrono::steady_clock::time_point
         g_serverReadyWaitStarted{};
 
     // Authority-side subscription state.
     std::vector<void*> g_subscribedClients;
+    std::mutex g_subscribedClientsMutex;
 
     // Typed network helper callback handles. These are required when
     // unregistering the handlers through the raw SDK functions.
@@ -85,6 +89,63 @@ namespace
 
     PluginNetworkMessageCallback
         g_statsSnapshotHandler = nullptr;
+
+
+    void ResetRemoteDisplayData()
+    {
+        std::lock_guard<std::mutex> lock(g_clientStateMutex);
+        g_hasRemoteSnapshot = false;
+        g_remoteSnapshot = {};
+        g_serverReadyWaitStarted = {};
+    }
+
+
+    void ClearRemoteSnapshot()
+    {
+        std::lock_guard<std::mutex> lock(g_clientStateMutex);
+        g_hasRemoteSnapshot = false;
+    }
+
+
+    void ClearRemoteSnapshotAndWait()
+    {
+        std::lock_guard<std::mutex> lock(g_clientStateMutex);
+        g_hasRemoteSnapshot = false;
+        g_serverReadyWaitStarted = {};
+    }
+
+
+    void StartServerReadyWait()
+    {
+        std::lock_guard<std::mutex> lock(g_clientStateMutex);
+        g_hasRemoteSnapshot = false;
+        g_serverReadyWaitStarted =
+            std::chrono::steady_clock::now();
+    }
+
+
+    void StopServerReadyWait()
+    {
+        std::lock_guard<std::mutex> lock(g_clientStateMutex);
+        g_serverReadyWaitStarted = {};
+    }
+
+
+    void PublishRemoteSnapshot(
+        const PersistentIdFixStats::Snapshot& snapshot)
+    {
+        std::lock_guard<std::mutex> lock(g_clientStateMutex);
+        g_remoteSnapshot = snapshot;
+        g_hasRemoteSnapshot = true;
+        g_serverReadyWaitStarted = {};
+    }
+
+
+    void ClearSubscriptions()
+    {
+        std::lock_guard<std::mutex> lock(g_subscribedClientsMutex);
+        g_subscribedClients.clear();
+    }
 
 
     bool HasNetworkInterface()
@@ -111,6 +172,8 @@ namespace
 
     void AddSubscription(void* playerController)
     {
+        std::lock_guard<std::mutex> lock(g_subscribedClientsMutex);
+
         if (playerController == nullptr)
             return;
 
@@ -129,6 +192,8 @@ namespace
 
     void RemoveSubscription(void* playerController)
     {
+        std::lock_guard<std::mutex> lock(g_subscribedClientsMutex);
+
         if (playerController == nullptr)
             return;
 
@@ -296,8 +361,7 @@ namespace
         snapshot.issuedIDsPerMinuteAvailable =
             packet.issuedIDsPerMinuteAvailable != 0;
 
-        g_remoteSnapshot = snapshot;
-        g_hasRemoteSnapshot = true;
+        PublishRemoteSnapshot(snapshot);
 
         /*
          * A snapshot can only arrive through the loader's exact-version
@@ -318,8 +382,7 @@ namespace
         }
 
         g_serverReady = true;
-        g_hasRemoteSnapshot = false;
-        g_serverReadyWaitStarted = {};
+        ClearRemoteSnapshotAndWait();
 
         LOG_INFO(
             "PersistentIdFix: remote server is ready (build tag=%s)",
@@ -420,7 +483,7 @@ namespace
             g_statsSnapshotHandler = nullptr;
         }
 
-        g_subscribedClients.clear();
+        ClearSubscriptions();
     }
 }
 
@@ -460,12 +523,10 @@ namespace PersistentIdFixNetwork
 
         g_uiVisible = false;
         g_serverReady = false;
-        g_hasRemoteSnapshot = false;
-        g_remoteSnapshot = {};
+        ResetRemoteDisplayData();
 
-        g_serverReadyWaitStarted = {};
 
-        g_subscribedClients.clear();
+        ClearSubscriptions();
 
         g_statsInterestHandler = nullptr;
         g_statsSnapshotHandler = nullptr;
@@ -512,11 +573,9 @@ namespace PersistentIdFixNetwork
         g_sessionActive = true;
 
         g_serverReady = false;
-        g_hasRemoteSnapshot = false;
-        g_remoteSnapshot = {};
-        g_serverReadyWaitStarted = {};
+        ResetRemoteDisplayData();
 
-        g_subscribedClients.clear();
+        ClearSubscriptions();
 
         if (g_isServer)
         {
@@ -601,8 +660,7 @@ namespace PersistentIdFixNetwork
 
             if (g_uiVisible)
             {
-                g_serverReadyWaitStarted =
-                    std::chrono::steady_clock::now();
+                StartServerReadyWait();
             }
 
             if (g_networkSelf->hooks->Network->
@@ -657,10 +715,8 @@ namespace PersistentIdFixNetwork
         g_isServer = false;
 
         g_serverReady = false;
-        g_hasRemoteSnapshot = false;
-        g_remoteSnapshot = {};
+        ResetRemoteDisplayData();
 
-        g_serverReadyWaitStarted = {};
 
         /*
          * Deliberately retain g_uiVisible here.
@@ -720,7 +776,7 @@ namespace PersistentIdFixNetwork
 
         if (visible)
         {
-            g_hasRemoteSnapshot = false;
+            ClearRemoteSnapshot();
 
             /*
              * If the server is already ready, subscribe immediately.
@@ -732,7 +788,7 @@ namespace PersistentIdFixNetwork
                 IsServerReady())
             {
                 g_serverReady = true;
-                g_serverReadyWaitStarted = {};
+                StopServerReadyWait();
 
                 StatsInterestPacket packet{};
 
@@ -749,8 +805,7 @@ namespace PersistentIdFixNetwork
             else
             {
                 g_serverReady = false;
-                g_serverReadyWaitStarted =
-                    std::chrono::steady_clock::now();
+                StartServerReadyWait();
             }
         }
         else
@@ -775,18 +830,18 @@ namespace PersistentIdFixNetwork
                     packet);
             }
 
-            g_serverReadyWaitStarted = {};
-            g_hasRemoteSnapshot = false;
+            ClearRemoteSnapshotAndWait();
         }
     }
 
 
     bool HasSubscribedClients()
     {
-        return
-            g_sessionActive &&
-            g_isServer &&
-            !g_subscribedClients.empty();
+        if (!g_sessionActive || !g_isServer)
+            return false;
+
+        std::lock_guard<std::mutex> lock(g_subscribedClientsMutex);
+        return !g_subscribedClients.empty();
     }
 
 
@@ -795,17 +850,31 @@ namespace PersistentIdFixNetwork
     {
         if (!g_sessionActive ||
             !g_isServer ||
-            g_subscribedClients.empty() ||
             !HasNetworkInterface())
         {
             return;
         }
 
+        std::vector<void*> subscribers;
+        try
+        {
+            std::lock_guard<std::mutex> lock(g_subscribedClientsMutex);
+            subscribers = g_subscribedClients;
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: failed to snapshot statistics subscriber list");
+            return;
+        }
+
+        if (subscribers.empty())
+            return;
+
         const StatsSnapshotPacket packet =
             MakeSnapshotPacket(snapshot);
 
-        for (void* playerController :
-            g_subscribedClients)
+        for (void* playerController : subscribers)
         {
             if (playerController == nullptr)
                 continue;
@@ -821,6 +890,8 @@ namespace PersistentIdFixNetwork
 
     RemoteDisplayState GetRemoteDisplayState()
     {
+        std::lock_guard<std::mutex> lock(g_clientStateMutex);
+
         RemoteDisplayState state{};
 
         state.serverReady =
