@@ -10,6 +10,8 @@
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
+#include <Windows.h>
+#pragma comment(lib, "User32.lib")
 #endif
 
 #include <algorithm>
@@ -40,7 +42,13 @@ static uintptr_t g_onPreLoadMapAddress = 0;
 
 static uintptr_t g_setIDHandlePairAddress = 0;
 
+// H2 engine-owned early-attachment probe dependencies.
+static uintptr_t g_gEngineStorageAddress = 0;
+static uintptr_t g_getGameWorldAddress = 0;
+static uintptr_t g_hasBegunPlayAddress = 0;
+
 static bool g_authoritativeWorldReadyObserved = false;
+static bool g_engineShutdownObserved = false;
 
 static void ResetProtectedIdPublication();
 
@@ -319,10 +327,233 @@ static PluginInfo s_pluginInfo = {
     PERSISTENT_ID_FIX_TARGET
 };
 
+static void OnEngineShutdown()
+{
+    g_engineShutdownObserved = true;
+}
+
+#ifdef MODLOADER_CLIENT_BUILD
+static void ShowHotUnloadMessageBox()
+{
+    HWND owner = GetForegroundWindow();
+
+    MessageBoxW(
+        owner,
+        L"PersistentIdFix is being unloaded while a game world is still active.\n\n"
+        L"Persistent ID reuse will stop for this running session.\n\n"
+        L"If this world is approaching the uint32 persistent-ID limit, continuing without PersistentIdFix can exhaust or overflow the available ID space.\n\n"
+        L"Return to the main menu before loading PersistentIdFix again. Do not hot-load it back into this already-running world.\n\n"
+        L"Existing saves can normally be loaded again safely unless persistent-ID exhaustion or overflow had already occurred before the save was written.",
+        L"PersistentIdFix - Active world",
+        MB_OK | MB_ICONWARNING | MB_TASKMODAL |
+            MB_SETFOREGROUND | MB_TOPMOST);
+}
+#endif
+
+enum class InitialAttachmentProbeResult : std::uint8_t
+{
+    Unknown = 0,
+    NotActiveGameplay,
+    ActiveGameplay
+};
+
+using GetGameWorldFn = SDK::UWorld* (*)(void* engine);
+using HasBegunPlayFn = bool (*)(const SDK::UWorld* world);
+
+static bool ExactObjectPointerHasName(
+    void* object,
+    const char* objectName,
+    bool& lookupComplete)
+{
+    lookupComplete = false;
+
+    if (object == nullptr ||
+        objectName == nullptr ||
+        g_self == nullptr ||
+        g_self->hooks == nullptr ||
+        g_self->hooks->ObjectWalker == nullptr ||
+        g_self->hooks->ObjectWalker->IsReady == nullptr ||
+        g_self->hooks->ObjectWalker->FindObjectsByNameInto == nullptr ||
+        !g_self->hooks->ObjectWalker->IsReady())
+    {
+        return false;
+    }
+
+    constexpr int InitialCapacity = 8;
+    PluginObjectInfo initial[InitialCapacity] = {};
+
+    const int total =
+        g_self->hooks->ObjectWalker->FindObjectsByNameInto(
+            objectName,
+            PluginObjectLookup_InstanceOnly,
+            initial,
+            InitialCapacity);
+
+    if (total < 0)
+        return false;
+
+    const int initialCount =
+        (std::min)(total, InitialCapacity);
+
+    for (int i = 0; i < initialCount; ++i)
+    {
+        if (initial[i].object == object)
+        {
+            lookupComplete = true;
+            return true;
+        }
+    }
+
+    if (total <= InitialCapacity)
+    {
+        lookupComplete = true;
+        return false;
+    }
+
+    try
+    {
+        std::vector<PluginObjectInfo> all(
+            static_cast<std::size_t>(total));
+
+        const int repeatedTotal =
+            g_self->hooks->ObjectWalker->FindObjectsByNameInto(
+                objectName,
+                PluginObjectLookup_InstanceOnly,
+                all.data(),
+                total);
+
+        if (repeatedTotal < 0 || repeatedTotal > total)
+            return false;
+
+        for (int i = 0; i < repeatedTotal; ++i)
+        {
+            if (all[static_cast<std::size_t>(i)].object == object)
+            {
+                lookupComplete = true;
+                return true;
+            }
+        }
+
+        lookupComplete = true;
+        return false;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+static InitialAttachmentProbeResult ProbeInitialAttachment()
+{
+    if (g_gEngineStorageAddress == 0 ||
+        g_getGameWorldAddress == 0 ||
+        g_hasBegunPlayAddress == 0)
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe has an unresolved native dependency");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    void* engine =
+        *reinterpret_cast<void* const*>(
+            g_gEngineStorageAddress);
+
+    if (engine == nullptr)
+    {
+        LOG_INFO(
+            "PersistentIdFix: H2 startup probe: engine=null result=NotActive");
+        return InitialAttachmentProbeResult::NotActiveGameplay;
+    }
+
+    const auto getGameWorld =
+        reinterpret_cast<GetGameWorldFn>(
+            g_getGameWorldAddress);
+
+    SDK::UWorld* world =
+        getGameWorld(engine);
+
+    if (world == nullptr)
+    {
+        LOG_INFO(
+            "PersistentIdFix: H2 startup probe: engine=%p world=null result=NotActive",
+            engine);
+        return InitialAttachmentProbeResult::NotActiveGameplay;
+    }
+
+    bool worldNameLookupComplete = false;
+    const bool isChimeraMain =
+        ExactObjectPointerHasName(
+            world,
+            "ChimeraMain",
+            worldNameLookupComplete);
+
+    if (!worldNameLookupComplete)
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: engine=%p world=%p ChimeraMainIdentity=unknown result=Unknown",
+            engine,
+            static_cast<void*>(world));
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    if (!isChimeraMain)
+    {
+        LOG_INFO(
+            "PersistentIdFix: H2 startup probe: engine=%p world=%p ChimeraMainIdentity=0 result=NotActive",
+            engine,
+            static_cast<void*>(world));
+        return InitialAttachmentProbeResult::NotActiveGameplay;
+    }
+
+    const auto hasBegunPlay =
+        reinterpret_cast<HasBegunPlayFn>(
+            g_hasBegunPlayAddress);
+
+    const bool begunPlay =
+        hasBegunPlay(world);
+
+    const auto* worldBytes =
+        reinterpret_cast<const std::uint8_t*>(world);
+
+    const bool tearingDown =
+        (worldBytes[0x18D] & 0x20u) != 0;
+
+    const bool beingCleanedUp =
+        worldBytes[0x190] != 0;
+
+    const InitialAttachmentProbeResult result =
+        begunPlay && !tearingDown && !beingCleanedUp
+            ? InitialAttachmentProbeResult::ActiveGameplay
+            : InitialAttachmentProbeResult::Unknown;
+
+    LOG_INFO(
+        "PersistentIdFix: H2 startup probe: engine=%p world=%p ChimeraMainIdentity=1 begunPlay=%u tearingDown=%u beingCleanedUp=%u result=%s",
+        engine,
+        static_cast<void*>(world),
+        begunPlay ? 1u : 0u,
+        tearingDown ? 1u : 0u,
+        beingCleanedUp ? 1u : 0u,
+        result == InitialAttachmentProbeResult::ActiveGameplay
+            ? "Active"
+            : "Unknown");
+
+    return result;
+}
+
 static void OnTick(
     float delta)
 {
     (void)delta;
+
+
+#ifdef MODLOADER_CLIENT_BUILD
+    if (PersistentIdFixSystem::ConsumeLateAttachmentNotification())
+    {
+        LOG_WARN(
+            "PersistentIdFix: displaying late-attachment warning through ImGui");
+        PersistentIdFixUI::ShowLateAttachmentWarning();
+    }
+#endif
 
     if (g_self == nullptr ||
         g_self->hooks == nullptr ||
@@ -688,6 +919,15 @@ void OnPluginLoadHooks(
 
     g_onPreLoadMapAddress =
         addresses.onPreLoadMap;
+
+    g_gEngineStorageAddress =
+        addresses.gEngineStorage;
+
+    g_getGameWorldAddress =
+        addresses.getGameWorld;
+
+    g_hasBegunPlayAddress =
+        addresses.hasBegunPlay;
 }
 
 // ---------------------------------------------------------------------------
@@ -917,6 +1157,9 @@ extern "C"
                 g_originalSetIDHandlePair,
                 g_originalGetOrAddIDForHandle);
 
+            const InitialAttachmentProbeResult initialAttachmentProbe =
+                ProbeInitialAttachment();
+
             //
             // World callbacks
             //
@@ -967,6 +1210,7 @@ extern "C"
             g_networkSessionActive = false;
             g_gameWorldActive = false;
             g_authoritativeWorldReadyObserved = false;
+            g_engineShutdownObserved = false;
             ResetProtectedIdPublication();
 
 #ifdef MODLOADER_CLIENT_BUILD
@@ -999,8 +1243,38 @@ extern "C"
             g_self->hooks->Engine->RegisterOnTick(
                 &OnTick);
 
+            g_self->hooks->Engine->RegisterOnShutdown(
+                &OnEngineShutdown);
+
             LOG_INFO(
-                "PersistentIdFix: registered OnTick callback");
+                "PersistentIdFix: registered OnTick and OnShutdown callbacks");
+
+            if (initialAttachmentProbe ==
+                InitialAttachmentProbeResult::ActiveGameplay)
+            {
+                PersistentIdFixSystem::MarkLateAttachmentDetected();
+
+                LOG_WARN(
+                    "PersistentIdFix: native H2 probe detected attachment to an already-active ChimeraMain world; persistent ID reuse remains disabled for this running world");
+
+#ifdef MODLOADER_CLIENT_BUILD
+                PersistentIdFixUI::ShowLateAttachmentWarning();
+                (void)PersistentIdFixSystem::ConsumeLateAttachmentNotification();
+#else
+                LOG_WARN(
+                    "========== PersistentIdFix: LATE ATTACHMENT ==========");
+                LOG_WARN(
+                    "This gameplay world began before PersistentIdFix was loaded.");
+                LOG_WARN(
+                    "Complete persistent-ID provenance was not observed.");
+                LOG_WARN(
+                    "ID reuse remains DISABLED for this running world.");
+                LOG_WARN(
+                    "Restart the server with PersistentIdFix active before relying on ID reuse again.");
+                LOG_WARN(
+                    "========================================================");
+#endif
+            }
 
             LOG_INFO(
                 "PersistentIdFix: initialization complete");
@@ -1128,6 +1402,34 @@ extern "C"
             LOG_INFO(
                 "PersistentIdFix: shutting down");
 
+            const bool activeWorldAtUnload =
+                g_gameWorldActive ||
+                PersistentIdFixSystem::IsLateAttachmentDetected();
+
+            if (activeWorldAtUnload && !g_engineShutdownObserved)
+            {
+#ifdef MODLOADER_CLIENT_BUILD
+                LOG_WARN(
+                    "PersistentIdFix: hot unload detected while a game world is active; displaying client warning");
+                ShowHotUnloadMessageBox();
+#else
+                LOG_WARN(
+                    "PersistentIdFix: hot unload detected while a game world is active");
+                LOG_WARN(
+                    "========== PersistentIdFix: ACTIVE-WORLD UNLOAD ==========");
+                LOG_WARN(
+                    "PersistentIdFix is being unloaded while gameplay is active.");
+                LOG_WARN(
+                    "Persistent ID reuse will stop for this running session.");
+                LOG_WARN(
+                    "Do not hot-load PersistentIdFix back into this same running world.");
+                LOG_WARN(
+                    "Restart or reload the world with PersistentIdFix active before relying on ID reuse again.");
+                LOG_WARN(
+                    "============================================================");
+#endif
+            }
+
             PersistentIdFixNetwork::Shutdown();
             g_networkSessionActive = false;
             g_gameWorldActive = false;
@@ -1145,6 +1447,9 @@ extern "C"
                 {
                     g_self->hooks->Engine->UnregisterOnTick(
                         &OnTick);
+
+                    g_self->hooks->Engine->UnregisterOnShutdown(
+                        &OnEngineShutdown);
                 }
 
                 if (g_self->hooks->World != nullptr)

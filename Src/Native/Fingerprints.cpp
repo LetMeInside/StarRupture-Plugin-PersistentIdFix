@@ -1,5 +1,7 @@
 #include "Native/Fingerprints.h"
 
+#include <cstring>
+
 // ---------------------------------------------------------------------------
 // Pattern resolution.
 //
@@ -33,6 +35,12 @@ namespace PersistentIdFixFingerprints
         uintptr_t setIDHandlePairAddress = 0;
         uintptr_t getSaveDataAddress = 0;
         uintptr_t onPreLoadMapAddress = 0;
+
+        uintptr_t getGameWorldAddress = 0;
+        uintptr_t getGameWorldFromAnchorAddress = 0;
+        uintptr_t hasBegunPlayAddress = 0;
+        uintptr_t gEngineAnchorAddress = 0;
+        uintptr_t gEngineStorageAddress = 0;
 
         uintptr_t getOrAddFingerprintMapAddress = 0;
         uintptr_t getOrAddFingerprintBucketAddress = 0;
@@ -127,6 +135,193 @@ namespace PersistentIdFixFingerprints
 
         if (onPreLoadMapAddress == 0)
             return false;
+
+        // H2 early-attachment probe: native UGameEngine::GetGameWorld.
+        //
+        // Client and Dedicated Server use different WorldList field
+        // displacements, so certify the expected target-specific body.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::UGameEngine::GetGameWorld";
+#ifdef MODLOADER_SERVER_BUILD
+        req.pattern =
+            "48 89 5C 24 08 "
+            "48 89 74 24 10 "
+            "57 "
+            "48 83 EC 30 "
+            "48 8B F1 "
+            "33 DB "
+            "85 DB "
+            "78 6D "
+            "3B 9E A8 11 00 00 "
+            "7D 65";
+#else
+        req.pattern =
+            "48 89 5C 24 08 "
+            "48 89 74 24 10 "
+            "57 "
+            "48 83 EC 30 "
+            "48 8B F1 "
+            "33 DB "
+            "85 DB "
+            "78 6D "
+            "3B 9E D0 11 00 00 "
+            "7D 65";
+#endif
+        req.kind =
+            PLUGIN_SCAN_FUNCTION_START;
+
+        getGameWorldAddress =
+            scanner->Resolve(self, &req);
+
+        if (getGameWorldAddress == 0)
+            return false;
+
+        // H2 early-attachment probe: UWorld::HasBegunPlay.
+        // This leaf function has no unwind entry in either executable;
+        // fingerprint the complete body and certify executable code.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::UWorld::HasBegunPlay";
+        req.pattern =
+            "F6 81 8D 01 00 00 01 "
+            "74 15 "
+            "48 8B 41 30 "
+            "48 85 C0 "
+            "74 0C "
+            "83 B8 A8 00 00 00 00 "
+            "74 03 "
+            "B0 01 "
+            "C3 "
+            "32 C0 "
+            "C3";
+        req.kind =
+            PLUGIN_SCAN_CODE;
+
+        hasBegunPlayAddress =
+            scanner->Resolve(self, &req);
+
+        if (hasBegunPlayAddress == 0)
+            return false;
+
+        // H2 early-attachment probe: native GEngine reference.
+        // The scanner certifies a unique code anchor beginning with
+        // 'mov rbx,[rip+disp32]'; decode only that RIP-relative data
+        // reference locally because FOLLOW_REL32 is E8/E9-only.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::GEngine.Reference";
+        req.pattern =
+            "48 8B 1D ?? ?? ?? ?? "
+            "48 85 DB "
+            "74 3A "
+            "E8 ?? ?? ?? ?? "
+            "48 8B 4B 10 "
+            "4C 8D 40 30 "
+            "48 63 40 38 "
+            "3B 41 38 "
+            "7F 24 "
+            "48 8B D0 "
+            "48 8B 41 30 "
+            "4C 39 04 D0 "
+            "75 17 "
+            "48 8B CB "
+            "E8 ?? ?? ?? ?? "
+            "48 85 C0 "
+            "74 0A "
+            "B2 01 "
+            "48 8B C8 "
+            "E8 ?? ?? ?? ??";
+        req.kind =
+            PLUGIN_SCAN_IN_FUNCTION;
+
+        gEngineAnchorAddress =
+            scanner->Resolve(self, &req);
+
+        if (gEngineAnchorAddress == 0)
+            return false;
+
+        const auto* gEngineAnchor =
+            reinterpret_cast<const std::uint8_t*>(
+                gEngineAnchorAddress);
+
+        if (gEngineAnchor[0] != 0x48 ||
+            gEngineAnchor[1] != 0x8B ||
+            gEngineAnchor[2] != 0x1D)
+        {
+            scanner->ReportFailure(
+                self,
+                "PersistentIdFix::GEngine.Reference",
+                "Resolved anchor did not begin with expected RIP-relative GEngine load");
+            return false;
+        }
+
+        std::int32_t gEngineDisp32 = 0;
+        std::memcpy(
+            &gEngineDisp32,
+            gEngineAnchor + 3,
+            sizeof(gEngineDisp32));
+
+        gEngineStorageAddress =
+            gEngineAnchorAddress + 7 +
+            static_cast<std::intptr_t>(gEngineDisp32);
+
+        if (gEngineStorageAddress == 0 ||
+            (gEngineStorageAddress & (alignof(void*) - 1u)) != 0)
+        {
+            scanner->ReportFailure(
+                self,
+                "PersistentIdFix::GEngine.Reference",
+                "Decoded GEngine pointer storage was invalid or misaligned");
+            return false;
+        }
+
+        // Independently follow the same anchor's GetGameWorld call.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::GEngine.GetGameWorldCrossCheck";
+        req.pattern =
+            "48 8B 1D ?? ?? ?? ?? "
+            "48 85 DB "
+            "74 3A "
+            "E8 ?? ?? ?? ?? "
+            "48 8B 4B 10 "
+            "4C 8D 40 30 "
+            "48 63 40 38 "
+            "3B 41 38 "
+            "7F 24 "
+            "48 8B D0 "
+            "48 8B 41 30 "
+            "4C 39 04 D0 "
+            "75 17 "
+            "48 8B CB "
+            "E8 ?? ?? ?? ?? "
+            "48 85 C0 "
+            "74 0A "
+            "B2 01 "
+            "48 8B C8 "
+            "E8 ?? ?? ?? ??";
+        req.kind =
+            PLUGIN_SCAN_FUNCTION_START;
+        req.flags =
+            PLUGIN_SCAN_FLAG_FOLLOW_REL32;
+        req.followRel32At = 0x32;
+
+        getGameWorldFromAnchorAddress =
+            scanner->Resolve(self, &req);
+
+        if (getGameWorldFromAnchorAddress == 0)
+            return false;
+
+        if (getGameWorldFromAnchorAddress !=
+            getGameWorldAddress)
+        {
+            scanner->ReportFailure(
+                self,
+                "PersistentIdFix::UGameEngine::GetGameWorld",
+                "Direct function fingerprint and GEngine call-site cross-check disagreed");
+            return false;
+        }
 
         // SetIDHandlePair:
         //
@@ -454,6 +649,9 @@ namespace PersistentIdFixFingerprints
         addresses.setIDHandlePair = setIDHandlePairAddress;
         addresses.getSaveData = getSaveDataAddress;
         addresses.onPreLoadMap = onPreLoadMapAddress;
+        addresses.gEngineStorage = gEngineStorageAddress;
+        addresses.getGameWorld = getGameWorldAddress;
+        addresses.hasBegunPlay = hasBegunPlayAddress;
 
         return true;
     }

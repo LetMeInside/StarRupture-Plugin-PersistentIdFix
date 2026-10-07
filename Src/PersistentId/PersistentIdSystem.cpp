@@ -12,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <mutex>
@@ -26,6 +27,8 @@ namespace
     static SDK::UWorld* g_activeGameWorld = nullptr;
     static bool g_subsystemWorldVerified = false;
     static bool g_unboundAllocatorWarningLogged = false;
+    static std::atomic_bool g_lateAttachmentDetected{ false };
+    static std::atomic_bool g_lateAttachmentNotificationPending{ false };
 
     static void* ReadUObjectOuter(const void* object)
     {
@@ -597,6 +600,8 @@ namespace PersistentIdFixSystem
         g_activeGameWorld = nullptr;
         g_subsystemWorldVerified = false;
         g_unboundAllocatorWarningLogged = false;
+        g_lateAttachmentDetected.store(false);
+        g_lateAttachmentNotificationPending.store(false);
 
         ResetAssignmentLedger(0);
         ResetSetPairObserver(0);
@@ -615,6 +620,11 @@ namespace PersistentIdFixSystem
     void BeginLoadGeneration(
         std::uint64_t loadGeneration)
     {
+        // A newly observed OnPreLoadMap boundary restores provenance.
+        g_unboundAllocatorWarningLogged = false;
+        g_lateAttachmentDetected.store(false);
+        g_lateAttachmentNotificationPending.store(false);
+
         ResetAssignmentLedger(loadGeneration);
         ResetSetPairObserver(loadGeneration);
 
@@ -1376,6 +1386,22 @@ namespace PersistentIdFixSystem
         return g_sessionActive;
     }
 
+    void MarkLateAttachmentDetected()
+    {
+        g_lateAttachmentDetected.store(true);
+        g_lateAttachmentNotificationPending.store(true);
+    }
+
+    bool ConsumeLateAttachmentNotification()
+    {
+        return g_lateAttachmentNotificationPending.exchange(false);
+    }
+
+    bool IsLateAttachmentDetected()
+    {
+        return g_lateAttachmentDetected.load();
+    }
+
     // ---------------------------------------------------------------------------
     // GetOrAddIDForHandle detour.
     //
@@ -1610,6 +1636,8 @@ namespace PersistentIdFixSystem
                 persistentIDSubsystem->IDHandleMap.Num() != 0))
         {
             g_unboundAllocatorWarningLogged = true;
+            g_lateAttachmentDetected.store(true);
+            g_lateAttachmentNotificationPending.store(true);
             LOG_WARN(
                 "PersistentIdFix: allocator activity observed without an OnWorldBeginPlay ownership boundary; treating this as late/hot attachment and keeping reuse fail-closed: subsystem=%p outer=%p MaxID=%u entities=%d",
                 static_cast<void*>(persistentIDSubsystem),

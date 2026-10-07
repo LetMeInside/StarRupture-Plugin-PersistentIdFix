@@ -130,6 +130,13 @@ namespace PersistentIdFixSystem
 
     bool IsSessionActive();
 
+    // Late attachment can be established by either the allocator
+    // fallback or the engine-owned startup probe. Notification is
+    // consumed later from a safe lifecycle callback.
+    void MarkLateAttachmentDetected();
+    bool ConsumeLateAttachmentNotification();
+    bool IsLateAttachmentDetected();
+
     bool SetIDHandlePairDetour(
         void* subsystem,
         SDK::FCrMassPersistentEntityID* persistentId,

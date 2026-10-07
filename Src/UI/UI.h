@@ -16,6 +16,10 @@ namespace PersistentIdFixUI
 
     void Hide();
 
+    // Displays a one-shot in-game modal. This is deliberately
+    // rendered through ImGui so fullscreen users can see it.
+    void ShowLateAttachmentWarning();
+
     bool IsVisible();
 }
 
