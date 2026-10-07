@@ -349,6 +349,105 @@ enum class InitialAttachmentProbeResult : std::uint8_t
 using GetGameWorldFn = SDK::UWorld* (*)(void* engine);
 using HasBegunPlayFn = bool (*)(const SDK::UWorld* world);
 
+static int FilterNativeProbeMemoryFault(
+    unsigned long exceptionCode)
+{
+    if (exceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+        exceptionCode == EXCEPTION_IN_PAGE_ERROR)
+    {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static bool TryReadPointerStorage(
+    uintptr_t storageAddress,
+    void*& value)
+{
+    value = nullptr;
+
+    __try
+    {
+        value =
+            *reinterpret_cast<void* const*>(
+                storageAddress);
+        return true;
+    }
+    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
+    {
+        value = nullptr;
+        return false;
+    }
+}
+
+static bool TryGetGameWorld(
+    GetGameWorldFn getGameWorld,
+    void* engine,
+    SDK::UWorld*& world)
+{
+    world = nullptr;
+
+    __try
+    {
+        world = getGameWorld(engine);
+        return true;
+    }
+    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
+    {
+        world = nullptr;
+        return false;
+    }
+}
+
+static bool TryReadWorldLifecycleFlags(
+    const SDK::UWorld* world,
+    bool& tearingDown,
+    bool& beingCleanedUp)
+{
+    tearingDown = false;
+    beingCleanedUp = false;
+
+    __try
+    {
+        const auto* worldBytes =
+            reinterpret_cast<const std::uint8_t*>(world);
+
+        tearingDown =
+            (worldBytes[0x18D] & 0x20u) != 0;
+
+        beingCleanedUp =
+            worldBytes[0x190] != 0;
+
+        return true;
+    }
+    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
+    {
+        tearingDown = false;
+        beingCleanedUp = false;
+        return false;
+    }
+}
+
+static bool TryHasBegunPlay(
+    HasBegunPlayFn hasBegunPlay,
+    const SDK::UWorld* world,
+    bool& begunPlay)
+{
+    begunPlay = false;
+
+    __try
+    {
+        begunPlay = hasBegunPlay(world);
+        return true;
+    }
+    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
+    {
+        begunPlay = false;
+        return false;
+    }
+}
+
 static bool IsReadableRange(
     const void* address,
     std::size_t size)
@@ -527,9 +626,15 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
         return InitialAttachmentProbeResult::Unknown;
     }
 
-    void* engine =
-        *reinterpret_cast<void* const*>(
-            g_gEngineStorageAddress);
+    void* engine = nullptr;
+    if (!TryReadPointerStorage(
+            g_gEngineStorageAddress,
+            engine))
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: GEngine storage read faulted; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
 
     if (engine == nullptr)
     {
@@ -576,8 +681,16 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
         reinterpret_cast<GetGameWorldFn>(
             g_getGameWorldAddress);
 
-    SDK::UWorld* world =
-        getGameWorld(engine);
+    SDK::UWorld* world = nullptr;
+    if (!TryGetGameWorld(
+            getGameWorld,
+            engine,
+            world))
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: GetGameWorld faulted; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
 
     if (world == nullptr)
     {
@@ -633,14 +746,18 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
         return InitialAttachmentProbeResult::Unknown;
     }
 
-    const auto* worldBytes =
-        reinterpret_cast<const std::uint8_t*>(world);
+    bool tearingDown = false;
+    bool beingCleanedUp = false;
 
-    const bool tearingDown =
-        (worldBytes[0x18D] & 0x20u) != 0;
-
-    const bool beingCleanedUp =
-        worldBytes[0x190] != 0;
+    if (!TryReadWorldLifecycleFlags(
+            world,
+            tearingDown,
+            beingCleanedUp))
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: World lifecycle read faulted; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
 
     if (tearingDown || beingCleanedUp)
     {
@@ -657,8 +774,16 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
         reinterpret_cast<HasBegunPlayFn>(
             g_hasBegunPlayAddress);
 
-    const bool begunPlay =
-        hasBegunPlay(world);
+    bool begunPlay = false;
+    if (!TryHasBegunPlay(
+            hasBegunPlay,
+            world,
+            begunPlay))
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: HasBegunPlay faulted; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
 
     const InitialAttachmentProbeResult result =
         begunPlay
