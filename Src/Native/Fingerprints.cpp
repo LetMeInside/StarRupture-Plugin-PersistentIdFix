@@ -1,6 +1,12 @@
 #include "Native/Fingerprints.h"
 
+#include <Windows.h>
+#include <Psapi.h>
+
 #include <cstring>
+#include <limits>
+
+#pragma comment(lib, "Psapi.lib")
 
 // ---------------------------------------------------------------------------
 // Pattern resolution.
@@ -18,6 +24,336 @@
 // function, preventing the plugin from continuing with an incompatible
 // native implementation.
 // ---------------------------------------------------------------------------
+
+namespace
+{
+    bool TryDecodeRipRelativeTarget(
+        uintptr_t instructionAddress,
+        std::size_t instructionLength,
+        std::int32_t displacement,
+        uintptr_t& target)
+    {
+        target = 0;
+
+        constexpr uintptr_t maxAddress =
+            (std::numeric_limits<uintptr_t>::max)();
+
+        if (instructionAddress > maxAddress - instructionLength)
+            return false;
+
+        const uintptr_t instructionEnd =
+            instructionAddress + instructionLength;
+
+        if (displacement >= 0)
+        {
+            const uintptr_t delta =
+                static_cast<uintptr_t>(displacement);
+
+            if (instructionEnd > maxAddress - delta)
+                return false;
+
+            target = instructionEnd + delta;
+            return true;
+        }
+
+        const std::uint64_t magnitude =
+            static_cast<std::uint64_t>(
+                -static_cast<std::int64_t>(displacement));
+
+        if (magnitude > instructionEnd)
+            return false;
+
+        target =
+            instructionEnd - static_cast<uintptr_t>(magnitude);
+        return true;
+    }
+
+    bool IsInitializedWritableNonExecutableImageSectionRange(
+        HMODULE mainModule,
+        const MODULEINFO& moduleInfo,
+        uintptr_t address,
+        std::size_t size)
+    {
+        if (mainModule == nullptr ||
+            moduleInfo.lpBaseOfDll == nullptr ||
+            moduleInfo.SizeOfImage == 0 ||
+            address == 0 ||
+            size == 0)
+        {
+            return false;
+        }
+
+        const uintptr_t moduleBase =
+            reinterpret_cast<uintptr_t>(
+                moduleInfo.lpBaseOfDll);
+
+        const std::size_t moduleSize =
+            static_cast<std::size_t>(
+                moduleInfo.SizeOfImage);
+
+        if (moduleSize < sizeof(IMAGE_DOS_HEADER))
+            return false;
+
+        const auto* dosHeader =
+            reinterpret_cast<const IMAGE_DOS_HEADER*>(
+                moduleBase);
+
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE ||
+            dosHeader->e_lfanew < 0)
+        {
+            return false;
+        }
+
+        const std::size_t ntOffset =
+            static_cast<std::size_t>(
+                dosHeader->e_lfanew);
+
+        if (ntOffset > moduleSize - sizeof(IMAGE_NT_HEADERS64))
+            return false;
+
+        const auto* ntHeaders =
+            reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+                moduleBase + ntOffset);
+
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE ||
+            ntHeaders->OptionalHeader.Magic !=
+                IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+            ntHeaders->FileHeader.NumberOfSections == 0)
+        {
+            return false;
+        }
+
+        const std::size_t optionalHeaderOffset =
+            ntOffset +
+            offsetof(IMAGE_NT_HEADERS64, OptionalHeader);
+
+        const std::size_t optionalHeaderSize =
+            static_cast<std::size_t>(
+                ntHeaders->FileHeader.SizeOfOptionalHeader);
+
+        if (optionalHeaderOffset > moduleSize ||
+            optionalHeaderSize >
+                moduleSize - optionalHeaderOffset)
+        {
+            return false;
+        }
+
+        const std::size_t sectionTableOffset =
+            optionalHeaderOffset + optionalHeaderSize;
+
+        const std::size_t sectionCount =
+            static_cast<std::size_t>(
+                ntHeaders->FileHeader.NumberOfSections);
+
+        if (sectionCount >
+            (std::numeric_limits<std::size_t>::max)() /
+                sizeof(IMAGE_SECTION_HEADER))
+        {
+            return false;
+        }
+
+        const std::size_t sectionTableSize =
+            sectionCount * sizeof(IMAGE_SECTION_HEADER);
+
+        if (sectionTableOffset > moduleSize ||
+            sectionTableSize > moduleSize - sectionTableOffset)
+        {
+            return false;
+        }
+
+        constexpr uintptr_t maxAddress =
+            (std::numeric_limits<uintptr_t>::max)();
+
+        if (address < moduleBase ||
+            address > maxAddress - (size - 1u))
+        {
+            return false;
+        }
+
+        const uintptr_t rangeEndInclusive =
+            address + size - 1u;
+
+        if (rangeEndInclusive < moduleBase)
+            return false;
+
+        const std::uint64_t startRva =
+            static_cast<std::uint64_t>(
+                address - moduleBase);
+
+        const std::uint64_t endRva =
+            static_cast<std::uint64_t>(
+                rangeEndInclusive - moduleBase);
+
+        const auto* sections =
+            reinterpret_cast<const IMAGE_SECTION_HEADER*>(
+                moduleBase + sectionTableOffset);
+
+        for (std::size_t index = 0;
+             index < sectionCount;
+             ++index)
+        {
+            const IMAGE_SECTION_HEADER& section =
+                sections[index];
+
+            const std::uint64_t sectionStart =
+                static_cast<std::uint64_t>(
+                    section.VirtualAddress);
+
+            const std::uint64_t virtualSize =
+                static_cast<std::uint64_t>(
+                    section.Misc.VirtualSize);
+
+            const std::uint64_t rawSize =
+                static_cast<std::uint64_t>(
+                    section.SizeOfRawData);
+
+            const std::uint64_t sectionSpan =
+                virtualSize > rawSize
+                    ? virtualSize
+                    : rawSize;
+
+            if (sectionSpan == 0)
+                continue;
+
+            const std::uint64_t sectionEnd =
+                sectionStart + sectionSpan;
+
+            if (sectionEnd < sectionStart)
+                return false;
+
+            if (startRva < sectionStart ||
+                endRva >= sectionEnd)
+            {
+                continue;
+            }
+
+            const DWORD characteristics =
+                section.Characteristics;
+
+            const bool initializedData =
+                (characteristics &
+                    IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
+
+            const bool readable =
+                (characteristics & IMAGE_SCN_MEM_READ) != 0;
+
+            const bool writable =
+                (characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+
+            const bool executable =
+                (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+
+            return initializedData &&
+                readable &&
+                writable &&
+                !executable;
+        }
+
+        return false;
+    }
+
+    bool IsReadableNonExecutableMainImageRange(
+        uintptr_t address,
+        std::size_t size)
+    {
+        if (address == 0 || size == 0)
+            return false;
+
+        constexpr uintptr_t maxAddress =
+            (std::numeric_limits<uintptr_t>::max)();
+
+        if (address > maxAddress - (size - 1u))
+            return false;
+
+        const uintptr_t rangeEndInclusive =
+            address + size - 1u;
+
+        const HMODULE mainModule =
+            GetModuleHandleW(nullptr);
+
+        if (mainModule == nullptr)
+            return false;
+
+        MODULEINFO moduleInfo{};
+        if (!GetModuleInformation(
+                GetCurrentProcess(),
+                mainModule,
+                &moduleInfo,
+                sizeof(moduleInfo)))
+        {
+            return false;
+        }
+
+        const uintptr_t moduleBase =
+            reinterpret_cast<uintptr_t>(
+                moduleInfo.lpBaseOfDll);
+
+        if (moduleInfo.SizeOfImage == 0 ||
+            moduleBase > maxAddress - moduleInfo.SizeOfImage)
+        {
+            return false;
+        }
+
+        const uintptr_t moduleEnd =
+            moduleBase + moduleInfo.SizeOfImage;
+
+        if (address < moduleBase ||
+            rangeEndInclusive >= moduleEnd)
+        {
+            return false;
+        }
+
+        if (!IsInitializedWritableNonExecutableImageSectionRange(
+                mainModule,
+                moduleInfo,
+                address,
+                size))
+        {
+            return false;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(
+                reinterpret_cast<const void*>(address),
+                &mbi,
+                sizeof(mbi)) == 0)
+        {
+            return false;
+        }
+
+        if (mbi.State != MEM_COMMIT ||
+            mbi.Type != MEM_IMAGE ||
+            mbi.AllocationBase != mainModule ||
+            (mbi.Protect & PAGE_GUARD) != 0 ||
+            (mbi.Protect & PAGE_NOACCESS) != 0)
+        {
+            return false;
+        }
+
+        const DWORD baseProtection =
+            mbi.Protect & 0xFFu;
+
+        const bool readable =
+            baseProtection == PAGE_READONLY ||
+            baseProtection == PAGE_READWRITE ||
+            baseProtection == PAGE_WRITECOPY;
+
+        if (!readable)
+            return false;
+
+        const uintptr_t regionBase =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+
+        if (regionBase > maxAddress - mbi.RegionSize)
+            return false;
+
+        const uintptr_t regionEnd =
+            regionBase + mbi.RegionSize;
+
+        return address >= regionBase &&
+            rangeEndInclusive < regionEnd;
+    }
+}
 
 namespace PersistentIdFixFingerprints
 {
@@ -262,17 +598,29 @@ namespace PersistentIdFixFingerprints
             gEngineAnchor + 3,
             sizeof(gEngineDisp32));
 
-        gEngineStorageAddress =
-            gEngineAnchorAddress + 7 +
-            static_cast<std::intptr_t>(gEngineDisp32);
-
-        if (gEngineStorageAddress == 0 ||
+        if (!TryDecodeRipRelativeTarget(
+                gEngineAnchorAddress,
+                7u,
+                gEngineDisp32,
+                gEngineStorageAddress) ||
+            gEngineStorageAddress == 0 ||
             (gEngineStorageAddress & (alignof(void*) - 1u)) != 0)
         {
             scanner->ReportFailure(
                 self,
                 "PersistentIdFix::GEngine.Reference",
-                "Decoded GEngine pointer storage was invalid or misaligned");
+                "Decoded GEngine pointer storage arithmetic was invalid or misaligned");
+            return false;
+        }
+
+        if (!IsReadableNonExecutableMainImageRange(
+                gEngineStorageAddress,
+                sizeof(void*)))
+        {
+            scanner->ReportFailure(
+                self,
+                "PersistentIdFix::GEngine.Reference",
+                "Decoded GEngine pointer storage was not a readable non-executable range in the main image");
             return false;
         }
 
