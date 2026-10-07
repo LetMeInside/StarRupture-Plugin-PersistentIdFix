@@ -8,9 +8,10 @@
 #include "SourceData/MassFragmentClassifier.h"
 #include "SourceData/IndependentSourceCollector.h"
 
+#include <Windows.h>
+
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
-#include <Windows.h>
 #pragma comment(lib, "User32.lib")
 #endif
 
@@ -348,37 +349,107 @@ enum class InitialAttachmentProbeResult : std::uint8_t
 using GetGameWorldFn = SDK::UWorld* (*)(void* engine);
 using HasBegunPlayFn = bool (*)(const SDK::UWorld* world);
 
-static bool ExactObjectPointerHasName(
-    void* object,
-    const char* objectName,
-    bool& lookupComplete)
+static bool IsReadableRange(
+    const void* address,
+    std::size_t size)
 {
-    lookupComplete = false;
+    if (address == nullptr || size == 0)
+        return false;
 
-    if (object == nullptr ||
-        objectName == nullptr ||
-        g_self == nullptr ||
-        g_self->hooks == nullptr ||
-        g_self->hooks->ObjectWalker == nullptr ||
-        g_self->hooks->ObjectWalker->IsReady == nullptr ||
-        g_self->hooks->ObjectWalker->FindObjectsByNameInto == nullptr ||
-        !g_self->hooks->ObjectWalker->IsReady())
+    const uintptr_t start =
+        reinterpret_cast<uintptr_t>(address);
+
+    constexpr uintptr_t maxAddress =
+        (std::numeric_limits<uintptr_t>::max)();
+
+    if (start > maxAddress - (size - 1u))
+        return false;
+
+    const uintptr_t endInclusive =
+        start + size - 1u;
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(
+            address,
+            &mbi,
+            sizeof(mbi)) == 0)
     {
         return false;
     }
 
+    if (mbi.State != MEM_COMMIT ||
+        (mbi.Protect & PAGE_GUARD) != 0 ||
+        (mbi.Protect & PAGE_NOACCESS) != 0)
+    {
+        return false;
+    }
+
+    const DWORD baseProtection =
+        mbi.Protect & 0xFFu;
+
+    const bool readable =
+        baseProtection == PAGE_READONLY ||
+        baseProtection == PAGE_READWRITE ||
+        baseProtection == PAGE_WRITECOPY ||
+        baseProtection == PAGE_EXECUTE_READ ||
+        baseProtection == PAGE_EXECUTE_READWRITE ||
+        baseProtection == PAGE_EXECUTE_WRITECOPY;
+
+    if (!readable)
+        return false;
+
+    const uintptr_t regionBase =
+        reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+
+    if (regionBase > maxAddress - mbi.RegionSize)
+        return false;
+
+    const uintptr_t regionEnd =
+        regionBase + mbi.RegionSize;
+
+    return start >= regionBase &&
+        endInclusive < regionEnd;
+}
+
+enum class ExactClassLookupResult : std::uint8_t
+{
+    Unknown = 0,
+    CompleteNoMatch,
+    ExactMatch
+};
+
+static ExactClassLookupResult FindExactObjectByClass(
+    void* object,
+    const char* className,
+    PluginObjectInfo& matchedInfo)
+{
+    matchedInfo = {};
+
+    if (object == nullptr ||
+        className == nullptr ||
+        g_self == nullptr ||
+        g_self->hooks == nullptr ||
+        g_self->hooks->ObjectWalker == nullptr ||
+        g_self->hooks->ObjectWalker->IsReady == nullptr ||
+        g_self->hooks->ObjectWalker->FindObjectsByClassNameInto == nullptr ||
+        !g_self->hooks->ObjectWalker->IsReady())
+    {
+        return ExactClassLookupResult::Unknown;
+    }
+
     constexpr int InitialCapacity = 8;
+    constexpr int MaximumCapacity = 64;
     PluginObjectInfo initial[InitialCapacity] = {};
 
     const int total =
-        g_self->hooks->ObjectWalker->FindObjectsByNameInto(
-            objectName,
+        g_self->hooks->ObjectWalker->FindObjectsByClassNameInto(
+            className,
             PluginObjectLookup_InstanceOnly,
             initial,
             InitialCapacity);
 
     if (total < 0)
-        return false;
+        return ExactClassLookupResult::Unknown;
 
     const int initialCount =
         (std::min)(total, InitialCapacity);
@@ -387,16 +458,16 @@ static bool ExactObjectPointerHasName(
     {
         if (initial[i].object == object)
         {
-            lookupComplete = true;
-            return true;
+            matchedInfo = initial[i];
+            return ExactClassLookupResult::ExactMatch;
         }
     }
 
     if (total <= InitialCapacity)
-    {
-        lookupComplete = true;
-        return false;
-    }
+        return ExactClassLookupResult::CompleteNoMatch;
+
+    if (total > MaximumCapacity)
+        return ExactClassLookupResult::Unknown;
 
     try
     {
@@ -404,33 +475,37 @@ static bool ExactObjectPointerHasName(
             static_cast<std::size_t>(total));
 
         const int repeatedTotal =
-            g_self->hooks->ObjectWalker->FindObjectsByNameInto(
-                objectName,
+            g_self->hooks->ObjectWalker->FindObjectsByClassNameInto(
+                className,
                 PluginObjectLookup_InstanceOnly,
                 all.data(),
                 total);
 
-        if (repeatedTotal < 0 || repeatedTotal > total)
-            return false;
+        if (repeatedTotal < 0 ||
+            repeatedTotal > total)
+        {
+            return ExactClassLookupResult::Unknown;
+        }
 
         for (int i = 0; i < repeatedTotal; ++i)
         {
             if (all[static_cast<std::size_t>(i)].object == object)
             {
-                lookupComplete = true;
-                return true;
+                matchedInfo = all[static_cast<std::size_t>(i)];
+                return ExactClassLookupResult::ExactMatch;
             }
         }
 
-        lookupComplete = true;
-        return false;
+        if (repeatedTotal != total)
+            return ExactClassLookupResult::Unknown;
+
+        return ExactClassLookupResult::CompleteNoMatch;
     }
     catch (...)
     {
-        return false;
+        return ExactClassLookupResult::Unknown;
     }
 }
-
 static InitialAttachmentProbeResult ProbeInitialAttachment()
 {
     if (g_gEngineStorageAddress == 0 ||
@@ -439,6 +514,16 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
     {
         LOG_WARN(
             "PersistentIdFix: H2 startup probe has an unresolved native dependency");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    if (!IsReadableRange(
+            reinterpret_cast<const void*>(
+                g_gEngineStorageAddress),
+            sizeof(void*)))
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: GEngine storage is not readable; result=Unknown");
         return InitialAttachmentProbeResult::Unknown;
     }
 
@@ -453,6 +538,40 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
         return InitialAttachmentProbeResult::NotActiveGameplay;
     }
 
+    PluginObjectInfo engineInfo{};
+    const ExactClassLookupResult engineLookup =
+        FindExactObjectByClass(
+            engine,
+            "GameEngine",
+            engineInfo);
+
+    if (engineLookup != ExactClassLookupResult::ExactMatch)
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=%s result=Unknown",
+            engine,
+            engineLookup == ExactClassLookupResult::CompleteNoMatch
+                ? "0"
+                : "unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+#ifdef MODLOADER_SERVER_BUILD
+    constexpr std::size_t RequiredEngineReadableSize = 0x11ACu;
+#else
+    constexpr std::size_t RequiredEngineReadableSize = 0x11D4u;
+#endif
+
+    if (!IsReadableRange(
+            engine,
+            RequiredEngineReadableSize))
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=1 readable=0 result=Unknown",
+            engine);
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
     const auto getGameWorld =
         reinterpret_cast<GetGameWorldFn>(
             g_getGameWorldAddress);
@@ -463,42 +582,56 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
     if (world == nullptr)
     {
         LOG_INFO(
-            "PersistentIdFix: H2 startup probe: engine=%p world=null result=NotActive",
+            "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=1 world=null result=NotActive",
             engine);
         return InitialAttachmentProbeResult::NotActiveGameplay;
     }
 
-    bool worldNameLookupComplete = false;
-    const bool isChimeraMain =
-        ExactObjectPointerHasName(
+    PluginObjectInfo worldInfo{};
+    const ExactClassLookupResult worldLookup =
+        FindExactObjectByClass(
             world,
-            "ChimeraMain",
-            worldNameLookupComplete);
+            "World",
+            worldInfo);
 
-    if (!worldNameLookupComplete)
+    if (worldLookup != ExactClassLookupResult::ExactMatch)
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: engine=%p world=%p ChimeraMainIdentity=unknown result=Unknown",
+            "PersistentIdFix: H2 startup probe: engine=%p world=%p WorldIdentity=%s result=Unknown",
             engine,
-            static_cast<void*>(world));
+            static_cast<void*>(world),
+            worldLookup == ExactClassLookupResult::CompleteNoMatch
+                ? "0"
+                : "unknown");
         return InitialAttachmentProbeResult::Unknown;
     }
+
+    const bool isChimeraMain =
+        std::strcmp(
+            worldInfo.objectName,
+            "ChimeraMain") == 0;
 
     if (!isChimeraMain)
     {
         LOG_INFO(
-            "PersistentIdFix: H2 startup probe: engine=%p world=%p ChimeraMainIdentity=0 result=NotActive",
+            "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 objectName=%s ChimeraMainIdentity=0 result=NotActive",
             engine,
-            static_cast<void*>(world));
+            static_cast<void*>(world),
+            worldInfo.objectName);
         return InitialAttachmentProbeResult::NotActiveGameplay;
     }
 
-    const auto hasBegunPlay =
-        reinterpret_cast<HasBegunPlayFn>(
-            g_hasBegunPlayAddress);
-
-    const bool begunPlay =
-        hasBegunPlay(world);
+    constexpr std::size_t RequiredWorldReadableSize = 0x191u;
+    if (!IsReadableRange(
+            world,
+            RequiredWorldReadableSize))
+    {
+        LOG_WARN(
+            "PersistentIdFix: H2 startup probe: engine=%p world=%p WorldIdentity=1 ChimeraMainIdentity=1 readable=0 result=Unknown",
+            engine,
+            static_cast<void*>(world));
+        return InitialAttachmentProbeResult::Unknown;
+    }
 
     const auto* worldBytes =
         reinterpret_cast<const std::uint8_t*>(world);
@@ -509,18 +642,34 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
     const bool beingCleanedUp =
         worldBytes[0x190] != 0;
 
+    if (tearingDown || beingCleanedUp)
+    {
+        LOG_INFO(
+            "PersistentIdFix: H2 startup probe: engine=%p world=%p GameEngineIdentity=1 WorldIdentity=1 ChimeraMainIdentity=1 tearingDown=%u beingCleanedUp=%u result=Unknown",
+            engine,
+            static_cast<void*>(world),
+            tearingDown ? 1u : 0u,
+            beingCleanedUp ? 1u : 0u);
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    const auto hasBegunPlay =
+        reinterpret_cast<HasBegunPlayFn>(
+            g_hasBegunPlayAddress);
+
+    const bool begunPlay =
+        hasBegunPlay(world);
+
     const InitialAttachmentProbeResult result =
-        begunPlay && !tearingDown && !beingCleanedUp
+        begunPlay
             ? InitialAttachmentProbeResult::ActiveGameplay
             : InitialAttachmentProbeResult::Unknown;
 
     LOG_INFO(
-        "PersistentIdFix: H2 startup probe: engine=%p world=%p ChimeraMainIdentity=1 begunPlay=%u tearingDown=%u beingCleanedUp=%u result=%s",
+        "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 ChimeraMainIdentity=1 begunPlay=%u tearingDown=0 beingCleanedUp=0 result=%s",
         engine,
         static_cast<void*>(world),
         begunPlay ? 1u : 0u,
-        tearingDown ? 1u : 0u,
-        beingCleanedUp ? 1u : 0u,
         result == InitialAttachmentProbeResult::ActiveGameplay
             ? "Active"
             : "Unknown");
