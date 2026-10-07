@@ -937,11 +937,37 @@ static void OnTick(
                         LOG_WARN(
                             "PersistentIdFix: certified candidate-pool diagnostic was not accepted");
                     }
-                    else if (!PersistentIdFixSystem::ActivateCertifiedPool(
-                                 g_publishedProtectedGeneration))
+                    else
                     {
-                        LOG_WARN(
-                            "PersistentIdFix: certified reusable pool activation was rejected");
+                        const auto coverage =
+                            PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+                        const auto highWater =
+                            PersistentIdFixSystem::LogHighWaterCrossCheck(
+                                "pre-activation",
+                                coverage.loadGeneration,
+                                coverage.savedHighWaterCaptured,
+                                coverage.savedHighWaterConflict,
+                                coverage.savedHighWater,
+                                true);
+
+                        const bool highWaterCertified =
+                            highWater.available &&
+                            highWater.restoredAtLeastSaved &&
+                            highWater.exactAccountingValid &&
+                            highWater.exactAccountingMatch;
+
+                        if (!highWaterCertified)
+                        {
+                            LOG_ERROR(
+                                "PersistentIdFix: certified pool activation rejected: serialized/live high-water accounting is not exact");
+                        }
+                        else if (!PersistentIdFixSystem::ActivateCertifiedPool(
+                                     g_publishedProtectedGeneration))
+                        {
+                            LOG_WARN(
+                                "PersistentIdFix: certified reusable pool activation was rejected");
+                        }
                     }
                 }
             }
@@ -950,18 +976,6 @@ static void OnTick(
         PersistentIdFixSystem::LogAssignmentLedger(
             "ready-transition");
 
-        {
-            const auto coverage =
-                PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
-
-            PersistentIdFixSystem::LogHighWaterCrossCheck(
-                "ready-transition",
-                coverage.loadGeneration,
-                coverage.savedHighWaterCaptured,
-                coverage.savedHighWaterConflict,
-                coverage.savedHighWater,
-                true);
-        }
 
         PersistentIdFixSystem::LogSetPairObserver(
             "ready-transition");
