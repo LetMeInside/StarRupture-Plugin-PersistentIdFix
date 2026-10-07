@@ -33,6 +33,10 @@ public:
 
     void ClearStagedPool();
 
+    // Atomically replaces the active legacy ranges with the already
+    // validated staged certified ranges. No allocation occurs here.
+    bool PromoteStagedPool();
+
     PersistentIdAllocationResult TryAllocate(
         SDK::FMassEntityHandle handle,
         SDK::FCrMassPersistentEntityID& outId);
@@ -81,4 +85,5 @@ private:
 
     std::vector<IdRange> stagedRanges_;
     uint64_t stagedReusableIDCount_ = 0;
+    bool stagedPoolReady_ = false;
 };

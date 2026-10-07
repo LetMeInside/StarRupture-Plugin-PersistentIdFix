@@ -34,6 +34,11 @@ namespace
     static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
 
     static bool g_reusePoolReady = false;
+
+    // Loaded-save reuse remains disabled until the complete source
+    // certificate has produced and promoted the staged pool.
+    static bool g_certifiedPoolActive = false;
+
     static bool g_sessionActive = false;
 
     static EPluginNetMode g_sessionNetMode = EPluginNetMode::Unknown;
@@ -152,6 +157,7 @@ namespace
     {
         g_persistentIdReuse.Clear();
         g_reusePoolReady = false;
+        g_certifiedPoolActive = false;
         g_persistentIdSubsystem = nullptr;
         g_loadedHandleIds.clear();
         g_loadedHighWater = 0;
@@ -338,9 +344,13 @@ namespace
             static_cast<uint32_t>(
                 subsystem->IDHandleMap.Num()),
             loadedMaxID,
-            g_persistentIdReuse.GetReusableIDCount(),
-            static_cast<uint64_t>(
-                g_persistentIdReuse.GetRangeCount()));
+            g_certifiedPoolActive
+                ? g_persistentIdReuse.GetReusableIDCount()
+                : 0u,
+            g_certifiedPoolActive
+                ? static_cast<uint64_t>(
+                    g_persistentIdReuse.GetRangeCount())
+                : 0u);
 
         g_persistentIdSubsystem = subsystem;
         g_sessionActive = true;
@@ -373,9 +383,13 @@ namespace
             static_cast<std::uint32_t>(
                 g_persistentIdSubsystem->IDHandleMap.Num()),
             g_persistentIdSubsystem->MaxID,
-            g_persistentIdReuse.GetReusableIDCount(),
-            static_cast<std::uint64_t>(
-                g_persistentIdReuse.GetRangeCount()));
+            g_certifiedPoolActive
+                ? g_persistentIdReuse.GetReusableIDCount()
+                : 0u,
+            g_certifiedPoolActive
+                ? static_cast<std::uint64_t>(
+                    g_persistentIdReuse.GetRangeCount())
+                : 0u);
 
         return true;
     }
@@ -430,6 +444,7 @@ namespace PersistentIdFixSystem
         g_loadedHandleIds.clear();
         g_loadedHighWater = 0;
         g_reusePoolReady = false;
+        g_certifiedPoolActive = false;
         g_sessionActive = false;
         g_sessionNetMode = EPluginNetMode::Unknown;
 
@@ -756,6 +771,62 @@ namespace PersistentIdFixSystem
         return diagnostic;
     }
 
+    bool ActivateCertifiedPool(
+        std::uint64_t loadGeneration)
+    {
+        if (!g_sessionActive ||
+            !g_reusePoolReady ||
+            g_persistentIdSubsystem == nullptr ||
+            g_loadedHighWater == 0 ||
+            loadGeneration == 0)
+        {
+            LOG_WARN(
+                "PersistentIdFix: certified pool activation rejected: session state is incomplete");
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
+
+            if (!g_assignmentLedgerHealthy ||
+                g_assignmentLedgerGeneration != loadGeneration)
+            {
+                LOG_WARN(
+                    "PersistentIdFix: certified pool activation rejected: assignment ledger generation/health mismatch");
+                return false;
+            }
+
+            for (const LedgerEntry& entry : g_assignmentLedger)
+            {
+                if (entry.subsystem != g_persistentIdSubsystem)
+                {
+                    LOG_WARN(
+                        "PersistentIdFix: certified pool activation rejected: foreign subsystem ledger entry is present");
+                    return false;
+                }
+            }
+
+            if (!g_persistentIdReuse.PromoteStagedPool())
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: certified pool activation failed: no valid staged pool was available");
+                return false;
+            }
+
+            g_certifiedPoolActive = true;
+        }
+
+        LOG_INFO(
+            "PersistentIdFix: certified reusable pool activated: generation=%llu reusable=%llu ranges=%llu",
+            static_cast<unsigned long long>(loadGeneration),
+            static_cast<unsigned long long>(
+                g_persistentIdReuse.GetReusableIDCount()),
+            static_cast<unsigned long long>(
+                g_persistentIdReuse.GetRangeCount()));
+
+        return true;
+    }
+
     void SetSessionNetMode(EPluginNetMode netMode)
     {
         if (g_sessionNetMode != EPluginNetMode::Unknown)
@@ -938,6 +1009,7 @@ namespace PersistentIdFixSystem
 
         g_persistentIdReuse.Clear();
         g_reusePoolReady = false;
+        g_certifiedPoolActive = false;
 
         PersistentIdFixStats::Reset();
 
@@ -1109,23 +1181,33 @@ namespace PersistentIdFixSystem
         /*
          * No existing mapping.
          *
-         * First consume an ID hole that existed when the save was loaded.
+         * Loaded-save holes are consumed only after the comprehensive
+         * source certificate has promoted the staged pool. Before that
+         * point, allocation deliberately falls through to bounded
+         * monotonic IDs. This removes the legacy unsafe-reuse window.
+         *
+         * A brand-new game also remains monotonic-only for its first
+         * session: it begins with no pre-existing holes, and same-session
+         * recycling is intentionally prohibited.
          */
-        switch (g_persistentIdReuse.TryAllocate(handle, *returnValue))
+        if (g_certifiedPoolActive)
         {
-        case PersistentIdAllocationResult::Allocated:
-            RecordAssignedId(
-                persistentIDSubsystem,
-                returnValue->ID);
-            PersistentIdFixStats::RecordAssignment();
-            return returnValue;
+            switch (g_persistentIdReuse.TryAllocate(handle, *returnValue))
+            {
+            case PersistentIdAllocationResult::Allocated:
+                RecordAssignedId(
+                    persistentIDSubsystem,
+                    returnValue->ID);
+                PersistentIdFixStats::RecordAssignment();
+                return returnValue;
 
-        case PersistentIdAllocationResult::NoReusableId:
-            break;
+            case PersistentIdAllocationResult::NoReusableId:
+                break;
 
-        case PersistentIdAllocationResult::Failed:
-            // This is logged inside TryAllocate.
-            return returnValue;
+            case PersistentIdAllocationResult::Failed:
+                // This is logged inside TryAllocate.
+                return returnValue;
+            }
         }
 
         /*

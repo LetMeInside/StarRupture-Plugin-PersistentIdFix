@@ -60,6 +60,10 @@ namespace PersistentIdFixSystem
         std::uint64_t loadGeneration,
         const std::vector<std::uint32_t>& sourceProtectedIds);
 
+    // Promotes only an already-staged certified pool for the exact
+    // current load generation. Failure leaves reuse fail-closed.
+    bool ActivateCertifiedPool(std::uint64_t loadGeneration);
+
     void SetSessionNetMode(EPluginNetMode netMode);
 
     // Returns the concrete current game-world role when available.

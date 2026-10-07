@@ -405,6 +405,12 @@ static void OnTick(
                 LOG_WARN(
                     "PersistentIdFix: certified candidate-pool diagnostic was not accepted");
             }
+            else if (!PersistentIdFixSystem::ActivateCertifiedPool(
+                         g_publishedProtectedGeneration))
+            {
+                LOG_WARN(
+                    "PersistentIdFix: certified reusable pool activation was rejected");
+            }
         }
 
         PersistentIdFixSystem::LogAssignmentLedger(

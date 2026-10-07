@@ -24,6 +24,7 @@ void PersistentIdReuse::Clear()
 
     stagedRanges_.clear();
     stagedReusableIDCount_ = 0;
+    stagedPoolReady_ = false;
 }
 
 void PersistentIdReuse::BuildPool()
@@ -95,6 +96,7 @@ bool PersistentIdReuse::StagePoolFromBlockedIds(
 {
     stagedRanges_.clear();
     stagedReusableIDCount_ = 0;
+    stagedPoolReady_ = false;
 
     if (highWater == 0)
         return false;
@@ -152,6 +154,7 @@ bool PersistentIdReuse::StagePoolFromBlockedIds(
         return false;
     }
 
+    stagedPoolReady_ = true;
     return true;
 }
 
@@ -159,6 +162,22 @@ void PersistentIdReuse::ClearStagedPool()
 {
     stagedRanges_.clear();
     stagedReusableIDCount_ = 0;
+    stagedPoolReady_ = false;
+}
+
+bool PersistentIdReuse::PromoteStagedPool()
+{
+    if (!stagedPoolReady_)
+        return false;
+
+    ranges_.swap(stagedRanges_);
+    reusableIDCount_ = stagedReusableIDCount_;
+
+    stagedRanges_.clear();
+    stagedReusableIDCount_ = 0;
+    stagedPoolReady_ = false;
+
+    return true;
 }
 
 PersistentIdAllocationResult PersistentIdReuse::TryAllocate(
