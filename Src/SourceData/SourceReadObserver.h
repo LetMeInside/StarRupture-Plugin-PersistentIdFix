@@ -125,6 +125,17 @@ namespace PersistentIdFixSourceReadObserver
     CoverageSnapshot GetCoverageSnapshot();
     ObserverActivitySnapshot GetObserverActivitySnapshot();
 
+    // Publication freeze.
+    //
+    // BeginPublicationFreeze() acquires the observer's exclusive
+    // source-data gate. It waits for every in-flight GetSaveData
+    // observer frame to finish and prevents any new observer frame or
+    // generation reset from beginning until EndPublicationFreeze().
+    // The caller must pair a successful begin with exactly one end on
+    // the same thread.
+    bool BeginPublicationFreeze();
+    void EndPublicationFreeze();
+
     // Writes a compact observational snapshot. The phase label identifies
     // whether the snapshot was taken at Mass OnSaveLoaded or at world end.
     void LogCoverage(const char* phase);

@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
+#include <mutex>
+#include <shared_mutex>
 
 namespace
 {
@@ -58,6 +60,19 @@ namespace
     // plugin-owned source vectors were being copied.
     std::atomic<std::uint64_t> g_activeObserverFrames{ 0 };
     std::atomic<std::uint64_t> g_observerFrameTransitions{ 0 };
+
+    // Formal source/publication exclusion gate.
+    //
+    // Observer frames take a shared lock for their entire native-read
+    // and collector-update lifetime. Publication and generation reset
+    // take the exclusive lock. Therefore collector publication cannot
+    // overlap a source read or collector reset.
+    std::shared_mutex g_sourcePublicationGate;
+
+    // Publication is initiated from the game thread. Keep explicit
+    // state so accidental nested/unpaired freeze requests fail closed.
+    std::mutex g_publicationFreezeStateMutex;
+    bool g_publicationFreezeHeld = false;
 
     struct ObserverFrameGuard
     {
@@ -463,6 +478,9 @@ namespace PersistentIdFixSourceReadObserver
         if (original == nullptr)
             return false;
 
+        std::shared_lock<std::shared_mutex> sourceReadLock(
+            g_sourcePublicationGate);
+
         ObserverFrameGuard observerFrame;
 
         // This is the only information Step 3A reads before the native call.
@@ -842,6 +860,63 @@ namespace PersistentIdFixSourceReadObserver
         return snapshot;
     }
 
+    bool BeginPublicationFreeze()
+    {
+        {
+            std::lock_guard<std::mutex> stateLock(
+                g_publicationFreezeStateMutex);
+
+            if (g_publicationFreezeHeld)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: publication freeze rejected: freeze already held");
+                return false;
+            }
+
+            g_publicationFreezeHeld = true;
+        }
+
+        try
+        {
+            g_sourcePublicationGate.lock();
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> stateLock(
+                g_publicationFreezeStateMutex);
+            g_publicationFreezeHeld = false;
+
+            LOG_ERROR(
+                "PersistentIdFix: publication freeze failed while acquiring source gate");
+            return false;
+        }
+
+        return true;
+    }
+
+    void EndPublicationFreeze()
+    {
+        bool release = false;
+
+        {
+            std::lock_guard<std::mutex> stateLock(
+                g_publicationFreezeStateMutex);
+
+            if (!g_publicationFreezeHeld)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: publication freeze release requested with no held freeze");
+                return;
+            }
+
+            g_publicationFreezeHeld = false;
+            release = true;
+        }
+
+        if (release)
+            g_sourcePublicationGate.unlock();
+    }
+
     void LogCoverage(const char* phase)
     {
         const CoverageSnapshot snapshot =
@@ -918,6 +993,9 @@ namespace PersistentIdFixSourceReadObserver
     void BeginLoadGeneration(
         void* saveSubsystem)
     {
+        std::unique_lock<std::shared_mutex> generationLock(
+            g_sourcePublicationGate);
+
         ResetObservationCounters();
 
         g_gameWorldAttached.store(false, std::memory_order_relaxed);
@@ -983,6 +1061,9 @@ namespace PersistentIdFixSourceReadObserver
 
     void Reset()
     {
+        std::unique_lock<std::shared_mutex> resetLock(
+            g_sourcePublicationGate);
+
         ResetObservationCounters();
         g_gameWorldAttached.store(false, std::memory_order_relaxed);
         g_attachedLoadGeneration.store(0, std::memory_order_relaxed);

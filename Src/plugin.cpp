@@ -173,13 +173,28 @@ static bool PublishProtectedIds()
         return false;
     }
 
+    if (!PersistentIdFixSourceReadObserver::BeginPublicationFreeze())
+    {
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication failed to acquire source freeze");
+        return false;
+    }
+
+    struct PublicationFreezeRelease
+    {
+        ~PublicationFreezeRelease()
+        {
+            PersistentIdFixSourceReadObserver::EndPublicationFreeze();
+        }
+    } publicationFreezeRelease;
+
     const auto activityBefore =
         PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
 
     if (activityBefore.activeFrames != 0)
     {
-        LOG_WARN(
-            "PersistentIdFix: protected-ID publication deferred: active observer frames=%llu",
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication acquired source freeze but active observer frames=%llu",
             static_cast<unsigned long long>(activityBefore.activeFrames));
         return false;
     }
@@ -194,18 +209,14 @@ static bool PublishProtectedIds()
         return false;
     }
 
-    const auto activityAfterA =
-        PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
-    const auto activityAfterB =
+    const auto activityAfter =
         PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
 
-    if (activityAfterA.activeFrames != 0 ||
-        activityAfterB.activeFrames != 0 ||
-        activityAfterA.frameTransitions != activityBefore.frameTransitions ||
-        activityAfterB.frameTransitions != activityBefore.frameTransitions)
+    if (activityAfter.activeFrames != 0 ||
+        activityAfter.frameTransitions != activityBefore.frameTransitions)
     {
-        LOG_WARN(
-            "PersistentIdFix: protected-ID publication deferred: observer activity changed during copy");
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication source freeze coherence failure");
         return false;
     }
 
