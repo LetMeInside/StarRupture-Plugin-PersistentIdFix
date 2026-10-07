@@ -81,6 +81,7 @@ private:
 
     uint32_t sessionMaxID_ = 0;
     std::vector<IdRange> ranges_;
+    size_t rangeIndex_ = 0;
     uint64_t reusableIDCount_ = 0;
 
     std::vector<IdRange> stagedRanges_;

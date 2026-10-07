@@ -20,6 +20,7 @@ void PersistentIdReuse::Clear()
 
     sessionMaxID_ = 0;
     ranges_.clear();
+    rangeIndex_ = 0;
     reusableIDCount_ = 0;
 
     stagedRanges_.clear();
@@ -30,6 +31,7 @@ void PersistentIdReuse::Clear()
 void PersistentIdReuse::BuildPool()
 {
     ranges_.clear();
+    rangeIndex_ = 0;
     reusableIDCount_ = 0;
 
     if (subsystem_ == nullptr)
@@ -171,6 +173,7 @@ bool PersistentIdReuse::PromoteStagedPool()
         return false;
 
     ranges_.swap(stagedRanges_);
+    rangeIndex_ = 0;
     reusableIDCount_ = stagedReusableIDCount_;
 
     stagedRanges_.clear();
@@ -186,12 +189,12 @@ PersistentIdAllocationResult PersistentIdReuse::TryAllocate(
 {
     if (subsystem_ == nullptr ||
         setIDHandlePair_ == nullptr ||
-        ranges_.empty())
+        rangeIndex_ >= ranges_.size())
     {
         return PersistentIdAllocationResult::NoReusableId;
     }
 
-    IdRange& range = ranges_.front();
+    IdRange& range = ranges_[rangeIndex_];
 
     const uint32_t id = range.first;
 
@@ -224,7 +227,7 @@ PersistentIdAllocationResult PersistentIdReuse::TryAllocate(
     --reusableIDCount_;
 
     if (range.first > range.last)
-        ranges_.erase(ranges_.begin());
+        ++rangeIndex_;
 
     // For debugging:
     //LOG_INFO(
@@ -253,7 +256,10 @@ uint64_t PersistentIdReuse::GetReusableIDCount() const
 
 size_t PersistentIdReuse::GetRangeCount() const
 {
-    return ranges_.size();
+    if (rangeIndex_ >= ranges_.size())
+        return 0;
+
+    return ranges_.size() - rangeIndex_;
 }
 
 uint64_t PersistentIdReuse::GetStagedReusableIDCount() const
@@ -294,11 +300,11 @@ bool PersistentIdReuse::GetFirstRange(
     uint32_t& first,
     uint32_t& last) const
 {
-    if (ranges_.empty())
+    if (rangeIndex_ >= ranges_.size())
         return false;
 
-    first = ranges_.front().first;
-    last = ranges_.front().last;
+    first = ranges_[rangeIndex_].first;
+    last = ranges_[rangeIndex_].last;
 
     return true;
 }
@@ -307,7 +313,7 @@ bool PersistentIdReuse::GetLastRange(
     uint32_t& first,
     uint32_t& last) const
 {
-    if (ranges_.empty())
+    if (rangeIndex_ >= ranges_.size())
         return false;
 
     first = ranges_.back().first;
