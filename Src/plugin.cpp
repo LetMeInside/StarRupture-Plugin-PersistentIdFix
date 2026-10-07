@@ -456,7 +456,6 @@ static void OnTick(
 
 static void OnWorldBeginPlay(SDK::UWorld* world)
 {
-    (void)world;
 
     if (g_self == nullptr ||
         g_self->hooks == nullptr ||
@@ -487,6 +486,7 @@ static void OnWorldBeginPlay(SDK::UWorld* world)
      */
     g_gameWorldActive = true;
 
+    PersistentIdFixSystem::BeginGameWorld(world);
     PersistentIdFixSourceReadObserver::AttachCurrentGenerationToGameWorld();
 
     /*
@@ -597,6 +597,7 @@ static void OnAfterWorldEndPlay(
     if (g_gameWorldActive)
     {
         PersistentIdFixSourceReadObserver::DetachGameWorld();
+        PersistentIdFixSystem::EndGameWorld(world);
     }
 
     /*
@@ -612,8 +613,6 @@ static void OnAfterWorldEndPlay(
 
     PersistentIdFixSystem::LogSetPairObserver(
         "world-end");
-
-
 
     PersistentIdFixSystem::EndSession();
 

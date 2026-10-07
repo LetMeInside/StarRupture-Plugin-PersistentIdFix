@@ -23,6 +23,20 @@ namespace
 
     static PersistentIdReuse g_persistentIdReuse;
     static SDK::UCrMassPersistentIDSubsystem* g_persistentIdSubsystem = nullptr;
+    static SDK::UWorld* g_activeGameWorld = nullptr;
+    static bool g_subsystemWorldVerified = false;
+    static bool g_unboundAllocatorWarningLogged = false;
+
+    static void* ReadUObjectOuter(const void* object)
+    {
+        if (object == nullptr)
+            return nullptr;
+
+        const auto* bytes =
+            static_cast<const std::uint8_t*>(object);
+
+        return *reinterpret_cast<void* const*>(bytes + 0x20);
+    }
 
     // Snapshot of IDs present in IDHandleMap when the authoritative
     // session was initialized. This intentionally remains stable for
@@ -216,12 +230,13 @@ namespace
     // belongs to the current world.
     // ---------------------------------------------------------------------------
 
-    static bool InitializeSession()
+    static bool InitializeSession(SDK::UCrMassPersistentIDSubsystem* requestedSubsystem)
     {
         g_persistentIdReuse.Clear();
         g_reusePoolReady = false;
         g_certifiedPoolActive = false;
         g_persistentIdSubsystem = nullptr;
+        g_subsystemWorldVerified = false;
         g_loadedHandleIds.clear();
         g_loadedHighWater = 0;
 
@@ -236,51 +251,118 @@ namespace
             return false;
         }
 
-        auto* walker = g_systemSelf->hooks->ObjectWalker;
+        SDK::UCrMassPersistentIDSubsystem* subsystem = requestedSubsystem;
+        void* object = requestedSubsystem;
 
-        if (walker == nullptr || !walker->IsReady())
+        if (subsystem != nullptr)
         {
-            LOG_ERROR(
-                "PersistentIdFix: ObjectWalker is unavailable during persistent ID system initialization");
-            return false;
+            LOG_INFO(
+                "PersistentIdFix: using allocator caller subsystem directly: object=%p outer=%p activeWorld=%p",
+                static_cast<void*>(subsystem),
+                ReadUObjectOuter(subsystem),
+                static_cast<void*>(g_activeGameWorld));
+        }
+        else
+        {
+            if (g_activeGameWorld == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: loaded-session subsystem discovery rejected: no observed ChimeraMain world");
+                return false;
+            }
+
+            auto* walker = g_systemSelf->hooks->ObjectWalker;
+
+            if (walker == nullptr || !walker->IsReady())
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: ObjectWalker is unavailable during persistent ID system initialization");
+                return false;
+            }
+
+            PluginObjectInfo objects[8] = {};
+
+            const int count = walker->FindObjectsByClassNameInto(
+                "CrMassPersistentIDSubsystem",
+                PluginObjectLookup_InstanceOnly,
+                objects,
+                8);
+
+            LOG_INFO(
+                "PersistentIdFix: found %d CrMassPersistentIDSubsystem instance(s); selecting by Outer world=%p",
+                count,
+                static_cast<void*>(g_activeGameWorld));
+
+            if (count <= 0)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: persistent ID subsystem was not found");
+                return false;
+            }
+
+            if (count > 8)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: subsystem discovery truncated: found %d instances, capacity=8",
+                    count);
+                return false;
+            }
+
+            int worldMatches = 0;
+            PluginObjectInfo* selected = nullptr;
+
+            for (int i = 0; i < count; ++i)
+            {
+                void* candidate = objects[i].object;
+                void* outer = ReadUObjectOuter(candidate);
+
+                LOG_INFO(
+                    "PersistentIdFix: subsystem candidate object=%p name=%s outer=%p worldMatch=%u",
+                    candidate,
+                    objects[i].objectName,
+                    outer,
+                    outer == g_activeGameWorld ? 1u : 0u);
+
+                if (outer == g_activeGameWorld)
+                {
+                    ++worldMatches;
+                    selected = &objects[i];
+                }
+            }
+
+            if (worldMatches != 1 || selected == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: expected exactly one persistent ID subsystem owned by active ChimeraMain world, found %d",
+                    worldMatches);
+                return false;
+            }
+
+            object = selected->object;
+            subsystem =
+                static_cast<SDK::UCrMassPersistentIDSubsystem*>(object);
+
+            LOG_INFO(
+                "PersistentIdFix: selected world-owned subsystem object=%p name=%s",
+                object,
+                selected->objectName);
         }
 
-        PluginObjectInfo objects[8] = {};
-
-        const int count = walker->FindObjectsByClassNameInto(
-            "CrMassPersistentIDSubsystem",
-            PluginObjectLookup_InstanceOnly,
-            objects,
-            8);
-
-        LOG_INFO(
-            "PersistentIdFix: found %d CrMassPersistentIDSubsystem instance(s)",
-            count);
-
-        if (count <= 0)
+        if (g_activeGameWorld != nullptr)
         {
-            LOG_ERROR(
-                "PersistentIdFix: persistent ID subsystem was not found");
-            return false;
+            g_subsystemWorldVerified =
+                ReadUObjectOuter(subsystem) == g_activeGameWorld;
+
+            if (!g_subsystemWorldVerified)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: allocator subsystem ownership mismatch: subsystem=%p outer=%p activeWorld=%p",
+                    static_cast<void*>(subsystem),
+                    ReadUObjectOuter(subsystem),
+                    static_cast<void*>(g_activeGameWorld));
+                return false;
+            }
         }
-
-        if (count > 1)
-        {
-            LOG_ERROR(
-                "PersistentIdFix: expected exactly one CrMassPersistentIDSubsystem, found %d",
-                count);
-            return false;
-        }
-
-        void* object = objects[0].object;
-
-        LOG_INFO(
-            "PersistentIdFix: subsystem object=%p name=%s",
-            object,
-            objects[0].objectName);
-
-        auto* subsystem =
-            static_cast<SDK::UCrMassPersistentIDSubsystem*>(object);
 
         // The highest existing ID is diagnostic information here.
         // PersistentIdFix does not infer corruption from MaxID alone.
@@ -471,14 +553,14 @@ namespace
     // indication that a new-game persistent-ID system is being populated.
     // ---------------------------------------------------------------------------
 
-    static void OnNewGame()
+    static void OnNewGame(SDK::UCrMassPersistentIDSubsystem* subsystem)
     {
         ResetSetPairObserver(0);
 
         LOG_INFO(
             "PersistentIdFix: new game detected");
 
-        if (!InitializeSession())
+        if (!InitializeSession(subsystem))
         {
             LOG_ERROR(
                 "PersistentIdFix: persistent ID system initialization failed for new game");
@@ -512,6 +594,9 @@ namespace PersistentIdFixSystem
         g_certifiedPoolActive = false;
         g_sessionActive = false;
         g_sessionNetMode = EPluginNetMode::Unknown;
+        g_activeGameWorld = nullptr;
+        g_subsystemWorldVerified = false;
+        g_unboundAllocatorWarningLogged = false;
 
         ResetAssignmentLedger(0);
         ResetSetPairObserver(0);
@@ -751,6 +836,8 @@ namespace PersistentIdFixSystem
         if (!g_sessionActive ||
             g_persistentIdSubsystem == nullptr ||
             !g_reusePoolReady ||
+            !g_subsystemWorldVerified ||
+            g_activeGameWorld == nullptr ||
             g_loadedHighWater == 0)
         {
             LOG_WARN(
@@ -990,6 +1077,8 @@ namespace PersistentIdFixSystem
         if (!g_sessionActive ||
             !g_reusePoolReady ||
             g_persistentIdSubsystem == nullptr ||
+            !g_subsystemWorldVerified ||
+            g_activeGameWorld == nullptr ||
             g_loadedHighWater == 0 ||
             loadGeneration == 0)
         {
@@ -1059,9 +1148,62 @@ namespace PersistentIdFixSystem
         return GetEffectiveSessionNetMode();
     }
 
+    void BeginGameWorld(SDK::UWorld* world)
+    {
+        g_activeGameWorld = world;
+        g_subsystemWorldVerified = false;
+
+        if (world == nullptr)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: BeginGameWorld received null world; reuse remains fail-closed");
+            return;
+        }
+
+        if (g_persistentIdSubsystem == nullptr)
+        {
+            LOG_INFO(
+                "PersistentIdFix: gameplay world observed: world=%p allocator not yet bound",
+                static_cast<void*>(world));
+            return;
+        }
+
+        void* outer = ReadUObjectOuter(g_persistentIdSubsystem);
+        g_subsystemWorldVerified = outer == world;
+
+        if (g_subsystemWorldVerified)
+        {
+            LOG_INFO(
+                "PersistentIdFix: allocator/world ownership verified: subsystem=%p outer=%p world=%p",
+                static_cast<void*>(g_persistentIdSubsystem),
+                outer,
+                static_cast<void*>(world));
+        }
+        else
+        {
+            LOG_ERROR(
+                "PersistentIdFix: allocator/world ownership mismatch: subsystem=%p outer=%p world=%p; reuse remains fail-closed",
+                static_cast<void*>(g_persistentIdSubsystem),
+                outer,
+                static_cast<void*>(world));
+        }
+    }
+
+    void EndGameWorld(SDK::UWorld* world)
+    {
+        if (world != nullptr && g_activeGameWorld == world)
+        {
+            LOG_INFO(
+                "PersistentIdFix: gameplay world binding ended: world=%p",
+                static_cast<void*>(world));
+            g_activeGameWorld = nullptr;
+            g_subsystemWorldVerified = false;
+        }
+    }
+
     void OnSaveLoaded()
     {
-        if (!InitializeSession())
+        if (!InitializeSession(nullptr))
         {
             LOG_ERROR(
                 "PersistentIdFix: persistent ID system initialization failed after save load");
@@ -1461,6 +1603,21 @@ namespace PersistentIdFixSystem
             return returnValue;
         }
 
+        if (!g_sessionActive &&
+            g_activeGameWorld == nullptr &&
+            !g_unboundAllocatorWarningLogged &&
+            (persistentIDSubsystem->MaxID != 0 ||
+                persistentIDSubsystem->IDHandleMap.Num() != 0))
+        {
+            g_unboundAllocatorWarningLogged = true;
+            LOG_WARN(
+                "PersistentIdFix: allocator activity observed without an OnWorldBeginPlay ownership boundary; treating this as late/hot attachment and keeping reuse fail-closed: subsystem=%p outer=%p MaxID=%u entities=%d",
+                static_cast<void*>(persistentIDSubsystem),
+                ReadUObjectOuter(persistentIDSubsystem),
+                persistentIDSubsystem->MaxID,
+                persistentIDSubsystem->IDHandleMap.Num());
+        }
+
         /*
          * A new game begins with an empty persistent-ID subsystem. StarRupture
          * starts allocating persistent IDs before OnWorldBeginPlay and without
@@ -1474,7 +1631,7 @@ namespace PersistentIdFixSystem
             persistentIDSubsystem->MaxID == 0 &&
             persistentIDSubsystem->IDHandleMap.Num() == 0)
         {
-            OnNewGame();
+            OnNewGame(persistentIDSubsystem);
         }
 
         /*

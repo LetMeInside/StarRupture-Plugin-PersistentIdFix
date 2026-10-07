@@ -119,6 +119,9 @@ namespace PersistentIdFixSystem
     // authority from process type or startup heuristics.
     EPluginNetMode GetSessionNetMode();
 
+    void BeginGameWorld(SDK::UWorld* world);
+    void EndGameWorld(SDK::UWorld* world);
+
     void OnSaveLoaded();
 
     void Tick();
