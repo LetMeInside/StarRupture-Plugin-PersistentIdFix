@@ -92,6 +92,13 @@ namespace
     static std::vector<LedgerEntry> g_assignmentLedger;
     static std::uint64_t g_assignmentLedgerGeneration = 0;
     static bool g_assignmentLedgerHealthy = true;
+    static bool g_assignmentLedgerRetainsEntries = true;
+    static SDK::UCrMassPersistentIDSubsystem*
+        g_assignmentLedgerCompactedSubsystem = nullptr;
+    static std::uint64_t g_assignmentLedgerCompactedAssigned = 0;
+    static std::uint64_t g_assignmentLedgerCompactedBurned = 0;
+    static std::uint64_t g_assignmentLedgerCompactedForeignAssigned = 0;
+    static std::uint64_t g_assignmentLedgerCompactedForeignBurned = 0;
 
 #ifdef PERSISTENTIDFIX_DIAGNOSTICS
     static std::mutex g_setPairObserverMutex;
@@ -109,7 +116,52 @@ namespace
         g_assignmentLedger.clear();
         g_assignmentLedgerGeneration = loadGeneration;
         g_assignmentLedgerHealthy = true;
+        g_assignmentLedgerRetainsEntries = true;
+        g_assignmentLedgerCompactedSubsystem = nullptr;
+        g_assignmentLedgerCompactedAssigned = 0;
+        g_assignmentLedgerCompactedBurned = 0;
+        g_assignmentLedgerCompactedForeignAssigned = 0;
+        g_assignmentLedgerCompactedForeignBurned = 0;
     }
+
+    static void CompactAssignmentLedgerLocked()
+    {
+        g_assignmentLedgerCompactedSubsystem =
+            g_persistentIdSubsystem;
+
+        g_assignmentLedgerCompactedAssigned = 0;
+        g_assignmentLedgerCompactedBurned = 0;
+        g_assignmentLedgerCompactedForeignAssigned = 0;
+        g_assignmentLedgerCompactedForeignBurned = 0;
+
+        for (const LedgerEntry& entry : g_assignmentLedger)
+        {
+            const bool compactedSubsystem =
+                g_assignmentLedgerCompactedSubsystem != nullptr &&
+                entry.subsystem ==
+                    g_assignmentLedgerCompactedSubsystem;
+
+            if (entry.kind == LedgerEntryKind::Assigned)
+            {
+                if (compactedSubsystem)
+                    ++g_assignmentLedgerCompactedAssigned;
+                else
+                    ++g_assignmentLedgerCompactedForeignAssigned;
+            }
+            else
+            {
+                if (compactedSubsystem)
+                    ++g_assignmentLedgerCompactedBurned;
+                else
+                    ++g_assignmentLedgerCompactedForeignBurned;
+            }
+        }
+
+        std::vector<LedgerEntry> empty;
+        g_assignmentLedger.swap(empty);
+        g_assignmentLedgerRetainsEntries = false;
+    }
+
 
     static void ResetSetPairObserver(
         std::uint64_t loadGeneration)
@@ -178,7 +230,33 @@ namespace
         try
         {
             std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
-            g_assignmentLedger.push_back({ subsystem, id, kind });
+
+            if (g_assignmentLedgerRetainsEntries)
+            {
+                g_assignmentLedger.push_back({ subsystem, id, kind });
+                return true;
+            }
+
+            const bool compactedSubsystem =
+                g_assignmentLedgerCompactedSubsystem != nullptr &&
+                subsystem ==
+                    g_assignmentLedgerCompactedSubsystem;
+
+            if (kind == LedgerEntryKind::Assigned)
+            {
+                if (compactedSubsystem)
+                    ++g_assignmentLedgerCompactedAssigned;
+                else
+                    ++g_assignmentLedgerCompactedForeignAssigned;
+            }
+            else
+            {
+                if (compactedSubsystem)
+                    ++g_assignmentLedgerCompactedBurned;
+                else
+                    ++g_assignmentLedgerCompactedForeignBurned;
+            }
+
             return true;
         }
         catch (...)
@@ -188,6 +266,7 @@ namespace
             return false;
         }
     }
+
 
     static void RecordAssignedId(
         SDK::UCrMassPersistentIDSubsystem* subsystem,
@@ -661,34 +740,72 @@ namespace PersistentIdFixSystem
         snapshot.loadGeneration = g_assignmentLedgerGeneration;
         snapshot.healthy = g_assignmentLedgerHealthy;
 
-        for (const LedgerEntry& entry : g_assignmentLedger)
+        if (g_assignmentLedgerRetainsEntries)
         {
-            const bool currentSubsystem =
-                g_persistentIdSubsystem != nullptr &&
-                entry.subsystem == g_persistentIdSubsystem;
-
-            if (entry.kind == LedgerEntryKind::Assigned)
+            for (const LedgerEntry& entry : g_assignmentLedger)
             {
-                ++snapshot.assignedEntries;
+                const bool currentSubsystem =
+                    g_persistentIdSubsystem != nullptr &&
+                    entry.subsystem == g_persistentIdSubsystem;
 
-                if (currentSubsystem)
-                    ++snapshot.currentSubsystemAssigned;
-                else
-                    ++snapshot.foreignSubsystemAssigned;
-            }
-            else
-            {
-                ++snapshot.burnedEntries;
+                if (entry.kind == LedgerEntryKind::Assigned)
+                {
+                    ++snapshot.assignedEntries;
 
-                if (currentSubsystem)
-                    ++snapshot.currentSubsystemBurned;
+                    if (currentSubsystem)
+                        ++snapshot.currentSubsystemAssigned;
+                    else
+                        ++snapshot.foreignSubsystemAssigned;
+                }
                 else
-                    ++snapshot.foreignSubsystemBurned;
+                {
+                    ++snapshot.burnedEntries;
+
+                    if (currentSubsystem)
+                        ++snapshot.currentSubsystemBurned;
+                    else
+                        ++snapshot.foreignSubsystemBurned;
+                }
             }
+
+            return snapshot;
+        }
+
+        snapshot.assignedEntries =
+            g_assignmentLedgerCompactedAssigned +
+            g_assignmentLedgerCompactedForeignAssigned;
+
+        snapshot.burnedEntries =
+            g_assignmentLedgerCompactedBurned +
+            g_assignmentLedgerCompactedForeignBurned;
+
+        if (g_persistentIdSubsystem != nullptr &&
+            g_persistentIdSubsystem ==
+                g_assignmentLedgerCompactedSubsystem)
+        {
+            snapshot.currentSubsystemAssigned =
+                g_assignmentLedgerCompactedAssigned;
+            snapshot.currentSubsystemBurned =
+                g_assignmentLedgerCompactedBurned;
+            snapshot.foreignSubsystemAssigned =
+                g_assignmentLedgerCompactedForeignAssigned;
+            snapshot.foreignSubsystemBurned =
+                g_assignmentLedgerCompactedForeignBurned;
+        }
+        else
+        {
+            // Exact foreign identities are intentionally discarded
+            // after activation. If ownership later differs, treat
+            // every compacted entry as foreign and remain fail-closed.
+            snapshot.foreignSubsystemAssigned =
+                snapshot.assignedEntries;
+            snapshot.foreignSubsystemBurned =
+                snapshot.burnedEntries;
         }
 
         return snapshot;
     }
+
 
     void LogAssignmentLedger(
         const char* phase)
@@ -888,10 +1005,11 @@ namespace PersistentIdFixSystem
             std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
 
             if (!g_assignmentLedgerHealthy ||
-                g_assignmentLedgerGeneration != loadGeneration)
+                g_assignmentLedgerGeneration != loadGeneration ||
+                !g_assignmentLedgerRetainsEntries)
             {
                 LOG_WARN(
-                    "PersistentIdFix: candidate-pool diagnostic unavailable: assignment ledger generation/health mismatch");
+                    "PersistentIdFix: candidate-pool diagnostic unavailable: assignment ledger generation/health/detail mismatch");
                 return diagnostic;
             }
 
@@ -1128,10 +1246,11 @@ namespace PersistentIdFixSystem
             std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
 
             if (!g_assignmentLedgerHealthy ||
-                g_assignmentLedgerGeneration != loadGeneration)
+                g_assignmentLedgerGeneration != loadGeneration ||
+                !g_assignmentLedgerRetainsEntries)
             {
                 LOG_WARN(
-                    "PersistentIdFix: certified pool activation rejected: assignment ledger generation/health mismatch");
+                    "PersistentIdFix: certified pool activation rejected: assignment ledger generation/health/detail mismatch");
                 return false;
             }
 
@@ -1152,6 +1271,7 @@ namespace PersistentIdFixSystem
                 return false;
             }
 
+            CompactAssignmentLedgerLocked();
             g_certifiedPoolActive = true;
         }
 
