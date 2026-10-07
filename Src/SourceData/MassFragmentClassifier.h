@@ -74,6 +74,12 @@ namespace PersistentIdFixMassFragmentClassifier
     bool InitializeDescriptorRegistry(IPluginEngineEvents* engineEvents);
     void ResetDescriptorRegistry();
     bool IsDescriptorRegistryReady();
+    // Validates the top-level Mass destination before any field is read.
+    // Side-effect free so the source observer can gate high-water capture on
+    // the same descriptor/storage contract used by Mass classification.
+    bool ValidateMassSaveDataEnvelope(
+        const SDK::UScriptStruct* structType,
+        const SDK::FCrMassSaveData* massSaveData);
 
     void ObserveMassSaveData(
         const SDK::UScriptStruct* structType,

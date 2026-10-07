@@ -1661,6 +1661,20 @@ namespace PersistentIdFixMassFragmentClassifier
         return g_descriptorRegistryReady;
     }
 
+    bool ValidateMassSaveDataEnvelope(
+        const UScriptStruct* structType,
+        const FCrMassSaveData* massSaveData)
+    {
+        return
+            IsDescriptorRegistryReady() &&
+            structType != nullptr &&
+            massSaveData != nullptr &&
+            structType == g_massSaveDataDescriptor &&
+            structType->Size == 0x4F8 &&
+            structType->MinAlignment == 8 &&
+            IsReadableRange(massSaveData, 0x4F8);
+    }
+
     void ObserveMassSaveData(
         const UScriptStruct* structType,
         const FCrMassSaveData* massSaveData)
@@ -1703,6 +1717,15 @@ namespace PersistentIdFixMassFragmentClassifier
             return;
         }
 
+        if (!IsReadableRange(massSaveData, 0x4F8))
+        {
+            g_massDescriptorMismatches.fetch_add(1, std::memory_order_relaxed);
+            LOG_WARN(
+                "PersistentIdFix: Mass destination storage is not readable for the validated schema: destination=%p size=0x4F8",
+                massSaveData);
+            return;
+        }
+
         if (!CommitEntityIdentities(*massSaveData))
         {
             LOG_WARN(
@@ -1715,52 +1738,52 @@ namespace PersistentIdFixMassFragmentClassifier
                 "PersistentIdFix: fixed-layout Mass remainder collection failed");
         }
 
-        const auto& entities = massSaveData->Entities;
-        const std::int32_t expected = entities.Num();
-        const std::int32_t allocated = entities.NumAllocated();
+        if (!CheckedSparseMap(
+                massSaveData->Entities,
+                [&](const auto& pair)
+                {
+                    g_entitySlotsVisited.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
 
-        if (expected < 0 || allocated < 0 || expected > allocated)
-        {
-            g_entityCountMismatches.fetch_add(1, std::memory_order_relaxed);
-            LOG_WARN(
-                "PersistentIdFix: Mass entity map header invalid: Num=%d NumAllocated=%d",
-                expected,
-                allocated);
-            return;
-        }
+                    const FCrEntitySaveData& entity = pair.Value();
 
-        std::int32_t visited = 0;
-        for (auto it = begin(entities); it != end(entities); ++it)
-        {
-            ++visited;
-            g_entitySlotsVisited.fetch_add(1, std::memory_order_relaxed);
-
-            const FCrEntitySaveData& entity = it->Value();
-
-            for (const FInstancedStruct& payload : entity.FragmentValues)
-                ObservePayload(payload);
-
-            if (!CheckedEach(
-                    entity.Tags,
-                    [&](const FInstancedStruct& tag)
+                    if (!CheckedEach(
+                            entity.FragmentValues,
+                            [&](const FInstancedStruct& payload)
+                            {
+                                ObservePayload(payload);
+                                return true;
+                            },
+                            &g_semanticContainerFailures))
                     {
-                        return ObserveTag(tag);
-                    },
-                    &g_tagContainerFailures))
-            {
-                LOG_WARN(
-                    "PersistentIdFix: Mass tag collection incomplete for entity");
-            }
-        }
+                        LOG_WARN(
+                            "PersistentIdFix: Mass fragment container validation failed for entity");
+                        return false;
+                    }
 
-        if (visited != expected)
+                    if (!CheckedEach(
+                            entity.Tags,
+                            [&](const FInstancedStruct& tag)
+                            {
+                                return ObserveTag(tag);
+                            },
+                            &g_tagContainerFailures))
+                    {
+                        LOG_WARN(
+                            "PersistentIdFix: Mass tag collection incomplete for entity");
+                        return false;
+                    }
+
+                    return true;
+                },
+                nullptr))
         {
-            g_entityCountMismatches.fetch_add(1, std::memory_order_relaxed);
+            g_entityCountMismatches.fetch_add(
+                1,
+                std::memory_order_relaxed);
             LOG_WARN(
-                "PersistentIdFix: Mass entity sparse-map traversal mismatch: visited=%d Num=%d NumAllocated=%d",
-                visited,
-                expected,
-                allocated);
+                "PersistentIdFix: Mass entity traversal failed validation");
         }
     }
     ClassificationSnapshot GetSnapshot()

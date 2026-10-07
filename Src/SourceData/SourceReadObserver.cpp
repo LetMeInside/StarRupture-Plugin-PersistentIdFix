@@ -604,19 +604,31 @@ namespace PersistentIdFixSourceReadObserver
             // Native GetSaveData has successfully reconstructed the typed Mass
             // destination. Capture the original serialized high-water before
             // PostInitialize resumes and applies it to the live PID subsystem.
+            const auto* descriptor =
+                static_cast<const SDK::UScriptStruct*>(structType);
             const auto* massSaveData =
                 static_cast<const SDK::FCrMassSaveData*>(destination);
 
-            if (!CaptureSavedHighWater(massSaveData))
+            if (PersistentIdFixMassFragmentClassifier::ValidateMassSaveDataEnvelope(
+                    descriptor,
+                    massSaveData))
+            {
+                if (!CaptureSavedHighWater(massSaveData))
+                {
+                    LOG_ERROR(
+                        "PersistentIdFix: failed to capture coherent saved Mass MaxPersistentID");
+                }
+            }
+            else
             {
                 LOG_ERROR(
-                    "PersistentIdFix: failed to capture coherent saved Mass MaxPersistentID");
+                    "PersistentIdFix: saved Mass high-water capture skipped because destination validation failed");
             }
 
             // Inspect the same typed destination synchronously before the
             // caller resumes.
             PersistentIdFixMassFragmentClassifier::ObserveMassSaveData(
-                static_cast<const SDK::UScriptStruct*>(structType),
+                descriptor,
                 massSaveData);
         }
         else
