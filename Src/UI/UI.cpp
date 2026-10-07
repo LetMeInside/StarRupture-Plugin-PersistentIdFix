@@ -392,13 +392,6 @@ namespace
 		EModKey key,
 		EModKeyEvent event)
 	{
-		LOG_INFO(
-			"PersistentIdFix: UI toggle callback received: "
-			"key=%d event=%d visible=%s",
-			static_cast<int>(key),
-			static_cast<int>(event),
-			g_visible ? "true" : "false");
-
 		(void)key;
 		(void)event;
 
@@ -415,12 +408,7 @@ namespace
 	bool RegisterUIToggleKeybind()
 	{
 		if (g_keybindRegistered)
-		{
-			LOG_INFO(
-				"PersistentIdFix: UI toggle keybind already registered");
-
 			return true;
-		}
 
 		if (g_self == nullptr ||
 			g_self->hooks == nullptr ||
@@ -446,20 +434,12 @@ namespace
 			return false;
 		}
 
-		LOG_INFO(
-			"PersistentIdFix: registering UI toggle keybind: %s",
-			toggleKey);
-
 		g_self->hooks->Input->RegisterKeybindByName(
 			toggleKey,
 			EModKeyEvent::Pressed,
 			&OnUIToggleKeyPressed);
 
 		g_keybindRegistered = true;
-
-		LOG_INFO(
-			"PersistentIdFix: UI toggle keybind registration call completed: %s",
-			toggleKey);
 
 		return true;
 	}
@@ -519,10 +499,6 @@ namespace PersistentIdFixUI
 		g_widget =
 			self->hooks->UI->RegisterWidget(
 				&widgetDesc);
-
-		LOG_INFO(
-			"PersistentIdFix: RegisterWidget returned widget=%p",
-			g_widget);
 
 		if (g_widget == nullptr)
 		{
@@ -621,12 +597,6 @@ namespace PersistentIdFixUI
 			return;
 		}
 
-		LOG_INFO(
-			"PersistentIdFix: Show() called: "
-			"widget=%p visible_before=%s",
-			g_widget,
-			g_visible ? "true" : "false");
-
 		g_visible = true;
 
 		/*
@@ -650,20 +620,12 @@ namespace PersistentIdFixUI
 			g_widget,
 			true);
 
-		LOG_INFO(
-			"PersistentIdFix: Show() completed: widget=%p",
-			g_widget);
 	}
 
 
 
 	void Hide()
 	{
-		LOG_INFO(
-			"PersistentIdFix: Hide() called: widget=%p visible_before=%s",
-			g_widget,
-			g_visible ? "true" : "false");
-
 		g_visible = false;
 
 		/*
@@ -681,9 +643,6 @@ namespace PersistentIdFixUI
 				g_widget,
 				false);
 
-			LOG_INFO(
-				"PersistentIdFix: Hide() completed: widget=%p",
-				g_widget);
 		}
 		else
 		{
