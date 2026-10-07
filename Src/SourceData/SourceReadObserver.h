@@ -37,6 +37,16 @@ namespace PersistentIdFixSourceReadObserver
     {
         std::uint64_t loadGeneration = 0;
 
+        // Original serialized FCrMassSaveData::MaxPersistentID
+        // captured synchronously from the successful Mass
+        // GetSaveData destination before native PostInitialize
+        // resumes and applies it to the live PID subsystem.
+        bool savedHighWaterCaptured = false;
+        bool savedHighWaterConflict = false;
+        std::uint64_t savedHighWaterGeneration = 0;
+        std::uint64_t savedHighWaterCaptures = 0;
+        std::uint32_t savedHighWater = 0;
+
         bool inventoryCaptured = false;
         bool inventoryValid = false;
         std::uint64_t inventoryEntries = 0;

@@ -61,6 +61,9 @@ namespace
     static std::uint64_t g_assignmentLedgerGeneration = 0;
     static bool g_assignmentLedgerHealthy = true;
 
+    static std::mutex g_setPairObserverMutex;
+    static PersistentIdFixSystem::SetPairObserverSnapshot g_setPairObserver;
+
     static std::chrono::steady_clock::time_point g_nextStatisticsLogTime{};
     static std::chrono::steady_clock::time_point g_nextLiveStatisticsRefreshTime{};
     static bool g_statisticsTimerActive = false;
@@ -72,6 +75,66 @@ namespace
         g_assignmentLedger.clear();
         g_assignmentLedgerGeneration = loadGeneration;
         g_assignmentLedgerHealthy = true;
+    }
+
+    static void ResetSetPairObserver(
+        std::uint64_t loadGeneration)
+    {
+        std::lock_guard<std::mutex> lock(g_setPairObserverMutex);
+        g_setPairObserver = {};
+        g_setPairObserver.loadGeneration = loadGeneration;
+    }
+
+    struct SetPairState
+    {
+        bool pidPresent = false;
+        bool handlePresent = false;
+        bool exactPair = false;
+    };
+
+    static SetPairState InspectSetPairState(
+        SDK::UCrMassPersistentIDSubsystem* subsystem,
+        std::uint32_t id,
+        const SDK::FMassEntityHandle& handle)
+    {
+        SetPairState state;
+
+        if (subsystem == nullptr)
+            return state;
+
+        bool exactForward = false;
+
+        for (const auto& pair : subsystem->IDHandleMap)
+        {
+            if (pair.Key().ID != id)
+                continue;
+
+            state.pidPresent = true;
+
+            const auto& mappedHandle = pair.Value();
+            exactForward =
+                mappedHandle.Index == handle.Index &&
+                mappedHandle.SerialNumber == handle.SerialNumber;
+
+            break;
+        }
+
+        const auto* mappedId =
+            FindPersistentIdByHandle(
+                subsystem,
+                handle);
+
+        if (mappedId != nullptr)
+            state.handlePresent = true;
+
+        const bool exactReverse =
+            mappedId != nullptr &&
+            mappedId->ID == id;
+
+        state.exactPair =
+            exactForward && exactReverse;
+
+        return state;
     }
 
     static bool RecordLedgerEntry(
@@ -410,6 +473,8 @@ namespace
 
     static void OnNewGame()
     {
+        ResetSetPairObserver(0);
+
         LOG_INFO(
             "PersistentIdFix: new game detected");
 
@@ -449,6 +514,7 @@ namespace PersistentIdFixSystem
         g_sessionNetMode = EPluginNetMode::Unknown;
 
         ResetAssignmentLedger(0);
+        ResetSetPairObserver(0);
 
         g_statisticsTimerActive = false;
         g_nextStatisticsLogTime = {};
@@ -465,6 +531,7 @@ namespace PersistentIdFixSystem
         std::uint64_t loadGeneration)
     {
         ResetAssignmentLedger(loadGeneration);
+        ResetSetPairObserver(loadGeneration);
 
         LOG_INFO(
             "PersistentIdFix: assignment ledger generation started: %llu",
@@ -526,6 +593,152 @@ namespace PersistentIdFixSystem
             static_cast<unsigned long long>(snapshot.currentSubsystemBurned),
             static_cast<unsigned long long>(snapshot.foreignSubsystemAssigned),
             static_cast<unsigned long long>(snapshot.foreignSubsystemBurned));
+    }
+
+    SetPairObserverSnapshot GetSetPairObserverSnapshot()
+    {
+        std::lock_guard<std::mutex> lock(g_setPairObserverMutex);
+        return g_setPairObserver;
+    }
+
+    void LogSetPairObserver(
+        const char* phase)
+    {
+        const SetPairObserverSnapshot snapshot =
+            GetSetPairObserverSnapshot();
+
+        LOG_INFO(
+            "PersistentIdFix: SetIDHandlePair observer [%s]: generation=%llu calls=%llu true=%llu false=%llu exactBefore=%llu exactAfter=%llu newInsertions=%llu consistentDuplicates=%llu conflicts=%llu maxAdvances=%llu maxAdvanceWithoutExactPair=%llu postStateMismatches=%llu nullArgs=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.loadGeneration),
+            static_cast<unsigned long long>(snapshot.totalCalls),
+            static_cast<unsigned long long>(snapshot.trueReturns),
+            static_cast<unsigned long long>(snapshot.falseReturns),
+            static_cast<unsigned long long>(snapshot.exactPairBefore),
+            static_cast<unsigned long long>(snapshot.exactPairAfter),
+            static_cast<unsigned long long>(snapshot.newInsertions),
+            static_cast<unsigned long long>(snapshot.consistentDuplicates),
+            static_cast<unsigned long long>(snapshot.conflictingAttempts),
+            static_cast<unsigned long long>(snapshot.maxAdvances),
+            static_cast<unsigned long long>(snapshot.maxAdvanceWithoutExactPair),
+            static_cast<unsigned long long>(snapshot.postStateMismatches),
+            static_cast<unsigned long long>(snapshot.nullArgumentCalls));
+    }
+
+    HighWaterCrossCheckSnapshot LogHighWaterCrossCheck(
+        const char* phase,
+        std::uint64_t sourceGeneration,
+        bool savedHighWaterCaptured,
+        bool savedHighWaterConflict,
+        std::uint32_t savedHighWater,
+        bool requireExactAccounting)
+    {
+        HighWaterCrossCheckSnapshot result;
+        result.sourceGeneration = sourceGeneration;
+        result.savedHighWater = savedHighWater;
+        result.exactAccountingRequested = requireExactAccounting;
+
+        const AssignmentLedgerSnapshot ledger =
+            GetAssignmentLedgerSnapshot();
+
+        result.ledgerGeneration = ledger.loadGeneration;
+        result.currentAssigned = ledger.currentSubsystemAssigned;
+        result.currentBurned = ledger.currentSubsystemBurned;
+        result.foreignAssigned = ledger.foreignSubsystemAssigned;
+        result.foreignBurned = ledger.foreignSubsystemBurned;
+
+        if (!g_sessionActive ||
+            g_persistentIdSubsystem == nullptr ||
+            !savedHighWaterCaptured ||
+            savedHighWaterConflict ||
+            sourceGeneration == 0 ||
+            ledger.loadGeneration != sourceGeneration)
+        {
+            LOG_WARN(
+                "PersistentIdFix: high-water cross-check [%s]: available=0 sourceGeneration=%llu ledgerGeneration=%llu captured=%u conflict=%u sessionActive=%u subsystem=%p",
+                phase != nullptr ? phase : "<null>",
+                static_cast<unsigned long long>(sourceGeneration),
+                static_cast<unsigned long long>(ledger.loadGeneration),
+                savedHighWaterCaptured ? 1u : 0u,
+                savedHighWaterConflict ? 1u : 0u,
+                g_sessionActive ? 1u : 0u,
+                static_cast<void*>(g_persistentIdSubsystem));
+            return result;
+        }
+
+        result.available = true;
+        result.liveHighWater = g_persistentIdSubsystem->MaxID;
+        result.restoredAtLeastSaved =
+            result.liveHighWater >= result.savedHighWater;
+
+        const std::uint64_t expected =
+            static_cast<std::uint64_t>(savedHighWater) +
+            ledger.currentSubsystemAssigned +
+            ledger.currentSubsystemBurned;
+
+        result.expectedLiveHighWater = expected;
+        result.expectedOverflow = expected > UINT32_MAX;
+
+        if (requireExactAccounting)
+        {
+            result.exactAccountingValid =
+                ledger.healthy &&
+                ledger.foreignSubsystemAssigned == 0 &&
+                ledger.foreignSubsystemBurned == 0 &&
+                !result.expectedOverflow;
+
+            if (result.exactAccountingValid)
+            {
+                result.exactAccountingMatch =
+                    result.liveHighWater ==
+                    static_cast<std::uint32_t>(expected);
+            }
+        }
+
+        LOG_INFO(
+            "PersistentIdFix: high-water cross-check [%s]: available=%u sourceGeneration=%llu ledgerGeneration=%llu saved=%u live=%u restoredAtLeastSaved=%u exactRequested=%u exactValid=%u exactMatch=%u expected=%llu overflow=%u currentAssigned=%llu currentBurned=%llu foreignAssigned=%llu foreignBurned=%llu ledgerHealthy=%u",
+            phase != nullptr ? phase : "<null>",
+            result.available ? 1u : 0u,
+            static_cast<unsigned long long>(result.sourceGeneration),
+            static_cast<unsigned long long>(result.ledgerGeneration),
+            result.savedHighWater,
+            result.liveHighWater,
+            result.restoredAtLeastSaved ? 1u : 0u,
+            result.exactAccountingRequested ? 1u : 0u,
+            result.exactAccountingValid ? 1u : 0u,
+            result.exactAccountingMatch ? 1u : 0u,
+            static_cast<unsigned long long>(result.expectedLiveHighWater),
+            result.expectedOverflow ? 1u : 0u,
+            static_cast<unsigned long long>(result.currentAssigned),
+            static_cast<unsigned long long>(result.currentBurned),
+            static_cast<unsigned long long>(result.foreignAssigned),
+            static_cast<unsigned long long>(result.foreignBurned),
+            ledger.healthy ? 1u : 0u);
+
+        if (!result.restoredAtLeastSaved)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: live MaxID is below serialized saved high-water during [%s]: saved=%u live=%u",
+                phase != nullptr ? phase : "<null>",
+                result.savedHighWater,
+                result.liveHighWater);
+        }
+
+        if (requireExactAccounting &&
+            result.exactAccountingValid &&
+            !result.exactAccountingMatch)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: pre-certification MaxID accounting mismatch during [%s]: saved=%u assigned=%llu burned=%llu expected=%llu live=%u",
+                phase != nullptr ? phase : "<null>",
+                result.savedHighWater,
+                static_cast<unsigned long long>(result.currentAssigned),
+                static_cast<unsigned long long>(result.currentBurned),
+                static_cast<unsigned long long>(result.expectedLiveHighWater),
+                result.liveHighWater);
+        }
+
+        return result;
     }
 
     CandidatePoolDiagnostic BuildCandidatePoolDiagnostic(
@@ -1038,6 +1251,111 @@ namespace PersistentIdFixSystem
     // If the pool is empty, the native allocation semantics are reproduced
     // using MaxID and SetIDHandlePair.
     // ---------------------------------------------------------------------------
+
+    bool SetIDHandlePairDetour(
+        void* subsystem,
+        SDK::FCrMassPersistentEntityID* persistentId,
+        SDK::FMassEntityHandle handle)
+    {
+        if (g_setIDHandlePair == nullptr)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: native SetIDHandlePair trampoline is unavailable");
+            return false;
+        }
+
+        auto* persistentIDSubsystem =
+            static_cast<SDK::UCrMassPersistentIDSubsystem*>(subsystem);
+
+        if (persistentIDSubsystem == nullptr || persistentId == nullptr)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_setPairObserverMutex);
+                ++g_setPairObserver.totalCalls;
+                ++g_setPairObserver.nullArgumentCalls;
+            }
+
+            return g_setIDHandlePair(
+                subsystem,
+                persistentId,
+                handle);
+        }
+
+        const std::uint32_t id = persistentId->ID;
+        const std::uint32_t maxBefore = persistentIDSubsystem->MaxID;
+        const SetPairState before =
+            InspectSetPairState(
+                persistentIDSubsystem,
+                id,
+                handle);
+
+        const bool result =
+            g_setIDHandlePair(
+                subsystem,
+                persistentId,
+                handle);
+
+        const std::uint32_t maxAfter = persistentIDSubsystem->MaxID;
+        const SetPairState after =
+            InspectSetPairState(
+                persistentIDSubsystem,
+                id,
+                handle);
+
+        const bool maxAdvanced = maxAfter > maxBefore;
+        const bool newInsertion =
+            result && !before.exactPair && after.exactPair;
+        const bool consistentDuplicate =
+            !result && before.exactPair && after.exactPair;
+        const bool conflictingAttempt =
+            !result && !before.exactPair && !after.exactPair &&
+            (before.pidPresent || before.handlePresent);
+        const bool postStateMismatch =
+            result && !after.exactPair;
+
+        {
+            std::lock_guard<std::mutex> lock(g_setPairObserverMutex);
+            ++g_setPairObserver.totalCalls;
+
+            if (result) ++g_setPairObserver.trueReturns;
+            else ++g_setPairObserver.falseReturns;
+            if (before.exactPair) ++g_setPairObserver.exactPairBefore;
+            if (after.exactPair) ++g_setPairObserver.exactPairAfter;
+            if (newInsertion) ++g_setPairObserver.newInsertions;
+            if (consistentDuplicate) ++g_setPairObserver.consistentDuplicates;
+            if (conflictingAttempt) ++g_setPairObserver.conflictingAttempts;
+            if (maxAdvanced) ++g_setPairObserver.maxAdvances;
+            if (maxAdvanced && !after.exactPair)
+                ++g_setPairObserver.maxAdvanceWithoutExactPair;
+            if (postStateMismatch)
+                ++g_setPairObserver.postStateMismatches;
+        }
+
+        if (maxAdvanced && !after.exactPair)
+        {
+            LOG_WARN(
+                "PersistentIdFix: SetIDHandlePair advanced MaxID without establishing exact pair: id=%u handle=(%u,%u) MaxID=%u->%u result=%u pidPresentBefore=%u handlePresentBefore=%u",
+                id,
+                handle.Index,
+                handle.SerialNumber,
+                maxBefore,
+                maxAfter,
+                result ? 1u : 0u,
+                before.pidPresent ? 1u : 0u,
+                before.handlePresent ? 1u : 0u);
+        }
+
+        if (postStateMismatch)
+        {
+            LOG_ERROR(
+                "PersistentIdFix: SetIDHandlePair returned true without exact bidirectional pair: id=%u handle=(%u,%u)",
+                id,
+                handle.Index,
+                handle.SerialNumber);
+        }
+
+        return result;
+    }
 
     SDK::FCrMassPersistentEntityID* GetOrAddIDForHandleDetour(
         void* subsystem,

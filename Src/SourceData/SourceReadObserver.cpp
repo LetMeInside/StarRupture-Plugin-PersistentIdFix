@@ -30,6 +30,18 @@ namespace
     std::atomic<bool> g_gameWorldAttached{ false };
     std::atomic<std::uint64_t> g_attachedLoadGeneration{ 0 };
 
+    struct SavedHighWaterState
+    {
+        bool captured = false;
+        bool conflict = false;
+        std::uint64_t generation = 0;
+        std::uint64_t captures = 0;
+        std::uint32_t value = 0;
+    };
+
+    std::mutex g_savedHighWaterMutex;
+    SavedHighWaterState g_savedHighWater;
+
     std::atomic<bool> g_inventoryCaptured{ false };
     std::atomic<bool> g_inventoryValid{ false };
     std::atomic<std::uint64_t> g_inventoryEntries{ 0 };
@@ -99,6 +111,11 @@ namespace
 
     void ResetObservationCounters()
     {
+        {
+            std::lock_guard<std::mutex> lock(g_savedHighWaterMutex);
+            g_savedHighWater = {};
+        }
+
         g_inventoryCaptured.store(false, std::memory_order_relaxed);
         g_inventoryValid.store(false, std::memory_order_relaxed);
         g_inventoryEntries.store(0, std::memory_order_relaxed);
@@ -126,6 +143,43 @@ namespace
 
         PersistentIdFixMassFragmentClassifier::Reset();
         PersistentIdFixIndependentSourceCollector::Reset();
+    }
+
+    bool CaptureSavedHighWater(
+        const SDK::FCrMassSaveData* massSaveData)
+    {
+        const std::uint64_t generation =
+            g_loadGeneration.load(std::memory_order_relaxed);
+
+        std::lock_guard<std::mutex> lock(g_savedHighWaterMutex);
+
+        ++g_savedHighWater.captures;
+
+        if (massSaveData == nullptr || generation == 0)
+        {
+            g_savedHighWater.conflict = true;
+            return false;
+        }
+
+        const std::uint32_t value =
+            massSaveData->MaxPersistentID;
+
+        if (!g_savedHighWater.captured)
+        {
+            g_savedHighWater.captured = true;
+            g_savedHighWater.generation = generation;
+            g_savedHighWater.value = value;
+            return true;
+        }
+
+        if (g_savedHighWater.generation != generation ||
+            g_savedHighWater.value != value)
+        {
+            g_savedHighWater.conflict = true;
+            return false;
+        }
+
+        return true;
     }
 
     bool EqualsSection(
@@ -548,10 +602,22 @@ namespace PersistentIdFixSourceReadObserver
         if (section == SourceSection::Mass)
         {
             // Native GetSaveData has successfully reconstructed the typed Mass
-            // destination. Inspect it synchronously before the caller resumes.
+            // destination. Capture the original serialized high-water before
+            // PostInitialize resumes and applies it to the live PID subsystem.
+            const auto* massSaveData =
+                static_cast<const SDK::FCrMassSaveData*>(destination);
+
+            if (!CaptureSavedHighWater(massSaveData))
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: failed to capture coherent saved Mass MaxPersistentID");
+            }
+
+            // Inspect the same typed destination synchronously before the
+            // caller resumes.
             PersistentIdFixMassFragmentClassifier::ObserveMassSaveData(
                 static_cast<const SDK::UScriptStruct*>(structType),
-                static_cast<const SDK::FCrMassSaveData*>(destination));
+                massSaveData);
         }
         else
         {
@@ -662,6 +728,15 @@ namespace PersistentIdFixSourceReadObserver
             g_loadGeneration.load(
                 std::memory_order_relaxed);
 
+        {
+            std::lock_guard<std::mutex> lock(g_savedHighWaterMutex);
+            snapshot.savedHighWaterCaptured = g_savedHighWater.captured;
+            snapshot.savedHighWaterConflict = g_savedHighWater.conflict;
+            snapshot.savedHighWaterGeneration = g_savedHighWater.generation;
+            snapshot.savedHighWaterCaptures = g_savedHighWater.captures;
+            snapshot.savedHighWater = g_savedHighWater.value;
+        }
+
         snapshot.gameWorldAttached =
             g_gameWorldAttached.load(std::memory_order_relaxed);
         snapshot.attachedLoadGeneration =
@@ -759,6 +834,13 @@ namespace PersistentIdFixSourceReadObserver
         {
             snapshot.massCertification =
                 CertificationState::Pending;
+        }
+        else if (!snapshot.savedHighWaterCaptured ||
+            snapshot.savedHighWaterConflict ||
+            snapshot.savedHighWaterGeneration != snapshot.loadGeneration)
+        {
+            snapshot.massCertification =
+                CertificationState::Failed;
         }
         else
         {
@@ -929,6 +1011,16 @@ namespace PersistentIdFixSourceReadObserver
             static_cast<unsigned long long>(snapshot.successfulReads),
             static_cast<unsigned long long>(snapshot.recognizedSuccessfulReads),
             static_cast<unsigned long long>(snapshot.failedReads));
+
+        LOG_INFO(
+            "PersistentIdFix: saved high-water [%s]: captured=%u conflict=%u generation=%llu currentGeneration=%llu captures=%llu value=%u",
+            phase != nullptr ? phase : "<null>",
+            snapshot.savedHighWaterCaptured ? 1u : 0u,
+            snapshot.savedHighWaterConflict ? 1u : 0u,
+            static_cast<unsigned long long>(snapshot.savedHighWaterGeneration),
+            static_cast<unsigned long long>(snapshot.loadGeneration),
+            static_cast<unsigned long long>(snapshot.savedHighWaterCaptures),
+            snapshot.savedHighWater);
 
         LOG_INFO(
             "PersistentIdFix: source inventory [%s]: captured=%u valid=%u entries=%llu recognized=%llu Mass=%u CustomNames=%u GameState=%u Antennas=%u ZiplineReplicator=%u ZiplineSubsystem=%u BaseCoreReplication=%u",

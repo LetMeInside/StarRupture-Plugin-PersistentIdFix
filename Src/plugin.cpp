@@ -21,11 +21,13 @@ IPluginSelf* g_self = nullptr;
 IPluginSelf* GetSelf() { return g_self; }
 
 static HookHandle g_getOrAddIDForHandleHook = nullptr;
+static HookHandle g_setIDHandlePairHook = nullptr;
 static HookHandle g_getSaveDataHook = nullptr;
 static HookHandle g_onPreLoadMapHook = nullptr;
 
 // SDK hook output; passed to PersistentIdFixSystem for native delegation.
 static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
+static SetIDHandlePairFn g_originalSetIDHandlePair = nullptr;
 
 // Native source-read observer trampoline. Step 2 is intentionally passive:
 // it forwards the call unchanged and does not inspect or retain source data.
@@ -426,6 +428,24 @@ static void OnTick(
 
         PersistentIdFixSystem::LogAssignmentLedger(
             "ready-transition");
+
+        {
+            const auto coverage =
+                PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+            PersistentIdFixSystem::LogHighWaterCrossCheck(
+                "ready-transition",
+                coverage.loadGeneration,
+                coverage.savedHighWaterCaptured,
+                coverage.savedHighWaterConflict,
+                coverage.savedHighWater,
+                true);
+        }
+
+        PersistentIdFixSystem::LogSetPairObserver(
+            "ready-transition");
+
+
     }
 
     if (netMode == EPluginNetMode::Unknown)
@@ -518,6 +538,24 @@ static void OnSaveLoaded()
     PersistentIdFixSystem::LogAssignmentLedger(
         "save-loaded");
 
+    {
+        const auto coverage =
+            PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+        PersistentIdFixSystem::LogHighWaterCrossCheck(
+            "save-loaded",
+            coverage.loadGeneration,
+            coverage.savedHighWaterCaptured,
+            coverage.savedHighWaterConflict,
+            coverage.savedHighWater,
+            false);
+    }
+
+    PersistentIdFixSystem::LogSetPairObserver(
+        "save-loaded");
+
+
+
     PersistentIdFixSourceReadObserver::LogCoverage(
         "save-loaded");
 
@@ -571,6 +609,11 @@ static void OnAfterWorldEndPlay(
 
     PersistentIdFixSystem::LogAssignmentLedger(
         "world-end");
+
+    PersistentIdFixSystem::LogSetPairObserver(
+        "world-end");
+
+
 
     PersistentIdFixSystem::EndSession();
 
@@ -818,6 +861,32 @@ extern "C"
                 "PersistentIdFix: GetSaveData observer hook installed");
 
             //
+            // Install SetIDHandlePair observer hook.
+            //
+            // PersistentIdFix-controlled setter calls use the native
+            // trampoline directly, so existing ledger accounting is not
+            // double-counted. Native game callers pass through this observer.
+            //
+            g_setIDHandlePairHook =
+                g_self->hooks->Hooks->Install(
+                    g_setIDHandlePairAddress,
+                    reinterpret_cast<void*>(&PersistentIdFixSystem::SetIDHandlePairDetour),
+                    reinterpret_cast<void**>(
+                        &g_originalSetIDHandlePair));
+
+            if (g_setIDHandlePairHook == nullptr ||
+                g_originalSetIDHandlePair == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: failed to install SetIDHandlePair observer hook");
+                g_setIDHandlePairHook = nullptr;
+                g_originalSetIDHandlePair = nullptr;
+                break;
+            }
+
+            LOG_INFO(
+                "PersistentIdFix: SetIDHandlePair observer hook installed");
+
             // Install GetOrAddIDForHandle hook
             //
             g_getOrAddIDForHandleHook =
@@ -846,8 +915,7 @@ extern "C"
 
             PersistentIdFixSystem::Configure(
                 g_self,
-                reinterpret_cast<SetIDHandlePairFn>(
-                    g_setIDHandlePairAddress),
+                g_originalSetIDHandlePair,
                 g_originalGetOrAddIDForHandle);
 
             //
@@ -990,6 +1058,18 @@ extern "C"
             g_originalGetOrAddIDForHandle = nullptr;
         }
 
+        if (g_setIDHandlePairHook != nullptr)
+        {
+            if (g_self->hooks->Hooks != nullptr)
+            {
+                g_self->hooks->Hooks->Remove(
+                    g_setIDHandlePairHook);
+            }
+
+            g_setIDHandlePairHook = nullptr;
+            g_originalSetIDHandlePair = nullptr;
+        }
+
         if (g_getSaveDataHook != nullptr)
         {
             if (g_self->hooks->Hooks != nullptr)
@@ -1087,6 +1167,13 @@ extern "C"
                         g_getOrAddIDForHandleHook);
                 }
 
+                if (g_setIDHandlePairHook != nullptr &&
+                    g_self->hooks->Hooks != nullptr)
+                {
+                    g_self->hooks->Hooks->Remove(
+                        g_setIDHandlePairHook);
+                }
+
                 if (g_getSaveDataHook != nullptr &&
                     g_self->hooks->Hooks != nullptr)
                 {
@@ -1109,6 +1196,9 @@ extern "C"
 
             g_getOrAddIDForHandleHook = nullptr;
             g_originalGetOrAddIDForHandle = nullptr;
+
+            g_setIDHandlePairHook = nullptr;
+            g_originalSetIDHandlePair = nullptr;
 
             g_getSaveDataHook = nullptr;
             g_originalGetSaveData = nullptr;
