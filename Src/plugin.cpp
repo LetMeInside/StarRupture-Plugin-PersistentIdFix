@@ -172,8 +172,11 @@ static bool IsAuthoritativeWorldReady()
             AuthorityReadiness::Authoritative;
 }
 
-static bool PublishProtectedIds()
+static bool PublishProtectedIdsWhileFrozen()
 {
+    // The caller owns the exclusive source-publication freeze for the
+    // complete certification -> publication -> candidate -> activation
+    // transaction. Revalidate readiness only after that freeze is held.
     const auto coverage =
         PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
 
@@ -182,21 +185,6 @@ static bool PublishProtectedIds()
     {
         return false;
     }
-
-    if (!PersistentIdFixSourceReadObserver::BeginPublicationFreeze())
-    {
-        LOG_ERROR(
-            "PersistentIdFix: protected-ID publication failed to acquire source freeze");
-        return false;
-    }
-
-    struct PublicationFreezeRelease
-    {
-        ~PublicationFreezeRelease()
-        {
-            PersistentIdFixSourceReadObserver::EndPublicationFreeze();
-        }
-    } publicationFreezeRelease;
 
     const auto activityBefore =
         PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
@@ -625,35 +613,63 @@ static void OnTick(
         !g_authoritativeWorldReadyObserved &&
         IsAuthoritativeWorldReady())
     {
-        g_authoritativeWorldReadyObserved = true;
-
-        LOG_INFO(
-            "PersistentIdFix: authoritative world readiness became true during active gameplay");
-
-        LogReadiness("ready-transition");
-
-        if (!PublishProtectedIds())
+        if (!PersistentIdFixSourceReadObserver::BeginPublicationFreeze())
         {
-            LOG_WARN(
-                "PersistentIdFix: protected-ID publication was not accepted for the ready generation");
+            LOG_ERROR(
+                "PersistentIdFix: certified-pool transaction failed to acquire source freeze");
         }
         else
         {
-            const auto candidate =
-                PersistentIdFixSystem::BuildCandidatePoolDiagnostic(
-                    g_publishedProtectedGeneration,
-                    g_publishedProtectedIds);
+            struct PublicationFreezeRelease
+            {
+                ~PublicationFreezeRelease()
+                {
+                    PersistentIdFixSourceReadObserver::EndPublicationFreeze();
+                }
+            } publicationFreezeRelease;
 
-            if (!candidate.valid)
+            // The readiness trigger above is intentionally only a hint.
+            // A source read or generation boundary could theoretically
+            // occur before the exclusive gate is acquired, so certify the
+            // actual frozen state before publishing or activating reuse.
+            if (!IsAuthoritativeWorldReady())
             {
                 LOG_WARN(
-                    "PersistentIdFix: certified candidate-pool diagnostic was not accepted");
+                    "PersistentIdFix: authoritative readiness changed before the source freeze was acquired; certified-pool transaction deferred");
             }
-            else if (!PersistentIdFixSystem::ActivateCertifiedPool(
-                         g_publishedProtectedGeneration))
+            else
             {
-                LOG_WARN(
-                    "PersistentIdFix: certified reusable pool activation was rejected");
+                g_authoritativeWorldReadyObserved = true;
+
+                LOG_INFO(
+                    "PersistentIdFix: authoritative world readiness became true during active gameplay");
+
+                LogReadiness("ready-transition");
+
+                if (!PublishProtectedIdsWhileFrozen())
+                {
+                    LOG_WARN(
+                        "PersistentIdFix: protected-ID publication was not accepted for the frozen ready generation");
+                }
+                else
+                {
+                    const auto candidate =
+                        PersistentIdFixSystem::BuildCandidatePoolDiagnostic(
+                            g_publishedProtectedGeneration,
+                            g_publishedProtectedIds);
+
+                    if (!candidate.valid)
+                    {
+                        LOG_WARN(
+                            "PersistentIdFix: certified candidate-pool diagnostic was not accepted");
+                    }
+                    else if (!PersistentIdFixSystem::ActivateCertifiedPool(
+                                 g_publishedProtectedGeneration))
+                    {
+                        LOG_WARN(
+                            "PersistentIdFix: certified reusable pool activation was rejected");
+                    }
+                }
             }
         }
 
@@ -675,8 +691,6 @@ static void OnTick(
 
         PersistentIdFixSystem::LogSetPairObserver(
             "ready-transition");
-
-
     }
 
     if (netMode == EPluginNetMode::Unknown)
