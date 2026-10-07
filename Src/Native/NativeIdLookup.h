@@ -36,9 +36,9 @@ namespace
 
     constexpr int32_t InvalidHashIndex = -1;
 
-#ifdef PERSISTENTIDFIX_DIAGNOSTICS
     // UCrMassPersistentIDSubsystem::IDHandleMap native layout.
-    // Verified against native GetHandleForID.
+    // Verified against native GetHandleForID. Release allocation safety
+    // uses this forward lookup to verify bidirectional PID mappings.
     constexpr size_t IDHandleMapElementsDataOffset = 0x00;
     constexpr size_t IDHandleMapElementsNumOffset = 0x08;
     constexpr size_t IDHandleMapHashInlineOffset = 0x38;
@@ -48,7 +48,6 @@ namespace
     constexpr size_t IDHandleMapHandleOffset = 0x10;
     constexpr size_t IDHandleMapHashNextIdOffset = 0x18;
     constexpr size_t IDHandleMapElementStride = 0x20;
-#endif
 
 
     static uint32_t HashMassEntityHandle(
@@ -116,7 +115,6 @@ namespace
         return a;
     }
 
-#ifdef PERSISTENTIDFIX_DIAGNOSTICS
     static const SDK::FMassEntityHandle* FindHandleByPersistentId(
         SDK::UCrMassPersistentIDSubsystem* subsystem,
         std::uint32_t persistentId)
@@ -203,7 +201,6 @@ namespace
 
         return nullptr;
     }
-#endif
 
 
     static const SDK::FCrMassPersistentEntityID* FindPersistentIdByHandle(

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <chrono>
+#include <intrin.h>
 #include <mutex>
 #include <vector>
 
@@ -59,6 +60,164 @@ namespace
     static bool g_sessionActive = false;
 
     static EPluginNetMode g_sessionNetMode = EPluginNetMode::Unknown;
+
+    enum class AllocationFailureReason : std::uint32_t
+    {
+        NullReturnBuffer = 1,
+        NullSubsystem,
+        NativeAllocatorUnavailable,
+        InvalidExistingMapping,
+        RecycledAllocationFailed,
+        PersistentIdSpaceExhausted,
+        NativeSetterUnavailable,
+        InvalidSetterInput,
+        SetterRegistrationFailed,
+        SetterPostconditionFailed
+    };
+
+    static const char* AllocationFailureReasonName(
+        AllocationFailureReason reason)
+    {
+        switch (reason)
+        {
+        case AllocationFailureReason::NullReturnBuffer:
+            return "null return buffer";
+        case AllocationFailureReason::NullSubsystem:
+            return "null persistent-ID subsystem";
+        case AllocationFailureReason::NativeAllocatorUnavailable:
+            return "native allocator unavailable";
+        case AllocationFailureReason::InvalidExistingMapping:
+            return "invalid existing persistent-ID mapping";
+        case AllocationFailureReason::RecycledAllocationFailed:
+            return "recycled-ID allocation failed";
+        case AllocationFailureReason::PersistentIdSpaceExhausted:
+            return "persistent-ID space exhausted";
+        case AllocationFailureReason::NativeSetterUnavailable:
+            return "native SetIDHandlePair unavailable";
+        case AllocationFailureReason::InvalidSetterInput:
+            return "invalid SetIDHandlePair input";
+        case AllocationFailureReason::SetterRegistrationFailed:
+            return "SetIDHandlePair registration failed";
+        case AllocationFailureReason::SetterPostconditionFailed:
+            return "SetIDHandlePair postcondition failed";
+        default:
+            return "unknown terminal allocation failure";
+        }
+    }
+
+    [[noreturn]] static void FatalAllocationFailure(
+        AllocationFailureReason reason,
+        void* subsystem,
+        SDK::FMassEntityHandle handle,
+        std::uint32_t attemptedId,
+        std::uint32_t maxId)
+    {
+        LOG_ERROR(
+            "PersistentIdFix: terminal persistent-ID allocation failure: "
+            "reason=%s reasonCode=%u subsystem=%p handle=(%u,%u) "
+            "attemptedId=%u MaxID=%u",
+            AllocationFailureReasonName(reason),
+            static_cast<unsigned int>(reason),
+            subsystem,
+            handle.Index,
+            handle.SerialNumber,
+            attemptedId,
+            maxId);
+
+        __fastfail(7u);
+    }
+
+    static bool IsExactPersistentIdMapping(
+        SDK::UCrMassPersistentIDSubsystem* subsystem,
+        std::uint32_t id,
+        const SDK::FMassEntityHandle& handle)
+    {
+        if (subsystem == nullptr ||
+            id == 0 ||
+            id == UINT32_MAX)
+        {
+            return false;
+        }
+
+        const SDK::FMassEntityHandle* forward =
+            FindHandleByPersistentId(
+                subsystem,
+                id);
+
+        if (forward == nullptr ||
+            forward->Index != handle.Index ||
+            forward->SerialNumber != handle.SerialNumber)
+        {
+            return false;
+        }
+
+        const SDK::FCrMassPersistentEntityID* reverse =
+            FindPersistentIdByHandle(
+                subsystem,
+                handle);
+
+        return reverse != nullptr &&
+            reverse->ID == id;
+    }
+
+    static bool CheckedSetIDHandlePair(
+        void* subsystem,
+        SDK::FCrMassPersistentEntityID* persistentId,
+        SDK::FMassEntityHandle handle)
+    {
+        auto* typedSubsystem =
+            static_cast<SDK::UCrMassPersistentIDSubsystem*>(subsystem);
+
+        if (typedSubsystem == nullptr ||
+            persistentId == nullptr ||
+            persistentId->ID == 0 ||
+            persistentId->ID == UINT32_MAX)
+        {
+            FatalAllocationFailure(
+                AllocationFailureReason::InvalidSetterInput,
+                subsystem,
+                handle,
+                persistentId != nullptr
+                    ? persistentId->ID
+                    : UINT32_MAX,
+                typedSubsystem != nullptr
+                    ? typedSubsystem->MaxID
+                    : 0);
+        }
+
+        if (g_setIDHandlePair == nullptr)
+        {
+            FatalAllocationFailure(
+                AllocationFailureReason::NativeSetterUnavailable,
+                subsystem,
+                handle,
+                persistentId->ID,
+                typedSubsystem->MaxID);
+        }
+
+        const bool nativeResult =
+            g_setIDHandlePair(
+                subsystem,
+                persistentId,
+                handle);
+
+        if (!IsExactPersistentIdMapping(
+                typedSubsystem,
+                persistentId->ID,
+                handle))
+        {
+            FatalAllocationFailure(
+                nativeResult
+                    ? AllocationFailureReason::SetterPostconditionFailed
+                    : AllocationFailureReason::SetterRegistrationFailed,
+                subsystem,
+                handle,
+                persistentId->ID,
+                typedSubsystem->MaxID);
+        }
+
+        return true;
+    }
 
     static void RevokeCertifiedPool(const char* reason)
     {
@@ -573,7 +732,7 @@ namespace
         // Build the reusable pool from holes below the loaded high-water mark.
         g_persistentIdReuse.Initialize(
             subsystem,
-            g_setIDHandlePair);
+            CheckedSetIDHandlePair);
 
         g_persistentIdReuse.BuildPool();
         g_reusePoolReady = true;
@@ -1683,10 +1842,12 @@ namespace PersistentIdFixSystem
     {
         if (returnValue == nullptr)
         {
-            LOG_ERROR(
-                "PersistentIdFix: GetOrAddIDForHandle return buffer is null");
-
-            return nullptr;
+            FatalAllocationFailure(
+                AllocationFailureReason::NullReturnBuffer,
+                subsystem,
+                handle,
+                UINT32_MAX,
+                0);
         }
 
         *returnValue = {};
@@ -1694,10 +1855,12 @@ namespace PersistentIdFixSystem
 
         if (subsystem == nullptr)
         {
-            LOG_ERROR(
-                "PersistentIdFix: GetOrAddIDForHandle subsystem is null");
-
-            return returnValue;
+            FatalAllocationFailure(
+                AllocationFailureReason::NullSubsystem,
+                nullptr,
+                handle,
+                UINT32_MAX,
+                0);
         }
 
         /*
@@ -1748,11 +1911,12 @@ namespace PersistentIdFixSystem
         {
             if (g_originalGetOrAddIDForHandle == nullptr)
             {
-                LOG_ERROR(
-                    "PersistentIdFix: native GetOrAddIDForHandle is unavailable "
-                    "while running as a remote client");
-
-                return returnValue;
+                FatalAllocationFailure(
+                    AllocationFailureReason::NativeAllocatorUnavailable,
+                    subsystem,
+                    handle,
+                    UINT32_MAX,
+                    0);
             }
 
             return g_originalGetOrAddIDForHandle(
@@ -1776,6 +1940,19 @@ namespace PersistentIdFixSystem
 
         if (existingId != nullptr)
         {
+            if (!IsExactPersistentIdMapping(
+                    persistentIDSubsystem,
+                    existingId->ID,
+                    handle))
+            {
+                FatalAllocationFailure(
+                    AllocationFailureReason::InvalidExistingMapping,
+                    subsystem,
+                    handle,
+                    existingId->ID,
+                    persistentIDSubsystem->MaxID);
+            }
+
             *returnValue = *existingId;
             return returnValue;
         }
@@ -1889,8 +2066,12 @@ namespace PersistentIdFixSystem
                 break;
 
             case PersistentIdAllocationResult::Failed:
-                // This is logged inside TryAllocate.
-                return returnValue;
+                FatalAllocationFailure(
+                    AllocationFailureReason::RecycledAllocationFailed,
+                    subsystem,
+                    handle,
+                    UINT32_MAX,
+                    persistentIDSubsystem->MaxID);
             }
         }
 
@@ -1903,13 +2084,22 @@ namespace PersistentIdFixSystem
          */
         if (persistentIDSubsystem->MaxID >= UINT32_MAX - 1u)
         {
-            LOG_ERROR(
-                "PersistentIdFix: persistent ID space exhausted; "
-                "no reusable IDs remain and MaxID=%u cannot advance without "
-                "reaching the invalid 0xFFFFFFFF persistent ID",
+            FatalAllocationFailure(
+                AllocationFailureReason::PersistentIdSpaceExhausted,
+                subsystem,
+                handle,
+                UINT32_MAX,
                 persistentIDSubsystem->MaxID);
+        }
 
-            return returnValue;
+        if (g_setIDHandlePair == nullptr)
+        {
+            FatalAllocationFailure(
+                AllocationFailureReason::NativeSetterUnavailable,
+                subsystem,
+                handle,
+                UINT32_MAX,
+                persistentIDSubsystem->MaxID);
         }
 
         ++persistentIDSubsystem->MaxID;
@@ -1922,36 +2112,10 @@ namespace PersistentIdFixSystem
         persistentId.CachedHandle =
             handle;
 
-        if (g_setIDHandlePair == nullptr)
-        {
-            RecordBurnedId(
-                persistentIDSubsystem,
-                persistentId.ID);
-
-            LOG_ERROR(
-                "PersistentIdFix: SetIDHandlePair is unavailable");
-
-            return returnValue;
-        }
-
-        if (!g_setIDHandlePair(
+        CheckedSetIDHandlePair(
             persistentIDSubsystem,
             &persistentId,
-            handle))
-        {
-            RecordBurnedId(
-                persistentIDSubsystem,
-                persistentId.ID);
-
-            LOG_ERROR(
-                "PersistentIdFix: SetIDHandlePair failed for new ID %u "
-                "handle=(%u,%u)",
-                persistentId.ID,
-                handle.Index,
-                handle.SerialNumber);
-
-            return returnValue;
-        }
+            handle);
 
         *returnValue = persistentId;
 
