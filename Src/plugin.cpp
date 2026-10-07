@@ -1387,13 +1387,9 @@ extern "C"
             LOG_INFO(
                 "PersistentIdFix: GetSaveData observer hook installed");
 
-            //
-            // Install SetIDHandlePair observer hook.
-            //
-            // PersistentIdFix-controlled setter calls use the native
-            // trampoline directly, so existing ledger accounting is not
-            // double-counted. Native game callers pass through this observer.
-            //
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
+            // Diagnostic builds observe native SetIDHandlePair provenance.
+            // Public Release must not pay this restoration-path cost.
             g_setIDHandlePairHook =
                 g_self->hooks->Hooks->Install(
                     g_setIDHandlePairAddress,
@@ -1405,17 +1401,31 @@ extern "C"
                 g_originalSetIDHandlePair == nullptr)
             {
                 LOG_ERROR(
-                    "PersistentIdFix: failed to install SetIDHandlePair observer hook");
+                    "PersistentIdFix: failed to install SetIDHandlePair diagnostic observer hook");
                 g_setIDHandlePairHook = nullptr;
                 g_originalSetIDHandlePair = nullptr;
                 break;
             }
 
             LOG_INFO(
-                "PersistentIdFix: SetIDHandlePair observer hook installed");
+                "PersistentIdFix: SetIDHandlePair diagnostic observer hook installed");
+#else
+            // Public Release calls the resolved native setter directly.
+            // It does not intercept native restoration traffic.
+            g_setIDHandlePairHook = nullptr;
+            g_originalSetIDHandlePair =
+                reinterpret_cast<SetIDHandlePairFn>(
+                    g_setIDHandlePairAddress);
+
+            if (g_originalSetIDHandlePair == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: resolved SetIDHandlePair address is null");
+                break;
+            }
+#endif
 
             // Install GetOrAddIDForHandle hook
-            //
             g_getOrAddIDForHandleHook =
                 g_self->hooks->Hooks->Install(
                     g_getOrAddIDForHandleAddress,

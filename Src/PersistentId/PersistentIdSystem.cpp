@@ -78,8 +78,10 @@ namespace
     static std::uint64_t g_assignmentLedgerGeneration = 0;
     static bool g_assignmentLedgerHealthy = true;
 
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
     static std::mutex g_setPairObserverMutex;
     static PersistentIdFixSystem::SetPairObserverSnapshot g_setPairObserver;
+#endif
 
     static std::chrono::steady_clock::time_point g_nextStatisticsLogTime{};
     static std::chrono::steady_clock::time_point g_nextLiveStatisticsRefreshTime{};
@@ -97,11 +99,16 @@ namespace
     static void ResetSetPairObserver(
         std::uint64_t loadGeneration)
     {
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
         std::lock_guard<std::mutex> lock(g_setPairObserverMutex);
         g_setPairObserver = {};
         g_setPairObserver.loadGeneration = loadGeneration;
+#else
+        (void)loadGeneration;
+#endif
     }
 
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
     struct SetPairState
     {
         bool pidPresent = false;
@@ -119,30 +126,24 @@ namespace
         if (subsystem == nullptr)
             return state;
 
-        bool exactForward = false;
+        const auto* mappedHandle =
+            FindHandleByPersistentId(
+                subsystem,
+                id);
 
-        for (const auto& pair : subsystem->IDHandleMap)
-        {
-            if (pair.Key().ID != id)
-                continue;
+        state.pidPresent = mappedHandle != nullptr;
 
-            state.pidPresent = true;
-
-            const auto& mappedHandle = pair.Value();
-            exactForward =
-                mappedHandle.Index == handle.Index &&
-                mappedHandle.SerialNumber == handle.SerialNumber;
-
-            break;
-        }
+        const bool exactForward =
+            mappedHandle != nullptr &&
+            mappedHandle->Index == handle.Index &&
+            mappedHandle->SerialNumber == handle.SerialNumber;
 
         const auto* mappedId =
             FindPersistentIdByHandle(
                 subsystem,
                 handle);
 
-        if (mappedId != nullptr)
-            state.handlePresent = true;
+        state.handlePresent = mappedId != nullptr;
 
         const bool exactReverse =
             mappedId != nullptr &&
@@ -153,7 +154,7 @@ namespace
 
         return state;
     }
-
+#endif
     static bool RecordLedgerEntry(
         SDK::UCrMassPersistentIDSubsystem* subsystem,
         std::uint32_t id,
@@ -692,13 +693,18 @@ namespace PersistentIdFixSystem
 
     SetPairObserverSnapshot GetSetPairObserverSnapshot()
     {
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
         std::lock_guard<std::mutex> lock(g_setPairObserverMutex);
         return g_setPairObserver;
+#else
+        return {};
+#endif
     }
 
     void LogSetPairObserver(
         const char* phase)
     {
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
         const SetPairObserverSnapshot snapshot =
             GetSetPairObserverSnapshot();
 
@@ -718,6 +724,9 @@ namespace PersistentIdFixSystem
             static_cast<unsigned long long>(snapshot.maxAdvanceWithoutExactPair),
             static_cast<unsigned long long>(snapshot.postStateMismatches),
             static_cast<unsigned long long>(snapshot.nullArgumentCalls));
+#else
+        (void)phase;
+#endif
     }
 
     HighWaterCrossCheckSnapshot LogHighWaterCrossCheck(
@@ -1420,6 +1429,7 @@ namespace PersistentIdFixSystem
     // using MaxID and SetIDHandlePair.
     // ---------------------------------------------------------------------------
 
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
     bool SetIDHandlePairDetour(
         void* subsystem,
         SDK::FCrMassPersistentEntityID* persistentId,
@@ -1524,6 +1534,8 @@ namespace PersistentIdFixSystem
 
         return result;
     }
+
+#endif
 
     SDK::FCrMassPersistentEntityID* GetOrAddIDForHandleDetour(
         void* subsystem,
@@ -1671,6 +1683,7 @@ namespace PersistentIdFixSystem
          * the invalid 0xFFFFFFFF persistent-ID sentinel. With no reusable pool
          * available yet, fall through to the bounded monotonic path below.
          */
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
         if (!g_reusePoolReady)
         {
             LOG_INFO(
@@ -1680,6 +1693,7 @@ namespace PersistentIdFixSystem
                 handle.SerialNumber,
                 persistentIDSubsystem->MaxID);
         }
+#endif
 
         /*
          * No existing mapping.
