@@ -221,9 +221,16 @@ namespace PersistentIdFixStats
         g_statistics.snapshot.totalEntities = totalEntities;
         g_statistics.snapshot.idCounterValue = idCounterValue;
 
+        constexpr std::uint32_t kMaxAssignablePersistentId =
+            UINT32_MAX - 1u;
+
         g_statistics.snapshot.remainingIDCount =
-            static_cast<std::uint64_t>(UINT32_MAX) -
-            static_cast<std::uint64_t>(idCounterValue);
+            idCounterValue < kMaxAssignablePersistentId
+                ? static_cast<std::uint64_t>(
+                    kMaxAssignablePersistentId) -
+                    static_cast<std::uint64_t>(
+                        idCounterValue)
+                : 0u;
 
         g_statistics.snapshot.reusableIDCount =
             reusableIDCount;
