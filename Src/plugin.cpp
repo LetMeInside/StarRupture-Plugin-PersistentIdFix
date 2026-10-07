@@ -613,7 +613,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
         g_hasBegunPlayAddress == 0)
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe has an unresolved native dependency");
+            "PersistentIdFix: startup attachment probe has an unresolved native dependency");
         return InitialAttachmentProbeResult::Unknown;
     }
 
@@ -623,7 +623,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
             sizeof(void*)))
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: GEngine storage is not readable; result=Unknown");
+            "PersistentIdFix: startup attachment probe: GEngine storage is not readable; result=Unknown");
         return InitialAttachmentProbeResult::Unknown;
     }
 
@@ -633,14 +633,14 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
             engine))
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: GEngine storage read faulted; result=Unknown");
+            "PersistentIdFix: startup attachment probe: GEngine storage read faulted; result=Unknown");
         return InitialAttachmentProbeResult::Unknown;
     }
 
     if (engine == nullptr)
     {
         LOG_INFO(
-            "PersistentIdFix: H2 startup probe: engine=null result=NotActive");
+            "PersistentIdFix: startup attachment probe: engine=null result=NotActive");
         return InitialAttachmentProbeResult::NotActiveGameplay;
     }
 
@@ -654,7 +654,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
     if (engineLookup != ExactClassLookupResult::ExactMatch)
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=%s result=Unknown",
+            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=%s result=Unknown",
             engine,
             engineLookup == ExactClassLookupResult::CompleteNoMatch
                 ? "0"
@@ -673,7 +673,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
             RequiredEngineReadableSize))
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=1 readable=0 result=Unknown",
+            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 readable=0 result=Unknown",
             engine);
         return InitialAttachmentProbeResult::Unknown;
     }
@@ -689,14 +689,14 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
             world))
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: GetGameWorld faulted; result=Unknown");
+            "PersistentIdFix: startup attachment probe: GetGameWorld faulted; result=Unknown");
         return InitialAttachmentProbeResult::Unknown;
     }
 
     if (world == nullptr)
     {
         LOG_INFO(
-            "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=1 world=null result=NotActive",
+            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=null result=NotActive",
             engine);
         return InitialAttachmentProbeResult::NotActiveGameplay;
     }
@@ -711,7 +711,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
     if (worldLookup != ExactClassLookupResult::ExactMatch)
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: engine=%p world=%p WorldIdentity=%s result=Unknown",
+            "PersistentIdFix: startup attachment probe: engine=%p world=%p WorldIdentity=%s result=Unknown",
             engine,
             static_cast<void*>(world),
             worldLookup == ExactClassLookupResult::CompleteNoMatch
@@ -728,7 +728,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
     if (!isChimeraMain)
     {
         LOG_INFO(
-            "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 objectName=%s ChimeraMainIdentity=0 result=NotActive",
+            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 objectName=%s ChimeraMainIdentity=0 result=NotActive",
             engine,
             static_cast<void*>(world),
             worldInfo.objectName);
@@ -741,7 +741,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
             RequiredWorldReadableSize))
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: engine=%p world=%p WorldIdentity=1 ChimeraMainIdentity=1 readable=0 result=Unknown",
+            "PersistentIdFix: startup attachment probe: engine=%p world=%p WorldIdentity=1 ChimeraMainIdentity=1 readable=0 result=Unknown",
             engine,
             static_cast<void*>(world));
         return InitialAttachmentProbeResult::Unknown;
@@ -756,14 +756,14 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
             beingCleanedUp))
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: World lifecycle read faulted; result=Unknown");
+            "PersistentIdFix: startup attachment probe: World lifecycle read faulted; result=Unknown");
         return InitialAttachmentProbeResult::Unknown;
     }
 
     if (tearingDown || beingCleanedUp)
     {
         LOG_INFO(
-            "PersistentIdFix: H2 startup probe: engine=%p world=%p GameEngineIdentity=1 WorldIdentity=1 ChimeraMainIdentity=1 tearingDown=%u beingCleanedUp=%u result=Unknown",
+            "PersistentIdFix: startup attachment probe: engine=%p world=%p GameEngineIdentity=1 WorldIdentity=1 ChimeraMainIdentity=1 tearingDown=%u beingCleanedUp=%u result=Unknown",
             engine,
             static_cast<void*>(world),
             tearingDown ? 1u : 0u,
@@ -782,7 +782,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
             begunPlay))
     {
         LOG_WARN(
-            "PersistentIdFix: H2 startup probe: HasBegunPlay faulted; result=Unknown");
+            "PersistentIdFix: startup attachment probe: HasBegunPlay faulted; result=Unknown");
         return InitialAttachmentProbeResult::Unknown;
     }
 
@@ -792,7 +792,7 @@ static InitialAttachmentProbeResult ProbeInitialAttachment()
             : InitialAttachmentProbeResult::Unknown;
 
     LOG_INFO(
-        "PersistentIdFix: H2 startup probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 ChimeraMainIdentity=1 begunPlay=%u tearingDown=0 beingCleanedUp=0 result=%s",
+        "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 ChimeraMainIdentity=1 begunPlay=%u tearingDown=0 beingCleanedUp=0 result=%s",
         engine,
         static_cast<void*>(world),
         begunPlay ? 1u : 0u,
@@ -1561,7 +1561,7 @@ extern "C"
                 PersistentIdFixSystem::MarkLateAttachmentDetected();
 
                 LOG_WARN(
-                    "PersistentIdFix: native H2 probe detected attachment to an already-active ChimeraMain world; persistent ID reuse remains disabled for this running world");
+                    "PersistentIdFix: startup attachment probe detected attachment to an already-active ChimeraMain world; persistent ID reuse remains disabled for this running world");
 
 #ifdef MODLOADER_CLIENT_BUILD
                 PersistentIdFixUI::ShowLateAttachmentWarning();
