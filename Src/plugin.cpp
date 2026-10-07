@@ -96,6 +96,7 @@ static void OnPreLoadMapDetour(
 
 static bool g_networkSessionActive = false;
 static bool g_gameWorldActive = false;
+static SDK::UWorld* g_gameWorld = nullptr;
 
 // G1 publication is diagnostic only. The allocator does not read this
 // vector yet.
@@ -1018,6 +1019,7 @@ static void OnWorldBeginPlay(SDK::UWorld* world)
      * network state becomes usable.
      */
     g_gameWorldActive = true;
+    g_gameWorld = world;
 
     PersistentIdFixSystem::BeginGameWorld(world);
     PersistentIdFixSourceReadObserver::AttachCurrentGenerationToGameWorld();
@@ -1111,8 +1113,22 @@ static void OnAfterWorldEndPlay(
     SDK::UWorld* world,
     const char* worldName)
 {
+    /*
+     * WorldEndPlay is global and fires for Untitled, Map_MainMenu and
+     * other intermediate worlds as well as ChimeraMain. Only the exact
+     * world that received our OnWorldBeginPlay callback owns this plugin
+     * lifecycle. Unrelated world-end callbacks must not detach coverage,
+     * end the persistent-ID session, reset networking, or hide the UI.
+     */
+    if (!g_gameWorldActive ||
+        g_gameWorld == nullptr ||
+        world != g_gameWorld)
+    {
+        return;
+    }
+
     LOG_INFO(
-        "PersistentIdFix: world ended: %s",
+        "PersistentIdFix: gameplay world ended: %s",
         worldName != nullptr ? worldName : "<null>");
 
     PersistentIdFixSourceReadObserver::LogCoverage(
@@ -1121,24 +1137,11 @@ static void OnAfterWorldEndPlay(
     LogReadiness(
         "world-end");
 
-    /*
-     * Detach source coverage only when this callback is ending the
-     * actual active game world. OnPreLoadMap can start an incoming
-     * generation before an outgoing menu/intermediate world ends;
-     * those callbacks must not invalidate the incoming generation.
-     */
-    if (g_gameWorldActive)
-    {
-        PersistentIdFixSourceReadObserver::DetachGameWorld();
-        PersistentIdFixSystem::EndGameWorld(world);
-    }
+    PersistentIdFixSourceReadObserver::DetachGameWorld();
+    PersistentIdFixSystem::EndGameWorld(world);
 
-    /*
-     * The actual game world has ended. Prevent OnTick() from starting a new
-     * network session while the process is transitioning through a menu or
-     * another intermediate world.
-     */
     g_gameWorldActive = false;
+    g_gameWorld = nullptr;
     ResetProtectedIdPublication();
 
     PersistentIdFixSystem::LogAssignmentLedger(
@@ -1151,10 +1154,8 @@ static void OnAfterWorldEndPlay(
 
     /*
      * End the network session independently of the local persistent-ID
-     * session.
-     *
-     * This is required for remote clients because they do not necessarily
-     * create a local PersistentIdFix persistent-ID session.
+     * session. Remote clients do not necessarily create a local allocator
+     * session, but the exact gameplay-world boundary still owns networking.
      */
     if (g_networkSessionActive)
     {
@@ -1164,16 +1165,9 @@ static void OnAfterWorldEndPlay(
 
 #ifdef MODLOADER_CLIENT_BUILD
     /*
-     * The UI belongs to the game world, not to the local persistent-ID session.
-     *
-     * A remote client can have a visible statistics window without ever
-     * creating a local persistent-ID session because the server owns the
-     * persistent-ID subsystem. Therefore the UI must also be hidden when the
-     * game world ends on a remote client.
-     *
-     * PersistentIdFixNetwork::ResetSession() has already happened above, so
-     * Hide() will not attempt to send a subscription packet for the ended
-     * session.
+     * The UI belongs to the exact gameplay world as well. ResetSession()
+     * has already happened, so Hide() cannot send a subscription update
+     * for a world that is ending.
      */
     if (PersistentIdFixUI::IsVisible())
     {
@@ -1181,7 +1175,6 @@ static void OnAfterWorldEndPlay(
     }
 #endif
 }
-
 // ---------------------------------------------------------------------------
 // Pattern resolution.
 //
@@ -1521,6 +1514,7 @@ extern "C"
 
             g_networkSessionActive = false;
             g_gameWorldActive = false;
+            g_gameWorld = nullptr;
             g_authoritativeWorldReadyObserved = false;
             g_engineShutdownObserved = false;
             ResetProtectedIdPublication();
@@ -1692,6 +1686,7 @@ extern "C"
 
         g_networkSessionActive = false;
         g_gameWorldActive = false;
+        g_gameWorld = nullptr;
         g_authoritativeWorldReadyObserved = false;
         ResetProtectedIdPublication();
 
@@ -1745,6 +1740,7 @@ extern "C"
             PersistentIdFixNetwork::Shutdown();
             g_networkSessionActive = false;
             g_gameWorldActive = false;
+            g_gameWorld = nullptr;
             g_authoritativeWorldReadyObserved = false;
             ResetProtectedIdPublication();
 
@@ -1809,6 +1805,7 @@ extern "C"
             PersistentIdFixMassFragmentClassifier::ResetDescriptorRegistry();
             PersistentIdFixSystem::Reset();
             g_gameWorldActive = false;
+            g_gameWorld = nullptr;
 
             g_getOrAddIDForHandleHook = nullptr;
             g_originalGetOrAddIDForHandle = nullptr;
