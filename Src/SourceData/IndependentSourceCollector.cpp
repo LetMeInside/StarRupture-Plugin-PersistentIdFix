@@ -19,7 +19,7 @@
 #include <vector>
 
 #ifndef PERSISTENTIDFIX_REFLECTION_TEST_MODE
-#define PERSISTENTIDFIX_REFLECTION_TEST_MODE 0
+#define PERSISTENTIDFIX_REFLECTION_TEST_MODE 1
 #endif
 
 namespace
@@ -892,6 +892,28 @@ namespace
                         persistentIdDescriptor,
                         summary))
                 {
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+                    LOG_WARN(
+                        "PersistentIdFix: reflection parent failure breadcrumb: "
+                        "stage=property depth=%u descriptor=%p descriptorSize=%d "
+                        "property=%p offset=%d elementSize=%d arrayDim=%d "
+                        "index=%d struct=%u array=%u enum=%u integral=%u "
+                        "unsupported=%llu maxDepth=%llu",
+                        depth,
+                        static_cast<const void*>(descriptor),
+                        descriptor->Size,
+                        static_cast<const void*>(property),
+                        property->Offset,
+                        property->ElementSize,
+                        property->ArrayDim,
+                        arrayIndex,
+                        HasCastFlag(property, EClassCastFlags::StructProperty) ? 1u : 0u,
+                        HasCastFlag(property, EClassCastFlags::ArrayProperty) ? 1u : 0u,
+                        HasCastFlag(property, EClassCastFlags::EnumProperty) ? 1u : 0u,
+                        IsSupportedIntegralProperty(property) ? 1u : 0u,
+                        static_cast<unsigned long long>(summary.unsupported),
+                        static_cast<unsigned long long>(summary.maxDepth));
+#endif
                     return false;
                 }
             }
@@ -1296,6 +1318,287 @@ namespace
                 summary);
         }
 
+        // Non-PID floating-point values are skipped, not collected.
+        // Validate reflected element width and readable storage first.
+        if (HasCastFlag(property, EClassCastFlags::FloatProperty) ||
+            HasCastFlag(property, EClassCastFlags::DoubleProperty))
+        {
+            const std::size_t requiredBytes =
+                HasCastFlag(property, EClassCastFlags::DoubleProperty)
+                    ? sizeof(double)
+                    : sizeof(float);
+
+            if (property->ElementSize <= 0 ||
+                static_cast<std::size_t>(property->ElementSize) <
+                    requiredBytes ||
+                !IsReadableRange(valueStorage, requiredBytes))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return true;
+        }
+
+        // Non-PID object references are skipped; their pointer values
+        // are not persistent IDs. Never follow or interpret the pointer.
+        if (HasCastFlag(property, EClassCastFlags::ObjectProperty))
+        {
+            if (property->ElementSize !=
+                    static_cast<std::int32_t>(sizeof(void*)) ||
+                !IsReadableRange(valueStorage, sizeof(void*)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return true;
+        }
+
+        // Non-PID name values are skipped. An FName is a value token,
+        // not a Mass persistent entity ID; do not decode its contents.
+        if (HasCastFlag(property, EClassCastFlags::NameProperty))
+        {
+            constexpr std::size_t kExpectedNameBytes =
+                sizeof(std::uint64_t);
+            if (property->ElementSize !=
+                    static_cast<std::int32_t>(kExpectedNameBytes) ||
+                !IsReadableRange(valueStorage, kExpectedNameBytes))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return true;
+        }
+
+        // Non-PID UTF-8 string values are skipped without accessing payload.
+        // Unreal's FUtf8StrProperty cast flag is 0x1000000000000000.
+        // Require the expected 16-byte inline field representation and
+        // validate storage, retaining fail-closed behavior on mismatch.
+        constexpr std::uint64_t kUtf8StringPropertyCastFlag =
+            0x1000000000000000ULL;
+        if (property->ClassPrivate != nullptr &&
+            IsReadableRange(property->ClassPrivate, sizeof(FFieldClass)) &&
+            (property->ClassPrivate->CastFlags &
+                kUtf8StringPropertyCastFlag) != 0)
+        {
+            if (property->ElementSize != 16 ||
+                !IsReadableRange(valueStorage, 16u))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return true;
+        }
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        // Read-only metadata only: no map storage access or entry traversal.
+        if (HasCastFlag(property, EClassCastFlags::MapProperty))
+        {
+            const bool mapReadable =
+                IsReadableRange(property, sizeof(FMapProperty));
+            const auto* mapProperty = mapReadable
+                ? static_cast<const FMapProperty*>(property)
+                : nullptr;
+            const FProperty* key = mapProperty != nullptr
+                ? mapProperty->KeyProperty : nullptr;
+            const FProperty* value = mapProperty != nullptr
+                ? mapProperty->ValueProperty : nullptr;
+            const bool keyReadable = key != nullptr &&
+                IsReadableRange(key, sizeof(FProperty));
+            const bool valueReadable = value != nullptr &&
+                IsReadableRange(value, sizeof(FProperty));
+            const unsigned long long keyFlags =
+                keyReadable && key->ClassPrivate != nullptr &&
+                IsReadableRange(key->ClassPrivate, sizeof(FFieldClass))
+                    ? static_cast<unsigned long long>(
+                        key->ClassPrivate->CastFlags)
+                    : 0ULL;
+            const unsigned long long valueFlags =
+                valueReadable && value->ClassPrivate != nullptr &&
+                IsReadableRange(value->ClassPrivate, sizeof(FFieldClass))
+                    ? static_cast<unsigned long long>(
+                        value->ClassPrivate->CastFlags)
+                    : 0ULL;
+            LOG_WARN(
+                "PersistentIdFix: reflection map key/value metadata: "
+                "depth=%u storageSize=%d mapReadable=%u "
+                "descriptorSize=%llu keyReadable=%u keySize=%d "
+                "keyOffset=%d keyFlags=0x%llX "
+                "valueReadable=%u valueSize=%d valueOffset=%d "
+                "valueFlags=0x%llX",
+                depth,
+                property->ElementSize,
+                mapReadable ? 1u : 0u,
+                static_cast<unsigned long long>(sizeof(FMapProperty)),
+                keyReadable ? 1u : 0u,
+                keyReadable ? key->ElementSize : -1,
+                keyReadable ? key->Offset : -1,
+                keyFlags,
+                valueReadable ? 1u : 0u,
+                valueReadable ? value->ElementSize : -1,
+                valueReadable ? value->Offset : -1,
+                valueFlags);
+            // Metadata only. Do not inspect map storage or entry contents.
+            const bool keyStructProperty = keyReadable &&
+                HasCastFlag(key, EClassCastFlags::StructProperty) &&
+                IsReadableRange(key, sizeof(FStructProperty));
+            const bool valueStructProperty = valueReadable &&
+                HasCastFlag(value, EClassCastFlags::StructProperty) &&
+                IsReadableRange(value, sizeof(FStructProperty));
+            const UStruct* keyDescriptor = keyStructProperty
+                ? static_cast<const FStructProperty*>(key)->Struct : nullptr;
+            const UStruct* valueDescriptor = valueStructProperty
+                ? static_cast<const FStructProperty*>(value)->Struct : nullptr;
+            const bool keyDescriptorReadable = keyDescriptor != nullptr &&
+                IsReadableRange(keyDescriptor, sizeof(UStruct));
+            const bool valueDescriptorReadable = valueDescriptor != nullptr &&
+                IsReadableRange(valueDescriptor, sizeof(UStruct));
+            LOG_WARN(
+                "PersistentIdFix: reflection map struct descriptors: "
+                "depth=%u keyIsStruct=%u keyDescriptorReadable=%u "
+                "keyStructSize=%d keyExactPid=%u "
+                "valueIsStruct=%u valueDescriptorReadable=%u "
+                "valueStructSize=%d valueExactPid=%u",
+                depth,
+                keyStructProperty ? 1u : 0u,
+                keyDescriptorReadable ? 1u : 0u,
+                keyDescriptorReadable ? keyDescriptor->Size : -1,
+                keyDescriptorReadable &&
+                    keyDescriptor == persistentIdDescriptor ? 1u : 0u,
+                valueStructProperty ? 1u : 0u,
+                valueDescriptorReadable ? 1u : 0u,
+                valueDescriptorReadable ? valueDescriptor->Size : -1,
+                valueDescriptorReadable &&
+                    valueDescriptor == persistentIdDescriptor ? 1u : 0u);
+            // Metadata-only bounded child-property inspection. No map data reads.
+            const UStruct* mapDescriptors[2] = {
+                keyDescriptorReadable ? keyDescriptor : nullptr,
+                valueDescriptorReadable ? valueDescriptor : nullptr
+            };
+            for (unsigned int side = 0; side < 2u; ++side)
+            {
+                const UStruct* descriptor = mapDescriptors[side];
+                if (descriptor == nullptr || descriptor->Size <= 0)
+                    continue;
+
+                const FField* child = descriptor->ChildProperties;
+                unsigned int inspected = 0;
+                while (child != nullptr && inspected < 8u)
+                {
+                    const bool fieldReadable =
+                        IsReadableRange(child, sizeof(FField));
+                    const bool propertyType = fieldReadable &&
+                        HasCastFlag(child, EClassCastFlags::Property);
+                    const auto* nested = propertyType
+                        ? reinterpret_cast<const FProperty*>(child)
+                        : nullptr;
+                    const bool propertyReadable = nested != nullptr &&
+                        IsReadableRange(nested, sizeof(FProperty));
+                    unsigned long long castFlags = 0ULL;
+                    if (fieldReadable && child->ClassPrivate != nullptr &&
+                        IsReadableRange(child->ClassPrivate, sizeof(FFieldClass)))
+                    {
+                        castFlags = static_cast<unsigned long long>(
+                            child->ClassPrivate->CastFlags);
+                    }
+                    LOG_WARN(
+                        "PersistentIdFix: reflection map child property: "
+                        "side=%u index=%u fieldReadable=%u propertyReadable=%u "
+                        "offset=%d size=%d arrayDim=%d castFlags=0x%llX",
+                        side, inspected, fieldReadable ? 1u : 0u,
+                        propertyReadable ? 1u : 0u,
+                        propertyReadable ? nested->Offset : -1,
+                        propertyReadable ? nested->ElementSize : -1,
+                        propertyReadable ? nested->ArrayDim : -1,
+                        castFlags);
+                    // Descriptor-only nested struct inspection; never read map entries.
+                    if (propertyReadable &&
+                        HasCastFlag(nested, EClassCastFlags::StructProperty))
+                    {
+                        const bool structPropertyReadable =
+                            IsReadableRange(nested, sizeof(FStructProperty));
+                        const auto* structProp = structPropertyReadable
+                            ? static_cast<const FStructProperty*>(nested) : nullptr;
+                        const UStruct* nestedDescriptor = structProp != nullptr
+                            ? structProp->Struct : nullptr;
+                        const bool descriptorReadable = nestedDescriptor != nullptr &&
+                            IsReadableRange(nestedDescriptor, sizeof(UStruct));
+                        LOG_WARN(
+                            "PersistentIdFix: reflection map nested child struct: "
+                            "side=%u index=%u structPropertyReadable=%u "
+                            "descriptorReadable=%u descriptorSize=%d "
+                            "exactPid=%u hasChildren=%u",
+                            side, inspected,
+                            structPropertyReadable ? 1u : 0u,
+                            descriptorReadable ? 1u : 0u,
+                            descriptorReadable ? nestedDescriptor->Size : -1,
+                            descriptorReadable &&
+                                nestedDescriptor == persistentIdDescriptor ? 1u : 0u,
+                            descriptorReadable &&
+                                nestedDescriptor->ChildProperties != nullptr ? 1u : 0u);
+                    }
+                    if (!fieldReadable || !propertyReadable)
+                        break;
+                    child = child->Next;
+                    ++inspected;
+                }
+                LOG_WARN(
+                    "PersistentIdFix: reflection map child scan: "
+                    "side=%u inspected=%u truncated=%u",
+                    side, inspected, child != nullptr ? 1u : 0u);
+            }
+        }
+#endif
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        // Classification-only breadcrumb. Never read or reinterpret the
+        // unknown payload, and retain the existing fail-closed behavior.
+        LOG_WARN(
+            "PersistentIdFix: reflection unsupported leaf classification: "
+            "depth=%u elementSize=%d offset=%d "
+            "name=%u object=%u str=%u text=%u "
+            "float=%u double=%u",
+            depth,
+            property->ElementSize,
+            property->Offset,
+            HasCastFlag(property, EClassCastFlags::NameProperty) ? 1u : 0u,
+            HasCastFlag(property, EClassCastFlags::ObjectProperty) ? 1u : 0u,
+            HasCastFlag(property, EClassCastFlags::StrProperty) ? 1u : 0u,
+            HasCastFlag(property, EClassCastFlags::TextProperty) ? 1u : 0u,
+            HasCastFlag(property, EClassCastFlags::FloatProperty) ? 1u : 0u,
+            HasCastFlag(property, EClassCastFlags::DoubleProperty) ? 1u : 0u);
+#endif
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        // Report reflected type bits without interpreting unknown value storage.
+        // The class pointer is separately validated before any metadata access.
+        const auto* leafClass = property->ClassPrivate;
+        if (leafClass != nullptr &&
+            IsReadableRange(leafClass, sizeof(FFieldClass)))
+        {
+            LOG_WARN(
+                "PersistentIdFix: reflection unsupported leaf cast flags: "
+                "depth=%u offset=%d elementSize=%d castFlags=0x%llX",
+                depth,
+                property->Offset,
+                property->ElementSize,
+                static_cast<unsigned long long>(leafClass->CastFlags));
+        }
+        else
+        {
+            LOG_WARN(
+                "PersistentIdFix: reflection unsupported leaf cast flags: "
+                "depth=%u classUnreadable=1",
+                depth);
+        }
+#endif
         summary.complete = false;
         ++summary.unsupported;
         return false;
@@ -1419,6 +1722,53 @@ namespace
         return nullptr;
     }
 
+    // Diagnostic-only: find a nested reflected struct field by a known
+    // typed member offset, without trusting a property name or raw bytes.
+    const FStructProperty* FindStructPropertyByOffset(
+        const UStruct* descriptor,
+        std::int32_t offset,
+        const UScriptStruct* expectedStruct)
+    {
+        if (descriptor == nullptr || expectedStruct == nullptr || offset < 0)
+            return nullptr;
+
+        const UStruct* current = descriptor;
+        std::uint32_t inheritanceGuard = 0;
+        while (current != nullptr)
+        {
+            if (++inheritanceGuard > kShadowMaxStructDepth ||
+                !IsReadableRange(current, sizeof(UStruct)))
+                return nullptr;
+
+            const FField* field = current->ChildProperties;
+            std::uint64_t chainGuard = 0;
+            while (field != nullptr)
+            {
+                if (++chainGuard > kShadowMaxProperties ||
+                    !IsReadableRange(field, sizeof(FField)))
+                    return nullptr;
+
+                if (HasCastFlag(field, EClassCastFlags::StructProperty))
+                {
+                    const auto* property =
+                        reinterpret_cast<const FStructProperty*>(field);
+                    if (!IsReadableRange(property, sizeof(FStructProperty)))
+                        return nullptr;
+
+                    if (property->Offset == offset &&
+                        property->ArrayDim == 1 &&
+                        property->Struct == expectedStruct &&
+                        expectedStruct->Size > 0 &&
+                        property->ElementSize >= expectedStruct->Size)
+                        return property;
+                }
+                field = field->Next;
+            }
+            current = current->SuperStruct;
+        }
+        return nullptr;
+    }
+
     void RunForcedReflectionShapeTests()
     {
         ShadowSchemaSummary persistentIdSummary{};
@@ -1483,6 +1833,50 @@ namespace
     void RunForcedReflectionValueTests(
         const FCrCharacterPlayerBaseSaveDataPerPlayer& player)
     {
+        // Diagnostic only. Traverse the entire reflected parent, rather
+        // than a single property selected by its typed field offset.
+        // This deliberately does not classify encountered integers as PIDs.
+        ShadowValueSummary parentSummary{};
+        const bool parentEligible =
+            g_reflectionTestPlayerDescriptor != nullptr &&
+            IsReadableRange(
+                g_reflectionTestPlayerDescriptor,
+                sizeof(UScriptStruct)) &&
+            g_reflectionTestPlayerDescriptor->Size > 0 &&
+            static_cast<std::size_t>(
+                g_reflectionTestPlayerDescriptor->Size) <= sizeof(player);
+
+        const bool parentComplete =
+            parentEligible &&
+            TraverseShadowStructValue(
+                g_reflectionTestPlayerDescriptor,
+                &player,
+                0,
+                g_reflectionTestPersistentIdDescriptor,
+                parentSummary);
+
+        LOG_INFO(
+            "PersistentIdFix: forced reflection value test: "
+            "target=PlayerSave.wholeParent eligible=%u complete=%u "
+            "exactPid=%llu integral=%llu candidates=%llu "
+            "arrays=%llu elements=%llu structs=%llu "
+            "unsupported=%llu maxDepth=%llu "
+            "floorExpected=%u",
+            parentEligible ? 1u : 0u,
+            parentComplete ? 1u : 0u,
+            static_cast<unsigned long long>(
+                parentSummary.exactPersistentIds),
+            static_cast<unsigned long long>(
+                parentSummary.integralValues),
+            static_cast<unsigned long long>(
+                parentSummary.candidateValues),
+            static_cast<unsigned long long>(parentSummary.arrays),
+            static_cast<unsigned long long>(parentSummary.arrayElements),
+            static_cast<unsigned long long>(parentSummary.structs),
+            static_cast<unsigned long long>(parentSummary.unsupported),
+            static_cast<unsigned long long>(parentSummary.maxDepth),
+            player.FloorPersistentEntityID.ID);
+
         ShadowValueSummary pidSummary{};
 
         const bool pidComplete =
@@ -1512,6 +1906,59 @@ namespace
             static_cast<unsigned long long>(pidSummary.unsupported),
             static_cast<unsigned long long>(pidSummary.maxDepth));
 
+        // Traverse a real nested struct *property* rather than invoking
+        // the PID wrapper's struct walker directly. The typed member is
+        // the independent value oracle; no PID is emitted to certification.
+        const auto typedPlayerBase =
+            reinterpret_cast<std::uintptr_t>(&player);
+        const auto typedFloorAddress =
+            reinterpret_cast<std::uintptr_t>(&player.FloorPersistentEntityID);
+        const bool floorOffsetValid =
+            typedFloorAddress >= typedPlayerBase &&
+            (typedFloorAddress - typedPlayerBase) <=
+                static_cast<std::uintptr_t>(
+                    (std::numeric_limits<std::int32_t>::max)());
+
+        const FStructProperty* nestedFloorProperty =
+            floorOffsetValid
+                ? FindStructPropertyByOffset(
+                    g_reflectionTestPlayerDescriptor,
+                    static_cast<std::int32_t>(
+                        typedFloorAddress - typedPlayerBase),
+                    g_reflectionTestPersistentIdDescriptor)
+                : nullptr;
+        ShadowValueSummary nestedSummary{};
+        bool nestedComplete = false;
+        if (nestedFloorProperty != nullptr)
+        {
+            nestedComplete = TraverseShadowPropertyValue(
+                nestedFloorProperty,
+                &player.FloorPersistentEntityID,
+                0,
+                g_reflectionTestPersistentIdDescriptor,
+                nestedSummary);
+        }
+        else
+        {
+            nestedSummary.complete = false;
+            ++nestedSummary.unsupported;
+        }
+
+        LOG_INFO(
+            "PersistentIdFix: forced reflection value test: "
+            "target=FloorPersistentEntityID.nestedProperty "
+            "propertyFound=%u complete=%u exactPid=%llu "
+            "candidates=%llu first=%u last=%u expected=%u "
+            "unsupported=%llu maxDepth=%llu",
+            nestedFloorProperty != nullptr ? 1u : 0u,
+            nestedComplete ? 1u : 0u,
+            static_cast<unsigned long long>(nestedSummary.exactPersistentIds),
+            static_cast<unsigned long long>(nestedSummary.candidateValues),
+            nestedSummary.firstCandidate,
+            nestedSummary.lastCandidate,
+            player.FloorPersistentEntityID.ID,
+            static_cast<unsigned long long>(nestedSummary.unsupported),
+            static_cast<unsigned long long>(nestedSummary.maxDepth));
         const auto playerBase =
             reinterpret_cast<std::uintptr_t>(&player);
         const auto arrayAddress =
