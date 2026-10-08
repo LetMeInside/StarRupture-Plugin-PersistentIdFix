@@ -16,8 +16,11 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
-#include <string>
 #include <vector>
+
+#ifndef PERSISTENTIDFIX_REFLECTION_TEST_MODE
+#define PERSISTENTIDFIX_REFLECTION_TEST_MODE 0
+#endif
 
 namespace
 {
@@ -78,6 +81,11 @@ namespace
     std::mutex g_registryMutex;
     std::array<const UScriptStruct*, 6> g_descriptors{};
     bool g_registryReady = false;
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+    const UScriptStruct* g_reflectionTestPersistentIdDescriptor = nullptr;
+    const UScriptStruct* g_reflectionTestMapMenuDescriptor = nullptr;
+#endif
 
     std::atomic<std::uint64_t> g_gameStatePlayers{0};
     std::atomic<std::uint64_t> g_gameStateFloorValues{0};
@@ -619,8 +627,7 @@ namespace
 
     bool AnalyzeShadowPayload(
         const FInstancedStruct& payload,
-        ShadowSchemaSummary& summary,
-        std::string& descriptorName)
+        ShadowSchemaSummary& summary)
     {
         if (payload.ScriptStruct == nullptr ||
             payload.StructMemory == nullptr ||
@@ -638,21 +645,131 @@ namespace
             return false;
         }
 
-        try
-        {
-            descriptorName =
-                payload.ScriptStruct->Name.ToString();
-        }
-        catch (...)
-        {
-            descriptorName = "<name-unavailable>";
-        }
-
         return AnalyzeShadowStructShape(
             payload.ScriptStruct,
             0,
             summary);
     }
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+    const FProperty* FindFirstIntegralArrayProperty(
+        const UStruct* descriptor)
+    {
+        const UStruct* current = descriptor;
+        std::uint32_t inheritanceGuard = 0;
+
+        while (current != nullptr)
+        {
+            if (++inheritanceGuard > kShadowMaxStructDepth ||
+                !IsReadableRange(current, sizeof(UStruct)))
+            {
+                return nullptr;
+            }
+
+            const FField* field = current->ChildProperties;
+            std::uint64_t chainGuard = 0;
+
+            while (field != nullptr)
+            {
+                if (++chainGuard > kShadowMaxProperties ||
+                    !IsReadableRange(field, sizeof(FField)))
+                {
+                    return nullptr;
+                }
+
+                if (HasCastFlag(field, EClassCastFlags::ArrayProperty))
+                {
+                    const auto* property =
+                        reinterpret_cast<const FProperty*>(field);
+
+                    if (!IsReadableRange(
+                            property,
+                            sizeof(FArrayProperty)))
+                    {
+                        return nullptr;
+                    }
+
+                    const auto* arrayProperty =
+                        static_cast<const FArrayProperty*>(property);
+
+                    if (arrayProperty->InnerProperty != nullptr &&
+                        IsSupportedIntegralProperty(
+                            arrayProperty->InnerProperty))
+                    {
+                        return property;
+                    }
+                }
+
+                field = field->Next;
+            }
+
+            current = current->SuperStruct;
+        }
+
+        return nullptr;
+    }
+
+    void RunForcedReflectionShapeTests()
+    {
+        ShadowSchemaSummary persistentIdSummary{};
+        const bool persistentIdSupported =
+            g_reflectionTestPersistentIdDescriptor != nullptr &&
+            AnalyzeShadowStructShape(
+                g_reflectionTestPersistentIdDescriptor,
+                0,
+                persistentIdSummary);
+
+        LOG_INFO(
+            "PersistentIdFix: forced reflection test: target=CrMassPersistentEntityID "
+            "supportedShape=%u properties=%llu arrays=%llu structs=%llu "
+            "integralLeaves=%llu enumLeaves=%llu unsupported=%llu maxDepth=%llu",
+            persistentIdSupported ? 1u : 0u,
+            static_cast<unsigned long long>(persistentIdSummary.properties),
+            static_cast<unsigned long long>(persistentIdSummary.arrays),
+            static_cast<unsigned long long>(persistentIdSummary.structs),
+            static_cast<unsigned long long>(persistentIdSummary.integralLeaves),
+            static_cast<unsigned long long>(persistentIdSummary.enumLeaves),
+            static_cast<unsigned long long>(persistentIdSummary.unsupported),
+            static_cast<unsigned long long>(persistentIdSummary.maxDepth));
+
+        ShadowSchemaSummary arraySummary{};
+        const FProperty* arrayProperty =
+            FindFirstIntegralArrayProperty(
+                g_reflectionTestMapMenuDescriptor);
+
+        bool arraySupported = false;
+        if (arrayProperty != nullptr)
+        {
+            arraySummary.properties = 1;
+            arraySupported =
+                AnalyzeShadowPropertyShape(
+                    arrayProperty,
+                    0,
+                    arraySummary);
+        }
+        else
+        {
+            arraySummary.supported = false;
+            ++arraySummary.unsupported;
+        }
+
+        LOG_INFO(
+            "PersistentIdFix: forced reflection test: "
+            "target=CrPlayersMapMenuState.firstIntegralArray "
+            "propertyFound=%u supportedShape=%u properties=%llu arrays=%llu "
+            "structs=%llu integralLeaves=%llu enumLeaves=%llu "
+            "unsupported=%llu maxDepth=%llu",
+            arrayProperty != nullptr ? 1u : 0u,
+            arraySupported ? 1u : 0u,
+            static_cast<unsigned long long>(arraySummary.properties),
+            static_cast<unsigned long long>(arraySummary.arrays),
+            static_cast<unsigned long long>(arraySummary.structs),
+            static_cast<unsigned long long>(arraySummary.integralLeaves),
+            static_cast<unsigned long long>(arraySummary.enumLeaves),
+            static_cast<unsigned long long>(arraySummary.unsupported),
+            static_cast<unsigned long long>(arraySummary.maxDepth));
+    }
+#endif
 
     bool Emit(
         std::vector<std::uint32_t>& staged,
@@ -829,6 +946,11 @@ namespace PersistentIdFixIndependentSourceCollector
         g_registryReady = false;
         g_descriptors.fill(nullptr);
 
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        g_reflectionTestPersistentIdDescriptor = nullptr;
+        g_reflectionTestMapMenuDescriptor = nullptr;
+#endif
+
         if (engineEvents == nullptr ||
             engineEvents->GetStaticFindObjectSafeByNameAddress == nullptr)
         {
@@ -888,10 +1010,39 @@ namespace PersistentIdFixIndependentSourceCollector
             g_descriptors[Index(profile.SectionId)] = descriptor;
         }
 
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        const auto resolveTestDescriptor =
+            [&](const wchar_t* path) -> const UScriptStruct*
+            {
+                UObject* object =
+                    findSafe(scriptStructClass, nullptr, path, true);
+
+                return object != nullptr
+                    ? reinterpret_cast<const UScriptStruct*>(object)
+                    : nullptr;
+            };
+
+        g_reflectionTestPersistentIdDescriptor =
+            resolveTestDescriptor(
+                L"/Script/ChimeraMassCommon.CrMassPersistentEntityID");
+
+        g_reflectionTestMapMenuDescriptor =
+            resolveTestDescriptor(
+                L"/Script/Chimera.CrPlayersMapMenuState");
+
+        LOG_INFO(
+            "PersistentIdFix: reflection test mode descriptor lookup: "
+            "persistentId=%p mapMenu=%p",
+            static_cast<const void*>(g_reflectionTestPersistentIdDescriptor),
+            static_cast<const void*>(g_reflectionTestMapMenuDescriptor));
+#endif
+
         g_registryReady = true;
 
         LOG_INFO(
-            "PersistentIdFix: independent source descriptor registry ready: profiles=6");
+            "PersistentIdFix: independent source descriptor registry ready: "
+            "profiles=6 reflectionTestMode=%u",
+            PERSISTENTIDFIX_REFLECTION_TEST_MODE ? 1u : 0u);
 
         return true;
     }
@@ -901,6 +1052,11 @@ namespace PersistentIdFixIndependentSourceCollector
         std::lock_guard<std::mutex> lock(g_registryMutex);
         g_registryReady = false;
         g_descriptors.fill(nullptr);
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        g_reflectionTestPersistentIdDescriptor = nullptr;
+        g_reflectionTestMapMenuDescriptor = nullptr;
+#endif
     }
 
     bool IsDescriptorRegistryReady()
@@ -1047,6 +1203,10 @@ namespace PersistentIdFixIndependentSourceCollector
             return false;
         }
 
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        RunForcedReflectionShapeTests();
+#endif
+
         std::vector<std::uint32_t> staged;
         std::uint64_t players = 0;
         std::uint64_t floorValues = 0;
@@ -1167,13 +1327,11 @@ namespace PersistentIdFixIndependentSourceCollector
                         }
 
                         ShadowSchemaSummary shadow{};
-                        std::string descriptorName;
 
                         const bool shadowSupported =
                             AnalyzeShadowPayload(
                                 payload,
-                                shadow,
-                                descriptorName);
+                                shadow);
 
                         if (shadowSupported)
                         {
@@ -1218,13 +1376,12 @@ namespace PersistentIdFixIndependentSourceCollector
 
                         LOG_INFO(
                             "PersistentIdFix: device payload reflection shadow: "
-                            "schema=%s size=%d supportedShape=%u "
+                            "schema=%p size=%d supportedShape=%u "
                             "properties=%llu arrays=%llu structs=%llu "
                             "integralLeaves=%llu enumLeaves=%llu "
                             "unsupported=%llu maxDepth=%llu",
-                            descriptorName.empty()
-                                ? "<unnamed>"
-                                : descriptorName.c_str(),
+                            static_cast<const void*>(
+                                payload.ScriptStruct),
                             payload.ScriptStruct->Size,
                             shadowSupported ? 1u : 0u,
                             static_cast<unsigned long long>(
