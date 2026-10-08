@@ -114,6 +114,9 @@
     <ClInclude Include="SourceData\SourceReadObserver.h" />
     <ClInclude Include="SourceData\MassFragmentClassifier.h" />
     <ClInclude Include="SourceData\IndependentSourceCollector.h" />
+    <ClInclude Include="SourceData\ReflectionWalker.h" />
+    <ClInclude Include="SourceData\ReflectionDiagnostics.h" />
+    <ClInclude Include="SourceData\SourceMemory.h" />
     <ClInclude Include="PersistentId\PersistentIdReuse.h" />
     <ClInclude Include="plugin.h" />
     <ClInclude Include="plugin_helpers.h" />
@@ -135,6 +138,8 @@
     <ClCompile Include="SourceData\SourceReadObserver.cpp" />
     <ClCompile Include="SourceData\MassFragmentClassifier.cpp" />
     <ClCompile Include="SourceData\IndependentSourceCollector.cpp" />
+    <ClCompile Include="SourceData\ReflectionWalker.cpp" />
+    <ClCompile Include="SourceData\ReflectionDiagnostics.cpp" />
     <ClCompile Include="Network\Network.cpp" />
     <ClCompile Include="Stats\Stats.cpp" />
     <ClCompile Include="UI\UI.cpp" />
