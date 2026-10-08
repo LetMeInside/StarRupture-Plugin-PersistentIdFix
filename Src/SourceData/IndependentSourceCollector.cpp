@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <vector>
@@ -86,6 +87,11 @@ namespace
     const UScriptStruct* g_reflectionTestPersistentIdDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestMapMenuDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestPlayerDescriptor = nullptr;
+    // Patch 28: diagnostic-only canonical identities; never used for PID certification.
+    const UScriptStruct* g_step28Store = nullptr;
+    const UScriptStruct* g_step28ItemId = nullptr;
+    const UScriptStruct* g_step28Guid = nullptr;
+    const UScriptStruct* g_step28Json = nullptr;
 #endif
 
     std::atomic<std::uint64_t> g_gameStatePlayers{0};
@@ -358,6 +364,87 @@ namespace
 
     constexpr std::uint32_t kShadowMaxStructDepth = 16;
     constexpr std::uint64_t kShadowMaxProperties = 512;
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+    // Native Client/Server ABI; the generated FMapProperty stops at 0x80.
+    constexpr std::size_t kShadowNativeMapDescriptorSize = 0xA0;
+    constexpr std::size_t kShadowNativeMapLayoutOffset = 0x80;
+    constexpr std::size_t kShadowNativeMapFlagsOffset = 0x98;
+    // Diagnostic work bound, not a claim about the engine's maximum size.
+    constexpr std::int32_t kShadowMaxMapSlotStride = 1024 * 1024;
+
+    struct ShadowNativeMapLayout
+    {
+        std::int32_t ValueOffset = -1;
+        std::int32_t HashNextIdOffset = -1;
+        std::int32_t HashIndexOffset = -1;
+        std::int32_t SetSize = -1;
+        std::int32_t SparseAlignment = -1;
+        std::int32_t SparseSlotStride = -1;
+    };
+    static_assert(sizeof(ShadowNativeMapLayout) == 0x18);
+    static_assert(offsetof(ShadowNativeMapLayout, ValueOffset) == 0x00);
+    static_assert(offsetof(ShadowNativeMapLayout, HashNextIdOffset) == 0x04);
+    static_assert(offsetof(ShadowNativeMapLayout, HashIndexOffset) == 0x08);
+    static_assert(offsetof(ShadowNativeMapLayout, SetSize) == 0x0C);
+    static_assert(offsetof(ShadowNativeMapLayout, SparseAlignment) == 0x10);
+    static_assert(offsetof(ShadowNativeMapLayout, SparseSlotStride) == 0x14);
+    static_assert(kShadowNativeMapLayoutOffset + sizeof(ShadowNativeMapLayout) ==
+        kShadowNativeMapFlagsOffset);
+    static_assert(kShadowNativeMapFlagsOffset + sizeof(std::uint8_t) <=
+        kShadowNativeMapDescriptorSize);
+
+    struct ShadowNativeMapMetadata
+    {
+        ShadowNativeMapLayout Layout;
+        std::uint8_t AllocatorFlags = 0;
+        bool DescriptorReadable = false;
+        bool FlagsKnown = false;
+        bool AllocatorSupported = false;
+        bool LayoutValid = false;
+    };
+
+    ShadowNativeMapMetadata ReadShadowNativeMapMetadata(
+        const FProperty* property)
+    {
+        ShadowNativeMapMetadata metadata{};
+        metadata.DescriptorReadable =
+            IsReadableRange(property, kShadowNativeMapDescriptorSize);
+        if (!metadata.DescriptorReadable)
+            return metadata;
+
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(property);
+        std::memcpy(
+            &metadata.Layout,
+            bytes + kShadowNativeMapLayoutOffset,
+            sizeof(metadata.Layout));
+        std::memcpy(
+            &metadata.AllocatorFlags,
+            bytes + kShadowNativeMapFlagsOffset,
+            sizeof(metadata.AllocatorFlags));
+
+        metadata.FlagsKnown = (metadata.AllocatorFlags & 0xFEu) == 0;
+        metadata.AllocatorSupported = metadata.AllocatorFlags == 0;
+
+        const auto& layout = metadata.Layout;
+        metadata.LayoutValid =
+            layout.SparseSlotStride > 0 &&
+            layout.SparseSlotStride <= kShadowMaxMapSlotStride &&
+            layout.SparseAlignment > 0 &&
+            (layout.SparseAlignment & (layout.SparseAlignment - 1)) == 0 &&
+            layout.SparseSlotStride % layout.SparseAlignment == 0 &&
+            layout.SetSize >= static_cast<std::int32_t>(sizeof(std::int32_t)) &&
+            layout.SetSize <= layout.SparseSlotStride &&
+            layout.ValueOffset >= 0 && layout.ValueOffset < layout.SetSize &&
+            layout.HashNextIdOffset >= 0 &&
+            layout.HashNextIdOffset <= layout.SetSize -
+                static_cast<std::int32_t>(sizeof(std::int32_t)) &&
+            layout.HashIndexOffset >= 0 &&
+            layout.HashIndexOffset <= layout.SetSize -
+                static_cast<std::int32_t>(sizeof(std::int32_t));
+        return metadata;
+    }
+#endif
 
     struct ShadowSchemaSummary
     {
@@ -914,6 +1001,21 @@ namespace
                         static_cast<unsigned long long>(summary.unsupported),
                         static_cast<unsigned long long>(summary.maxDepth));
 #endif
+                    LOG_WARN(
+                        "PersistentIdFix: reflection step28 parent identity: "
+                        "depth=%u storeReady=%u exactStore=%u mapOffset16=%u "
+                        "mapStorage80=%u playerReady=%u playerExact=%u "
+                        "playerOffset=%d",
+                        depth,
+                        g_step28Store != nullptr ? 1u : 0u,
+                        g_step28Store != nullptr &&
+                            descriptor == g_step28Store ? 1u : 0u,
+                        property->Offset == 0x10 ? 1u : 0u,
+                        property->ElementSize == 0x50 ? 1u : 0u,
+                        g_reflectionTestPlayerDescriptor != nullptr ? 1u : 0u,
+                        g_reflectionTestPlayerDescriptor != nullptr &&
+                            descriptor == g_reflectionTestPlayerDescriptor ? 1u : 0u,
+                        property->Offset);
                     return false;
                 }
             }
@@ -1401,6 +1503,32 @@ namespace
         // Read-only metadata only: no map storage access or entry traversal.
         if (HasCastFlag(property, EClassCastFlags::MapProperty))
         {
+            const auto nativeMetadata = ReadShadowNativeMapMetadata(property);
+            const auto& nativeLayout = nativeMetadata.Layout;
+            LOG_WARN(
+                "PersistentIdFix: reflection native map metadata: "
+                "property=%p descriptorReadable=%u nativeDescriptorSize=%llu "
+                "valueOffset=%d hashNextIdOffset=%d hashIndexOffset=%d "
+                "setSize=%d sparseAlignment=%d sparseSlotStride=%d "
+                "allocatorFlags=0x%02X flagsKnown=%u allocatorSupported=%u "
+                "layoutValid=%u metadataValid=%u",
+                static_cast<const void*>(property),
+                nativeMetadata.DescriptorReadable ? 1u : 0u,
+                static_cast<unsigned long long>(kShadowNativeMapDescriptorSize),
+                nativeLayout.ValueOffset,
+                nativeLayout.HashNextIdOffset,
+                nativeLayout.HashIndexOffset,
+                nativeLayout.SetSize,
+                nativeLayout.SparseAlignment,
+                nativeLayout.SparseSlotStride,
+                static_cast<unsigned int>(nativeMetadata.AllocatorFlags),
+                nativeMetadata.FlagsKnown ? 1u : 0u,
+                nativeMetadata.AllocatorSupported ? 1u : 0u,
+                nativeMetadata.LayoutValid ? 1u : 0u,
+                nativeMetadata.DescriptorReadable &&
+                    nativeMetadata.FlagsKnown &&
+                    nativeMetadata.AllocatorSupported &&
+                    nativeMetadata.LayoutValid ? 1u : 0u);
             const bool mapReadable =
                 IsReadableRange(property, sizeof(FMapProperty));
             const auto* mapProperty = mapReadable
@@ -1477,6 +1605,17 @@ namespace
                 valueDescriptorReadable ? valueDescriptor->Size : -1,
                 valueDescriptorReadable &&
                     valueDescriptor == persistentIdDescriptor ? 1u : 0u);
+            LOG_WARN(
+                "PersistentIdFix: reflection step28 map identity: "
+                "property=%p keyReady=%u keyExactItemId=%u "
+                "valueReady=%u valueExactJson=%u",
+                static_cast<const void*>(property),
+                g_step28ItemId != nullptr ? 1u : 0u,
+                keyDescriptorReadable && g_step28ItemId != nullptr &&
+                    keyDescriptor == g_step28ItemId ? 1u : 0u,
+                g_step28Json != nullptr ? 1u : 0u,
+                valueDescriptorReadable && g_step28Json != nullptr &&
+                    valueDescriptor == g_step28Json ? 1u : 0u);
             // Metadata-only bounded child-property inspection. No map data reads.
             const UStruct* mapDescriptors[2] = {
                 keyDescriptorReadable ? keyDescriptor : nullptr,
@@ -1543,6 +1682,92 @@ namespace
                                 nestedDescriptor == persistentIdDescriptor ? 1u : 0u,
                             descriptorReadable &&
                                 nestedDescriptor->ChildProperties != nullptr ? 1u : 0u);
+                    }
+                    // Patch 23: descriptor-only inspection of the nested
+                    // map-key structure (side 0), limited to eight children.
+                    // Do not read map storage or dereference object values.
+                    if (side == 0u && propertyReadable &&
+                        HasCastFlag(nested, EClassCastFlags::StructProperty) &&
+                        IsReadableRange(nested, sizeof(FStructProperty)))
+                    {
+                        const UStruct* innerDescriptor =
+                            static_cast<const FStructProperty*>(nested)->Struct;
+                        if (innerDescriptor != nullptr &&
+                            IsReadableRange(innerDescriptor, sizeof(UStruct)) &&
+                            innerDescriptor->Size > 0)
+                        {
+                            LOG_WARN(
+                                "PersistentIdFix: reflection step28 nested identity: "
+                                "keyReady=%u keyExactItemId=%u guidReady=%u "
+                                "nestedOffset=%d nestedSize=%d nestedArrayDim=%d "
+                                "nestedExactGuid=%u",
+                                g_step28ItemId != nullptr ? 1u : 0u,
+                                keyDescriptorReadable && g_step28ItemId != nullptr &&
+                                    keyDescriptor == g_step28ItemId ? 1u : 0u,
+                                g_step28Guid != nullptr ? 1u : 0u,
+                                nested->Offset, nested->ElementSize, nested->ArrayDim,
+                                g_step28Guid != nullptr &&
+                                    innerDescriptor == g_step28Guid ? 1u : 0u);
+                            const FField* inner = innerDescriptor->ChildProperties;
+                            unsigned int innerIndex = 0u;
+                            while (inner != nullptr && innerIndex < 8u)
+                            {
+                                if (!IsReadableRange(inner, sizeof(FField)))
+                                {
+                                    LOG_WARN(
+                                        "PersistentIdFix: reflection map nested key field unreadable: "
+                                        "index=%u", innerIndex);
+                                    break;
+                                }
+                                const bool innerIsProperty =
+                                    HasCastFlag(inner, EClassCastFlags::Property);
+                                const FProperty* innerProperty = innerIsProperty
+                                    ? reinterpret_cast<const FProperty*>(inner)
+                                    : nullptr;
+                                const bool innerReadable =
+                                    innerProperty != nullptr &&
+                                    IsReadableRange(innerProperty, sizeof(FProperty));
+                                const bool classReadable =
+                                    inner->ClassPrivate != nullptr &&
+                                    IsReadableRange(inner->ClassPrivate, sizeof(FFieldClass));
+                                const unsigned long long innerFlags = classReadable
+                                    ? static_cast<unsigned long long>(
+                                        inner->ClassPrivate->CastFlags)
+                                    : 0ULL;
+                                LOG_WARN(
+                                    "PersistentIdFix: reflection map nested key property: "
+                                    "index=%u readable=%u offset=%d size=%d "
+                                    "arrayDim=%d flags=0x%llX integral=%u "
+                                    "struct=%u array=%u exactPidStruct=%u",
+                                    innerIndex,
+                                    innerReadable ? 1u : 0u,
+                                    innerReadable ? innerProperty->Offset : -1,
+                                    innerReadable ? innerProperty->ElementSize : -1,
+                                    innerReadable ? innerProperty->ArrayDim : -1,
+                                    innerFlags,
+                                    innerReadable &&
+                                        IsSupportedIntegralProperty(innerProperty) ? 1u : 0u,
+                                    innerReadable &&
+                                        HasCastFlag(innerProperty, EClassCastFlags::StructProperty) ? 1u : 0u,
+                                    innerReadable &&
+                                        HasCastFlag(innerProperty, EClassCastFlags::ArrayProperty) ? 1u : 0u,
+                                    innerReadable &&
+                                        HasCastFlag(innerProperty, EClassCastFlags::StructProperty) &&
+                                        IsReadableRange(innerProperty, sizeof(FStructProperty)) &&
+                                        static_cast<const FStructProperty*>(innerProperty)->Struct ==
+                                            persistentIdDescriptor ? 1u : 0u);
+
+                                if (!innerReadable)
+                                    break;
+                                inner = inner->Next;
+                                ++innerIndex;
+                            }
+                            LOG_WARN(
+                                "PersistentIdFix: reflection map nested key scan: "
+                                "inspected=%u remaining=%u descriptorSize=%d",
+                                innerIndex, inner != nullptr ? 1u : 0u,
+                                innerDescriptor->Size);
+                        }
                     }
                     if (!fieldReadable || !propertyReadable)
                         break;
@@ -2208,6 +2433,10 @@ namespace PersistentIdFixIndependentSourceCollector
         g_reflectionTestPersistentIdDescriptor = nullptr;
         g_reflectionTestMapMenuDescriptor = nullptr;
         g_reflectionTestPlayerDescriptor = nullptr;
+        g_step28Store = nullptr;
+        g_step28ItemId = nullptr;
+        g_step28Guid = nullptr;
+        g_step28Json = nullptr;
 #endif
 
         if (engineEvents == nullptr ||
@@ -2293,6 +2522,33 @@ namespace PersistentIdFixIndependentSourceCollector
             resolveTestDescriptor(
                 L"/Script/Chimera.CrCharacterPlayerBaseSaveDataPerPlayer");
 
+        // Diagnostic-only lookups; missing or invalid descriptors remain unavailable.
+        const auto resolveStep28 = [&](const wchar_t* path, int expectedSize)
+            -> const UScriptStruct*
+        {
+            const UScriptStruct* result = resolveTestDescriptor(path);
+            if (result == nullptr ||
+                !IsReadableRange(result, sizeof(UScriptStruct)) ||
+                result->Size != expectedSize)
+                return nullptr;
+            return result;
+        };
+        g_step28Store = resolveStep28(
+            L"/Script/AuItems.AuItemsStoreComponentState", 0xC0);
+        g_step28ItemId = resolveStep28(
+            L"/Script/AuItems.AuItemId", 0x10);
+        g_step28Guid = resolveStep28(
+            L"/Script/CoreUObject.Guid", 0x10);
+        g_step28Json = resolveStep28(
+            L"/Script/JsonUtilities.JsonObjectWrapper", 0x20);
+        LOG_WARN(
+            "PersistentIdFix: reflection step28 descriptor identity: "
+            "storeReady=%u itemIdReady=%u guidReady=%u jsonReady=%u",
+            g_step28Store != nullptr ? 1u : 0u,
+            g_step28ItemId != nullptr ? 1u : 0u,
+            g_step28Guid != nullptr ? 1u : 0u,
+            g_step28Json != nullptr ? 1u : 0u);
+
         LOG_INFO(
             "PersistentIdFix: reflection test mode descriptor lookup: "
             "persistentId=%p mapMenu=%p player=%p",
@@ -2324,6 +2580,10 @@ namespace PersistentIdFixIndependentSourceCollector
         g_reflectionTestPersistentIdDescriptor = nullptr;
         g_reflectionTestMapMenuDescriptor = nullptr;
         g_reflectionTestPlayerDescriptor = nullptr;
+        g_step28Store = nullptr;
+        g_step28ItemId = nullptr;
+        g_step28Guid = nullptr;
+        g_step28Json = nullptr;
 #endif
     }
 
