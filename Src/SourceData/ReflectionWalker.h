@@ -122,6 +122,29 @@ namespace PersistentIdFixReflectionWalker
         bool AllValidated = false;
     };
 
+    // Caller-owned diagnostic storage, valid only during synchronous traversal.
+    // Every exact occurrence is counted, including zero and the invalid sentinel.
+    // Overflow affects observation completeness only, never traversal policy.
+    struct ShadowExactPidSink
+    {
+        std::uint32_t* Values = nullptr;
+        std::size_t Capacity = 0;
+        std::size_t Count = 0;
+        std::uint64_t Observed = 0;
+        bool Overflow = false;
+
+        void Observe(std::uint32_t value) noexcept
+        {
+            ++Observed;
+            if (Values == nullptr || Count >= Capacity)
+            {
+                Overflow = true;
+                return;
+            }
+            Values[Count++] = value;
+        }
+    };
+
     // Optional synchronous, observational sinks. No traversal budgets are exposed.
     struct ShadowDiagnosticSink
     {
@@ -164,6 +187,7 @@ namespace PersistentIdFixReflectionWalker
         // Distinct cumulative resource limits: complete structural preflight
         // and actual recursive traversal each charge a slot/entry once.
         const ShadowDiagnosticSink* Diagnostics = nullptr;
+        ShadowExactPidSink* ExactPidSink = nullptr;
         ShadowMapSlotBudget MapPrevalidationBudget;
         ShadowMapSlotBudget MapSlotBudget;
         // Optional caller-supplied opaque-boundary policy; never a prerequisite

@@ -2,7 +2,11 @@
 
 #include "ReflectionWalker.h"
 
-namespace SDK { struct FCrCharacterPlayerBaseSaveDataPerPlayer; }
+namespace SDK
+{
+    struct FCrCharacterPlayerBaseSaveDataPerPlayer;
+    struct FCrAntennaSaveData;
+}
 namespace PersistentIdFixReflectionDiagnostics
 {
     using ShadowSchemaSummary = PersistentIdFixReflectionWalker::ShadowSchemaSummary;
@@ -13,6 +17,7 @@ namespace PersistentIdFixReflectionDiagnostics
     using Resolver = SDK::UObject* (*)(SDK::UClass*, SDK::UObject*, const wchar_t*, bool);
     void InitializeDescriptorRegistry(Resolver findSafe, SDK::UClass* scriptStructClass);
     void ResetDescriptorRegistry();
+    void RunAntennaMapValueTest(const SDK::UScriptStruct*, const SDK::FCrAntennaSaveData&) noexcept;
     void RunForcedReflectionShapeTests();
     void RunForcedReflectionValueTests(const SDK::FCrCharacterPlayerBaseSaveDataPerPlayer&);
 #endif

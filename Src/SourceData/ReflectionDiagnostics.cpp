@@ -3,6 +3,9 @@
 #include "plugin.h"
 #include "plugin_helpers.h"
 #include "SDK/Chimera_structs.hpp"
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -53,6 +56,7 @@ namespace
     const UScriptStruct* g_reflectionTestPersistentIdDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestMapMenuDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestPlayerDescriptor = nullptr;
+    const UScriptStruct* g_reflectionTestAntennaDescriptor = nullptr;
     // Patch 28: diagnostic-only canonical identities; never used for PID certification.
     const UScriptStruct* g_step28Store = nullptr;
     const UScriptStruct* g_step28ItemId = nullptr;
@@ -914,6 +918,203 @@ namespace
             static_cast<unsigned long long>(arraySummary.maxDepth));
     }
 
+    namespace
+    {
+        constexpr std::size_t kAntennaObservationCapacity = 4096;
+        constexpr std::int32_t kAntennaOracleMaxSlots = 65536;
+
+        // Independent typed SDK path: no native reflection map helper, bitmap
+        // decoder or slot-address validator is used to construct the oracle.
+        bool CollectAntennaOracle(const FCrAntennaSaveData& data,
+            ShadowExactPidSink& oracle, const char*& reason)
+        {
+            const auto& values = data.Antennas;
+            if (!IsReadableRange(&values, sizeof(values)))
+            {
+                reason = "oracle-header-unreadable";
+                return false;
+            }
+            const auto live = values.Num();
+            const auto allocated = values.NumAllocated();
+            const auto capacity = values.Max();
+            const auto& flags = values.GetAllocationFlags();
+            if (live < 0 || allocated < 0 || capacity < 0 || live > allocated ||
+                allocated > capacity || allocated > kAntennaOracleMaxSlots ||
+                static_cast<std::size_t>(live) > oracle.Capacity ||
+                flags.Num() != allocated || flags.Max() < flags.Num())
+            {
+                reason = "oracle-count-or-capacity-invalid";
+                return false;
+            }
+            if (allocated == 0)
+                return live == 0;
+            const auto words = (static_cast<std::size_t>(allocated) + 31u) / 32u;
+            if (!values.IsValid() || !IsReadableRange(flags.GetData(),
+                    words * sizeof(std::uint32_t)))
+            {
+                reason = "oracle-bitmap-unreadable";
+                return false;
+            }
+            struct SparseDataHeader
+            {
+                const void* Data;
+                std::int32_t Num;
+                std::int32_t Max;
+            };
+            static_assert(sizeof(SparseDataHeader) == 0x10);
+            SparseDataHeader sparse{};
+            std::memcpy(&sparse, &values, sizeof(sparse));
+            using Map = TMap<FCrMassPersistentEntityID, FCrAntennaParams>;
+            using Slot = UC::ContainerImpl::SetElement<Map::ElementType>;
+            if (sparse.Num != allocated || sparse.Max != capacity ||
+                sparse.Data == nullptr ||
+                reinterpret_cast<std::uintptr_t>(sparse.Data) % alignof(Slot) != 0 ||
+                static_cast<std::size_t>(allocated) >
+                    (std::numeric_limits<std::size_t>::max)() / sizeof(Slot) ||
+                !IsReadableRange(sparse.Data,
+                    static_cast<std::size_t>(allocated) * sizeof(Slot)))
+            {
+                reason = "oracle-slots-unreadable-or-invalid";
+                return false;
+            }
+            std::int32_t visited = 0;
+            for (auto it = begin(values); it != end(values); ++it)
+            {
+                if (++visited > live || oracle.Count >= oracle.Capacity)
+                {
+                    reason = "oracle-iteration-bound-exceeded";
+                    return false;
+                }
+                oracle.Observe(it->Key().ID);
+            }
+            if (visited != live || oracle.Overflow ||
+                values.Num() != live || values.NumAllocated() != allocated ||
+                values.Max() != capacity)
+            {
+                reason = "oracle-incomplete-or-header-changed";
+                return false;
+            }
+            return true;
+        }
+    }
+
+    void RunAntennaMapValueTest(const UScriptStruct* suppliedDescriptor,
+        const FCrAntennaSaveData& data) noexcept
+    {
+        // A diagnostic exception must never change the successful static read.
+        try
+        {
+            std::array<std::uint32_t, kAntennaObservationCapacity> found{};
+            std::array<std::uint32_t, kAntennaObservationCapacity> expected{};
+            ShadowExactPidSink discoveries{found.data(), found.size()};
+            ShadowExactPidSink oracle{expected.data(), expected.size()};
+            const char* oracleReason = "none";
+            const bool oracleComplete = CollectAntennaOracle(data, oracle, oracleReason);
+            const bool descriptorReady = g_reflectionTestAntennaDescriptor != nullptr &&
+                suppliedDescriptor == g_reflectionTestAntennaDescriptor &&
+                IsReadableRange(g_reflectionTestAntennaDescriptor, sizeof(UStruct)) &&
+                g_reflectionTestAntennaDescriptor->Size == sizeof(data);
+            const auto* property = descriptorReady
+                ? FindShadowTestMapPropertyByOffset(g_reflectionTestAntennaDescriptor, 0)
+                : nullptr;
+            const bool exactKey = property != nullptr &&
+                HasCastFlag(property->KeyProperty, EClassCastFlags::StructProperty) &&
+                IsReadableRange(property->KeyProperty, sizeof(FStructProperty)) &&
+                g_reflectionTestPersistentIdDescriptor != nullptr &&
+                reinterpret_cast<const FStructProperty*>(property->KeyProperty)->Struct ==
+                    g_reflectionTestPersistentIdDescriptor;
+            auto summary = MakeShadowFixtureSummary();
+            summary.ExactPidSink = &discoveries;
+            LOG_INFO("PersistentIdFix: reflection antenna map test begin: "
+                "descriptorReady=%u mapFound=%u exactKey=%u oracleComplete=%u "
+                "oracleReason=%s capacity=%llu",
+                descriptorReady ? 1u : 0u, property != nullptr ? 1u : 0u,
+                exactKey ? 1u : 0u, oracleComplete ? 1u : 0u, oracleReason,
+                static_cast<unsigned long long>(found.size()));
+            const bool traversed = exactKey && TraverseShadowPropertyValue(
+                property, &data.Antennas, 0, g_reflectionTestPersistentIdDescriptor, summary);
+            const bool reflectedComplete = traversed && summary.complete;
+            const bool comparisonComplete = oracleComplete && reflectedComplete &&
+                !discoveries.Overflow && discoveries.Count == summary.exactPersistentIds &&
+                discoveries.Observed == summary.exactPersistentIds;
+            std::sort(found.begin(), found.begin() + discoveries.Count);
+            std::sort(expected.begin(), expected.begin() + oracle.Count);
+            std::size_t missing = 0, unexpected = 0, i = 0, j = 0;
+            constexpr std::size_t sampleLimit = 8;
+            std::array<std::uint32_t, sampleLimit> missingSample{}, unexpectedSample{};
+            // A sorted merge preserves multiplicity; no set/deduplication occurs.
+            while (i < oracle.Count || j < discoveries.Count)
+            {
+                if (i < oracle.Count && j < discoveries.Count && expected[i] == found[j])
+                {
+                    ++i;
+                    ++j;
+                }
+                else if (j == discoveries.Count ||
+                    (i < oracle.Count && expected[i] < found[j]))
+                {
+                    if (missing < sampleLimit)
+                        missingSample[missing] = expected[i];
+                    ++missing;
+                    ++i;
+                }
+                else
+                {
+                    if (unexpected < sampleLimit)
+                        unexpectedSample[unexpected] = found[j];
+                    ++unexpected;
+                    ++j;
+                }
+            }
+            const auto count = [](const auto& values, std::size_t n, std::uint32_t v)
+            {
+                return static_cast<unsigned long long>(
+                    std::count(values.begin(), values.begin() + n, v));
+            };
+            LOG_INFO("PersistentIdFix: reflection antenna map test: "
+                "oracleComplete=%u comparisonComplete=%u exactMatch=%u "
+                "expected=%llu observed=%llu stored=%llu overflow=%u "
+                "missing=%llu unexpected=%llu oracleZero=%llu discoveredZero=%llu "
+                "oracleSentinel=%llu discoveredSentinel=%llu "
+                "oracle283336=%llu discovered283336=%llu exactPid=%llu "
+                "integral=%llu opaque=%llu unsupported=%llu reflectedComplete=%u "
+                "semanticCertified=0 budgetFailures=%llu depthFailures=%llu "
+                "maxDepth=%llu reason=%s oracleReason=%s",
+                oracleComplete ? 1u : 0u, comparisonComplete ? 1u : 0u,
+                comparisonComplete && missing == 0 && unexpected == 0 ? 1u : 0u,
+                static_cast<unsigned long long>(oracle.Count),
+                static_cast<unsigned long long>(discoveries.Observed),
+                static_cast<unsigned long long>(discoveries.Count), discoveries.Overflow ? 1u : 0u,
+                static_cast<unsigned long long>(missing), static_cast<unsigned long long>(unexpected),
+                count(expected, oracle.Count, 0), count(found, discoveries.Count, 0),
+                count(expected, oracle.Count, UINT32_MAX), count(found, discoveries.Count, UINT32_MAX),
+                count(expected, oracle.Count, 283336), count(found, discoveries.Count, 283336),
+                static_cast<unsigned long long>(summary.exactPersistentIds),
+                static_cast<unsigned long long>(summary.integralValues),
+                static_cast<unsigned long long>(summary.opaqueBoundaries),
+                static_cast<unsigned long long>(summary.unsupported), reflectedComplete ? 1u : 0u,
+                static_cast<unsigned long long>(summary.budgetFailures),
+                static_cast<unsigned long long>(summary.depthFailures),
+                static_cast<unsigned long long>(summary.maxDepth),
+                exactKey ? summary.failureReason : "descriptor-or-key-unavailable", oracleReason);
+            for (std::size_t n = 0; n < (std::min)(missing, sampleLimit); ++n)
+                LOG_WARN("PersistentIdFix: reflection antenna mismatch sample: "
+                    "kind=missing pid=%u conclusive=%u", missingSample[n], comparisonComplete ? 1u : 0u);
+            for (std::size_t n = 0; n < (std::min)(unexpected, sampleLimit); ++n)
+                LOG_WARN("PersistentIdFix: reflection antenna mismatch sample: "
+                    "kind=unexpected pid=%u conclusive=%u", unexpectedSample[n], comparisonComplete ? 1u : 0u);
+        }
+        catch (...)
+        {
+            try
+            {
+                LOG_WARN("PersistentIdFix: reflection antenna map test: "
+                    "comparisonComplete=0 semanticCertified=0 reason=diagnostic-exception");
+            }
+            catch (...) {}
+        }
+    }
+
     void InitializeDescriptorRegistry(Resolver findSafe, UClass* scriptStructClass)
     {
         const auto resolveTestDescriptor =
@@ -950,6 +1151,8 @@ namespace
                 return nullptr;
             return result;
         };
+        g_reflectionTestAntennaDescriptor = resolveStep28(
+            L"/Script/Chimera.CrAntennaSaveData", sizeof(FCrAntennaSaveData));
         g_step28Store = resolveStep28(
             L"/Script/AuItems.AuItemsStoreComponentState", 0xC0);
         g_step28ItemId = resolveStep28(
@@ -982,6 +1185,7 @@ namespace
         g_reflectionTestPersistentIdDescriptor = nullptr;
         g_reflectionTestMapMenuDescriptor = nullptr;
         g_reflectionTestPlayerDescriptor = nullptr;
+        g_reflectionTestAntennaDescriptor = nullptr;
         g_step28Store = nullptr;
         g_step28ItemId = nullptr;
         g_step28Guid = nullptr;

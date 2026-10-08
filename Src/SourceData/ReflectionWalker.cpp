@@ -969,6 +969,10 @@ namespace PersistentIdFixReflectionWalker
                 *reinterpret_cast<const std::uint32_t*>(storage);
 
             ++summary.exactPersistentIds;
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+            if (summary.ExactPidSink != nullptr)
+                summary.ExactPidSink->Observe(value);
+#endif
             return RecordShadowCandidate(summary, value);
         }
 

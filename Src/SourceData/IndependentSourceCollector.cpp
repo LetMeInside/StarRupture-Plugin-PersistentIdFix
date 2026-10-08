@@ -594,7 +594,7 @@ namespace PersistentIdFixIndependentSourceCollector
         const UScriptStruct* structType,
         const FCrAntennaSaveData* data)
     {
-        return Observe(
+        const bool success = Observe(
             Section::AntennasData,
             structType,
             data,
@@ -608,6 +608,12 @@ namespace PersistentIdFixIndependentSourceCollector
                         return Emit(staged, pair.Key().ID);
                     });
             });
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        // Observational only: production collection has already succeeded.
+        if (success)
+            PersistentIdFixReflectionDiagnostics::RunAntennaMapValueTest(structType, *data);
+#endif
+        return success;
     }
 
     bool ObserveZiplineReplicator(
