@@ -839,6 +839,30 @@ namespace PersistentIdFixReflectionWalker
         return summary.budgetFailures == 0 && summary.depthFailures == 0;
     }
 
+    ShadowMapInspection InspectShadowMap(const FProperty* property,
+        const void* storage, ShadowMapSlotBudget& preflightBudget)
+    {
+        ShadowMapInspection result{};
+        if (property == nullptr || !IsReadableRange(property, sizeof(FProperty)) ||
+            !HasCastFlag(property, EClassCastFlags::MapProperty) ||
+            property->ArrayDim <= 0 || property->ElementSize != sizeof(ShadowHeapMapHeader))
+        {
+            result.FailureReason = "invalid-map-property";
+            return result;
+        }
+        result.Metadata = ReadShadowNativeMapMetadata(property);
+        result.Heap = ValidateShadowHeapMap(result.Metadata, storage, property->ElementSize,
+            &preflightBudget.RemainingBitmapWords);
+        const auto* map = reinterpret_cast<const FMapProperty*>(property);
+        const auto* key = result.Metadata.DescriptorReadable ? map->KeyProperty : nullptr;
+        const auto* value = result.Metadata.DescriptorReadable ? map->ValueProperty : nullptr;
+        result.Slots = ValidateShadowMapSlots(result.Metadata, result.Heap, storage,
+            key, value, preflightBudget);
+        result.StructuralValid = result.Slots.AllValidated;
+        result.FailureReason = result.Heap.Valid ? result.Slots.FailureReason : result.Heap.FailureReason;
+        return result;
+    }
+
     bool TraverseShadowMapValue(
         const FProperty* property, const void* storage, std::uint32_t depth,
         const UScriptStruct* persistentId, ShadowValueSummary& summary)
@@ -846,14 +870,13 @@ namespace PersistentIdFixReflectionWalker
         const bool log = summary.RemainingMapLogs != 0;
         if (log)
             --summary.RemainingMapLogs;
-        const auto metadata = ReadShadowNativeMapMetadata(property);
-        const auto heap = ValidateShadowHeapMap(metadata, storage, property->ElementSize,
-            &summary.MapPrevalidationBudget.RemainingBitmapWords);
+        const auto inspection = InspectShadowMap(property, storage, summary.MapPrevalidationBudget);
+        const auto& metadata = inspection.Metadata;
+        const auto& heap = inspection.Heap;
+        const auto& slots = inspection.Slots;
         const auto* map = reinterpret_cast<const FMapProperty*>(property);
         const auto* key = metadata.DescriptorReadable ? map->KeyProperty : nullptr;
         const auto* value = metadata.DescriptorReadable ? map->ValueProperty : nullptr;
-        const auto slots = ValidateShadowMapSlots(
-            metadata, heap, storage, key, value, summary.MapPrevalidationBudget);
         // No recursive visitor can run until every occupied slot has passed
         // structural prevalidation. Diagnostics only consume these snapshots.
         if (log)

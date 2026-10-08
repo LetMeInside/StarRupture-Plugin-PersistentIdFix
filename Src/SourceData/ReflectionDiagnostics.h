@@ -19,6 +19,7 @@ namespace PersistentIdFixReflectionDiagnostics
     void InitializeDescriptorRegistry(Resolver findSafe, SDK::UClass* scriptStructClass);
     void ResetDescriptorRegistry();
     void RunAntennaMapValueTest(const SDK::UScriptStruct*, const SDK::FCrAntennaSaveData&) noexcept;
+    void RunSparseMapCensus(const SDK::UScriptStruct*, const SDK::FCrMassSaveData&) noexcept;
     void RunStabilityRampMapValueTest(const SDK::UScriptStruct*, const SDK::FCrMassSaveData&) noexcept;
     void RunForcedReflectionShapeTests();
     void RunForcedReflectionValueTests(const SDK::FCrCharacterPlayerBaseSaveDataPerPlayer&);

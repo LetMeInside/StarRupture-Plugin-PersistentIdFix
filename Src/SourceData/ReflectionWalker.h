@@ -122,6 +122,19 @@ namespace PersistentIdFixReflectionWalker
         bool AllValidated = false;
     };
 
+    // Structural snapshots only; no recursive visitors or PID observations.
+    struct ShadowMapInspection
+    {
+        ShadowNativeMapMetadata Metadata;
+        ShadowHeapMapValidation Heap;
+        ShadowMapSlotValidation Slots;
+        const char* FailureReason = "not-inspected";
+        bool StructuralValid = false;
+    };
+
+    ShadowMapInspection InspectShadowMap(const FProperty* property,
+        const void* storage, ShadowMapSlotBudget& preflightBudget);
+
     // Caller-owned diagnostic storage, valid only during synchronous traversal.
     // Every exact occurrence is counted, including zero and the invalid sentinel.
     // Overflow affects observation completeness only, never traversal policy.

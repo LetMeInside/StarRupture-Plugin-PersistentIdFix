@@ -1745,6 +1745,7 @@ namespace PersistentIdFixMassFragmentClassifier
             // No diagnostic state or values carry across observations/generations.
             PersistentIdFixReflectionDiagnostics::RunStabilityRampMapValueTest(
                 structType, *massSaveData);
+            PersistentIdFixReflectionDiagnostics::RunSparseMapCensus(structType, *massSaveData);
         }
 #endif
 

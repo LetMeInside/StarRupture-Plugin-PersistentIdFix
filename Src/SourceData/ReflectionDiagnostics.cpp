@@ -60,6 +60,8 @@ namespace
     const UScriptStruct* g_reflectionTestMassDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestStabilityDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestPidArrayDescriptor = nullptr;
+    const UScriptStruct* g_sparseGraphDescriptor = nullptr;
+    const UScriptStruct* g_sparseNodeDescriptor = nullptr;
     // Patch 28: diagnostic-only canonical identities; never used for PID certification.
     const UScriptStruct* g_step28Store = nullptr;
     const UScriptStruct* g_step28ItemId = nullptr;
@@ -1258,6 +1260,108 @@ namespace
         }
     }
 
+    void RunSparseMapCensus(const UScriptStruct* suppliedDescriptor,
+        const FCrMassSaveData& data) noexcept
+    {
+        static_assert(offsetof(FCrMassSaveData, StabilitySubsystemState) == 0x50);
+        static_assert(offsetof(FCrBuildingStabilitySubsystemState, BuildingFoundationData) == 0x150);
+        static_assert(offsetof(FCrBuildingStabilitySubsystemState, GraphData) == 0);
+        static_assert(offsetof(FCrBuildingGraphData, NodeDatas) == 0x50);
+        // Local cumulative preflight work only. No recursive traversal or sinks.
+        ShadowMapSlotBudget budget{};
+        for (unsigned candidate = 0; candidate != 2; ++candidate)
+        {
+            const char* name = candidate == 0 ? "BuildingFoundationData" : "NodeDatas";
+            try
+            {
+                const bool rootReady = suppliedDescriptor == g_reflectionTestMassDescriptor &&
+                    RampDescriptorReady(g_reflectionTestMassDescriptor, sizeof(data), alignof(FCrMassSaveData)) &&
+                    RampDescriptorReady(g_reflectionTestStabilityDescriptor,
+                        sizeof(FCrBuildingStabilitySubsystemState), alignof(FCrBuildingStabilitySubsystemState)) &&
+                    RampDescriptorReady(g_reflectionTestPersistentIdDescriptor,
+                        sizeof(FCrMassPersistentEntityID), alignof(FCrMassPersistentEntityID)) &&
+                    IsReadableRange(&data, sizeof(data)) &&
+                    reinterpret_cast<std::uintptr_t>(&data) % alignof(FCrMassSaveData) == 0;
+                const bool descriptorReady = rootReady && (candidate == 0 ?
+                    RampDescriptorReady(g_reflectionTestPidArrayDescriptor,
+                        sizeof(FCrMassPersistentEntityIDArray), alignof(FCrMassPersistentEntityIDArray)) :
+                    (RampDescriptorReady(g_sparseGraphDescriptor,
+                        sizeof(FCrBuildingGraphData), alignof(FCrBuildingGraphData)) &&
+                     RampDescriptorReady(g_sparseNodeDescriptor,
+                        sizeof(FCrMassEntityStabilityData), alignof(FCrMassEntityStabilityData))));
+                const auto* stability = descriptorReady ? FindStructPropertyByOffset(
+                    suppliedDescriptor, offsetof(FCrMassSaveData, StabilitySubsystemState),
+                    g_reflectionTestStabilityDescriptor) : nullptr;
+                bool links = stability != nullptr && stability->ElementSize == sizeof(FCrBuildingStabilitySubsystemState);
+                if (links && candidate == 1)
+                {
+                    const auto* graph = FindStructPropertyByOffset(g_reflectionTestStabilityDescriptor,
+                        offsetof(FCrBuildingStabilitySubsystemState, GraphData), g_sparseGraphDescriptor);
+                    links = graph != nullptr && graph->ElementSize == sizeof(FCrBuildingGraphData);
+                }
+                const auto* map = links ? FindShadowTestMapPropertyByOffset(
+                    candidate == 0 ? g_reflectionTestStabilityDescriptor : g_sparseGraphDescriptor,
+                    candidate == 0 ? offsetof(FCrBuildingStabilitySubsystemState, BuildingFoundationData) :
+                        offsetof(FCrBuildingGraphData, NodeDatas)) : nullptr;
+                const bool mapFound = map != nullptr && IsReadableRange(map, kShadowNativeMapDescriptorSize);
+                bool schemaReady = mapFound &&
+                    RampStructPropertyMatches(map->KeyProperty, g_reflectionTestPersistentIdDescriptor,
+                        sizeof(FCrMassPersistentEntityID)) &&
+                    RampStructPropertyMatches(map->ValueProperty,
+                        candidate == 0 ? g_reflectionTestPidArrayDescriptor : g_sparseNodeDescriptor,
+                        candidate == 0 ? sizeof(FCrMassPersistentEntityIDArray) : sizeof(FCrMassEntityStabilityData));
+                if (schemaReady && candidate == 0)
+                {
+                    const auto* values = FindRampValuesProperty(g_reflectionTestPidArrayDescriptor);
+                    schemaReady = values != nullptr && RampStructPropertyMatches(values->InnerProperty,
+                        g_reflectionTestPersistentIdDescriptor, sizeof(FCrMassPersistentEntityID));
+                }
+                ShadowMapInspection inspection{};
+                if (schemaReady)
+                {
+                    const void* storage = candidate == 0 ?
+                        static_cast<const void*>(&data.StabilitySubsystemState.BuildingFoundationData) :
+                        static_cast<const void*>(&data.StabilitySubsystemState.GraphData.NodeDatas);
+                    inspection = InspectShadowMap(map, storage, budget);
+                }
+                const auto& heap = inspection.Heap;
+                const auto& header = heap.Header;
+                const auto freeBits = heap.BitmapValid ?
+                    static_cast<std::uint64_t>(header.NumBits) - heap.OccupiedBits : 0;
+                const bool holes = inspection.StructuralValid && heap.LiveEntries > 0 &&
+                    header.NumFreeIndices > 0 && heap.OccupiedBits == heap.LiveEntries &&
+                    freeBits == header.NumFreeIndices;
+                const char* reason = !descriptorReady ? "descriptor-unavailable" :
+                    !links ? "containing-link-mismatch" : !mapFound ? "map-not-found" :
+                    !schemaReady ? "key-value-schema-mismatch" : !inspection.StructuralValid ?
+                    inspection.FailureReason : heap.LiveEntries == 0 ? "empty-map" :
+                    holes ? "populated-with-free-slots" : "no-free-slots";
+                LOG_INFO("PersistentIdFix: reflection sparse map census: "
+                    "candidate=%s descriptorReady=%u mapFound=%u allocatorSupported=%u "
+                    "structuralValid=%u headerValid=%u bitmapValid=%u slotScanComplete=%u "
+                    "arrayNum=%d arrayMax=%d numFreeIndices=%d firstFreeIndex=%d "
+                    "liveEntries=%d numBits=%d maxBits=%d bitmapMode=%s "
+                    "occupiedBits=%llu bitmapFreeBits=%llu freeListHeadChecked=%u "
+                    "freeListChecked=0 holeFixtureSatisfied=%u semanticCertified=0 reason=%s",
+                    name, descriptorReady ? 1u : 0u, mapFound ? 1u : 0u,
+                    inspection.Metadata.AllocatorSupported ? 1u : 0u,
+                    inspection.StructuralValid ? 1u : 0u, heap.HeaderValid ? 1u : 0u,
+                    heap.BitmapValid ? 1u : 0u, inspection.Slots.AllValidated ? 1u : 0u,
+                    header.ArrayNum, header.ArrayMax, header.NumFreeIndices, header.FirstFreeIndex,
+                    heap.LiveEntries, header.NumBits, header.MaxBits, heap.BitmapMode,
+                    static_cast<unsigned long long>(heap.OccupiedBits),
+                    static_cast<unsigned long long>(freeBits), heap.BitmapValid ? 1u : 0u,
+                    holes ? 1u : 0u, reason);
+            }
+            catch (...)
+            {
+                LOG_WARN("PersistentIdFix: reflection sparse map census: "
+                    "candidate=%s structuralValid=0 freeListChecked=0 "
+                    "holeFixtureSatisfied=0 semanticCertified=0 reason=diagnostic-exception", name);
+            }
+        }
+    }
+
     void RunStabilityRampMapValueTest(const UScriptStruct* suppliedDescriptor,
         const FCrMassSaveData& data) noexcept
     {
@@ -1446,6 +1550,10 @@ namespace
         g_reflectionTestPidArrayDescriptor = resolveStep28(
             L"/Script/ChimeraMassCommon.CrMassPersistentEntityIDArray",
             sizeof(FCrMassPersistentEntityIDArray));
+        g_sparseGraphDescriptor = resolveStep28(
+            L"/Script/Chimera.CrBuildingGraphData", sizeof(FCrBuildingGraphData));
+        g_sparseNodeDescriptor = resolveStep28(
+            L"/Script/Chimera.CrMassEntityStabilityData", sizeof(FCrMassEntityStabilityData));
         g_reflectionTestAntennaDescriptor = resolveStep28(
             L"/Script/Chimera.CrAntennaSaveData", sizeof(FCrAntennaSaveData));
         g_step28Store = resolveStep28(
@@ -1484,6 +1592,8 @@ namespace
         g_reflectionTestMassDescriptor = nullptr;
         g_reflectionTestStabilityDescriptor = nullptr;
         g_reflectionTestPidArrayDescriptor = nullptr;
+        g_sparseGraphDescriptor = nullptr;
+        g_sparseNodeDescriptor = nullptr;
         g_step28Store = nullptr;
         g_step28ItemId = nullptr;
         g_step28Guid = nullptr;
