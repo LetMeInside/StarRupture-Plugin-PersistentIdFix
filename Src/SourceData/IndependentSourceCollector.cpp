@@ -85,6 +85,7 @@ namespace
 #if PERSISTENTIDFIX_REFLECTION_TEST_MODE
     const UScriptStruct* g_reflectionTestPersistentIdDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestMapMenuDescriptor = nullptr;
+    const UScriptStruct* g_reflectionTestPlayerDescriptor = nullptr;
 #endif
 
     std::atomic<std::uint64_t> g_gameStatePlayers{0};
@@ -651,6 +652,655 @@ namespace
             summary);
     }
 
+    constexpr std::uint64_t kShadowMaxArrayElements = 1000000;
+    constexpr std::uint64_t kShadowMaxValues = 2000000;
+
+    struct ShadowValueSummary
+    {
+        bool complete = true;
+        std::uint64_t exactPersistentIds = 0;
+        std::uint64_t integralValues = 0;
+        std::uint64_t candidateValues = 0;
+        std::uint64_t arrays = 0;
+        std::uint64_t arrayElements = 0;
+        std::uint64_t structs = 0;
+        std::uint64_t unsupported = 0;
+        std::uint64_t zeros = 0;
+        std::uint64_t invalidSentinels = 0;
+        std::uint64_t maxDepth = 0;
+        std::uint32_t firstCandidate = 0;
+        std::uint32_t lastCandidate = 0;
+    };
+
+    struct ShadowScriptArray
+    {
+        const std::uint8_t* Data;
+        std::int32_t Num;
+        std::int32_t Max;
+    };
+    static_assert(sizeof(ShadowScriptArray) == 0x10);
+
+    bool RecordShadowCandidate(
+        ShadowValueSummary& summary,
+        std::uint32_t value)
+    {
+        if (value == 0)
+        {
+            ++summary.zeros;
+            return true;
+        }
+
+        if (value == UINT32_MAX)
+        {
+            ++summary.invalidSentinels;
+            return true;
+        }
+
+        if (summary.candidateValues >= kShadowMaxValues)
+        {
+            summary.complete = false;
+            ++summary.unsupported;
+            return false;
+        }
+
+        if (summary.candidateValues == 0)
+            summary.firstCandidate = value;
+
+        summary.lastCandidate = value;
+        ++summary.candidateValues;
+        return true;
+    }
+
+    bool TraverseShadowPropertyValue(
+        const FProperty* property,
+        const void* valueStorage,
+        std::uint32_t depth,
+        const UScriptStruct* persistentIdDescriptor,
+        ShadowValueSummary& summary);
+
+    bool TraverseShadowStructValue(
+        const UStruct* descriptor,
+        const void* storage,
+        std::uint32_t depth,
+        const UScriptStruct* persistentIdDescriptor,
+        ShadowValueSummary& summary)
+    {
+        if (descriptor == nullptr ||
+            storage == nullptr ||
+            depth > kShadowMaxStructDepth ||
+            !IsReadableRange(descriptor, sizeof(UStruct)) ||
+            descriptor->Size <= 0 ||
+            !IsReadableRange(
+                storage,
+                static_cast<std::size_t>(descriptor->Size)))
+        {
+            summary.complete = false;
+            ++summary.unsupported;
+            return false;
+        }
+
+        if (depth > summary.maxDepth)
+            summary.maxDepth = depth;
+
+        if (persistentIdDescriptor != nullptr &&
+            descriptor == persistentIdDescriptor)
+        {
+            if (descriptor->Size < static_cast<std::int32_t>(
+                    sizeof(std::uint32_t)) ||
+                !IsReadableRange(storage, sizeof(std::uint32_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const std::uint32_t value =
+                *reinterpret_cast<const std::uint32_t*>(storage);
+
+            ++summary.exactPersistentIds;
+            return RecordShadowCandidate(summary, value);
+        }
+
+        if (descriptor->SuperStruct != nullptr)
+        {
+            // An inherited descriptor must fit within the storage
+            // advertised by the derived descriptor.
+            if (!IsReadableRange(descriptor->SuperStruct, sizeof(UStruct)) ||
+                descriptor->SuperStruct->Size <= 0 ||
+                descriptor->SuperStruct->Size > descriptor->Size)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            if (!TraverseShadowStructValue(
+                    descriptor->SuperStruct,
+                    storage,
+                    depth + 1u,
+                    persistentIdDescriptor,
+                    summary))
+            {
+                return false;
+            }
+        }
+
+        ++summary.structs;
+
+        const FField* field = descriptor->ChildProperties;
+        std::uint64_t chainGuard = 0;
+
+        while (field != nullptr)
+        {
+            if (++chainGuard > kShadowMaxProperties ||
+                !IsReadableRange(field, sizeof(FField)) ||
+                !HasCastFlag(field, EClassCastFlags::Property))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto* property =
+                reinterpret_cast<const FProperty*>(field);
+
+            if (!IsReadableRange(property, sizeof(FProperty)) ||
+                property->ArrayDim <= 0 ||
+                property->ElementSize <= 0 ||
+                property->Offset < 0)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const std::uint64_t offset =
+                static_cast<std::uint64_t>(property->Offset);
+            const std::uint64_t elementSize =
+                static_cast<std::uint64_t>(property->ElementSize);
+            const std::uint64_t arrayDim =
+                static_cast<std::uint64_t>(property->ArrayDim);
+
+            if (arrayDim >
+                    (std::numeric_limits<std::uint64_t>::max)() /
+                        elementSize)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const std::uint64_t byteCount =
+                elementSize * arrayDim;
+
+            if (offset >
+                    static_cast<std::uint64_t>(descriptor->Size) ||
+                byteCount >
+                    static_cast<std::uint64_t>(descriptor->Size) -
+                        offset)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            // A reflected nested struct must fit within this property's
+            // per-element storage, not merely within readable memory.
+            if (HasCastFlag(property, EClassCastFlags::StructProperty))
+            {
+                if (!IsReadableRange(property, sizeof(FStructProperty)))
+                {
+                    summary.complete = false;
+                    ++summary.unsupported;
+                    return false;
+                }
+
+                const auto* structProperty =
+                    static_cast<const FStructProperty*>(property);
+                if (structProperty->Struct == nullptr ||
+                    !IsReadableRange(
+                        structProperty->Struct,
+                        sizeof(UStruct)) ||
+                    structProperty->Struct->Size <= 0 ||
+                    static_cast<std::uint64_t>(
+                        structProperty->Struct->Size) > elementSize)
+                {
+                    summary.complete = false;
+                    ++summary.unsupported;
+                    return false;
+                }
+            }
+
+            const auto* propertyBase =
+                static_cast<const std::uint8_t*>(storage) +
+                property->Offset;
+
+            for (std::int32_t arrayIndex = 0;
+                arrayIndex < property->ArrayDim;
+                ++arrayIndex)
+            {
+                const auto* elementStorage =
+                    propertyBase +
+                    static_cast<std::size_t>(arrayIndex) *
+                        static_cast<std::size_t>(
+                            property->ElementSize);
+
+                if (!TraverseShadowPropertyValue(
+                        property,
+                        elementStorage,
+                        depth,
+                        persistentIdDescriptor,
+                        summary))
+                {
+                    return false;
+                }
+            }
+
+            field = field->Next;
+        }
+
+        return true;
+    }
+
+    bool ReadShadowIntegralValue(
+        const FProperty* property,
+        const void* storage,
+        ShadowValueSummary& summary)
+    {
+        if (property == nullptr || storage == nullptr) {
+            summary.complete = false;
+            ++summary.unsupported;
+            return false;
+        }
+
+        ++summary.integralValues;
+
+        if (HasCastFlag(property, EClassCastFlags::BoolProperty))
+            return true;
+
+        if (HasCastFlag(property, EClassCastFlags::Int8Property))
+        {
+            if (!IsReadableRange(storage, sizeof(std::int8_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto value =
+                *reinterpret_cast<const std::int8_t*>(storage);
+
+            if (value < 0)
+                return true;
+
+            return RecordShadowCandidate(
+                summary,
+                static_cast<std::uint32_t>(value));
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::ByteProperty))
+        {
+            if (!IsReadableRange(storage, sizeof(std::uint8_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return RecordShadowCandidate(
+                summary,
+                *reinterpret_cast<const std::uint8_t*>(storage));
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::Int16Property))
+        {
+            if (!IsReadableRange(storage, sizeof(std::int16_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto value =
+                *reinterpret_cast<const std::int16_t*>(storage);
+
+            if (value < 0)
+                return true;
+
+            return RecordShadowCandidate(
+                summary,
+                static_cast<std::uint32_t>(value));
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::UInt16Property))
+        {
+            if (!IsReadableRange(storage, sizeof(std::uint16_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return RecordShadowCandidate(
+                summary,
+                *reinterpret_cast<const std::uint16_t*>(storage));
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::IntProperty))
+        {
+            if (!IsReadableRange(storage, sizeof(std::int32_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto value =
+                *reinterpret_cast<const std::int32_t*>(storage);
+
+            if (value < 0)
+                return true;
+
+            return RecordShadowCandidate(
+                summary,
+                static_cast<std::uint32_t>(value));
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::UInt32Property))
+        {
+            if (!IsReadableRange(storage, sizeof(std::uint32_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return RecordShadowCandidate(
+                summary,
+                *reinterpret_cast<const std::uint32_t*>(storage));
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::Int64Property))
+        {
+            if (!IsReadableRange(storage, sizeof(std::int64_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const std::int64_t value =
+                *reinterpret_cast<const std::int64_t*>(storage);
+
+            if (value >= 0 &&
+                static_cast<std::uint64_t>(value) <= UINT32_MAX)
+            {
+                return RecordShadowCandidate(
+                    summary,
+                    static_cast<std::uint32_t>(value));
+            }
+
+            return true;
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::UInt64Property))
+        {
+            if (!IsReadableRange(storage, sizeof(std::uint64_t)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const std::uint64_t value =
+                *reinterpret_cast<const std::uint64_t*>(storage);
+
+            if (value <= UINT32_MAX)
+            {
+                return RecordShadowCandidate(
+                    summary,
+                    static_cast<std::uint32_t>(value));
+            }
+
+            return true;
+        }
+
+        summary.complete = false;
+        ++summary.unsupported;
+        return false;
+    }
+
+    bool TraverseShadowPropertyValue(
+        const FProperty* property,
+        const void* valueStorage,
+        std::uint32_t depth,
+        const UScriptStruct* persistentIdDescriptor,
+        ShadowValueSummary& summary)
+    {
+        if (property == nullptr ||
+            valueStorage == nullptr ||
+            depth > kShadowMaxStructDepth ||
+            !IsReadableRange(property, sizeof(FProperty)))
+        {
+            summary.complete = false;
+            ++summary.unsupported;
+            return false;
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::ArrayProperty))
+        {
+            if (!IsReadableRange(property, sizeof(FArrayProperty)) ||
+                !IsReadableRange(valueStorage, sizeof(ShadowScriptArray)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto* arrayProperty =
+                static_cast<const FArrayProperty*>(property);
+
+            if (arrayProperty->InnerProperty == nullptr ||
+                !IsReadableRange(
+                    arrayProperty->InnerProperty,
+                    sizeof(FProperty)) ||
+                arrayProperty->InnerProperty->ElementSize <= 0)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto& array =
+                *reinterpret_cast<const ShadowScriptArray*>(valueStorage);
+
+            if (array.Num < 0 ||
+                array.Max < 0 ||
+                array.Num > array.Max ||
+                static_cast<std::uint64_t>(array.Num) >
+                    kShadowMaxArrayElements)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            ++summary.arrays;
+
+            if (array.Num == 0)
+                return true;
+
+            if (array.Data == nullptr)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const std::size_t stride =
+                static_cast<std::size_t>(
+                    arrayProperty->InnerProperty->ElementSize);
+            const std::size_t count =
+                static_cast<std::size_t>(array.Num);
+
+            // Readable neighboring elements cannot make a primitive read
+            // valid when the reflected element stride is too small.
+            const FProperty* innerProperty =
+                arrayProperty->InnerProperty;
+            std::size_t minimumIntegralBytes = 0;
+            if (HasCastFlag(innerProperty, EClassCastFlags::Int8Property) ||
+                HasCastFlag(innerProperty, EClassCastFlags::ByteProperty))
+                minimumIntegralBytes = sizeof(std::uint8_t);
+            else if (HasCastFlag(innerProperty, EClassCastFlags::Int16Property) ||
+                HasCastFlag(innerProperty, EClassCastFlags::UInt16Property))
+                minimumIntegralBytes = sizeof(std::uint16_t);
+            else if (HasCastFlag(innerProperty, EClassCastFlags::IntProperty) ||
+                HasCastFlag(innerProperty, EClassCastFlags::UInt32Property))
+                minimumIntegralBytes = sizeof(std::uint32_t);
+            else if (HasCastFlag(innerProperty, EClassCastFlags::Int64Property) ||
+                HasCastFlag(innerProperty, EClassCastFlags::UInt64Property))
+                minimumIntegralBytes = sizeof(std::uint64_t);
+
+            if (minimumIntegralBytes != 0 &&
+                stride < minimumIntegralBytes)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            // A readable allocation alone does not prove that a nested
+            // reflected struct fits inside one array element.
+            if (HasCastFlag(
+                    arrayProperty->InnerProperty,
+                    EClassCastFlags::StructProperty))
+            {
+                const auto* innerStructProperty =
+                    reinterpret_cast<const FStructProperty*>(
+                        arrayProperty->InnerProperty);
+                if (!IsReadableRange(
+                        innerStructProperty,
+                        sizeof(FStructProperty)) ||
+                    innerStructProperty->Struct == nullptr ||
+                    !IsReadableRange(
+                        innerStructProperty->Struct,
+                        sizeof(UStruct)) ||
+                    innerStructProperty->Struct->Size <= 0 ||
+                    static_cast<std::size_t>(
+                        innerStructProperty->Struct->Size) > stride)
+                {
+                    summary.complete = false;
+                    ++summary.unsupported;
+                    return false;
+                }
+            }
+
+            if (count >
+                    (std::numeric_limits<std::size_t>::max)() / stride ||
+                !IsReadableRange(array.Data, count * stride))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            for (std::size_t index = 0; index < count; ++index)
+            {
+                if (summary.arrayElements >= kShadowMaxArrayElements)
+                {
+                    summary.complete = false;
+                    ++summary.unsupported;
+                    return false;
+                }
+
+                ++summary.arrayElements;
+
+                if (!TraverseShadowPropertyValue(
+                        arrayProperty->InnerProperty,
+                        array.Data + index * stride,
+                        depth + 1u,
+                        persistentIdDescriptor,
+                        summary))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::StructProperty))
+        {
+            if (!IsReadableRange(property, sizeof(FStructProperty)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto* structProperty =
+                static_cast<const FStructProperty*>(property);
+
+            if (structProperty->Struct == nullptr)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return TraverseShadowStructValue(
+                structProperty->Struct,
+                valueStorage,
+                depth + 1u,
+                persistentIdDescriptor,
+                summary);
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::EnumProperty))
+        {
+            if (!IsReadableRange(property, sizeof(FEnumProperty)))
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto* enumProperty =
+                static_cast<const FEnumProperty*>(property);
+
+            if (enumProperty->UnderlayingProperty == nullptr ||
+                !IsReadableRange(
+                    enumProperty->UnderlayingProperty,
+                    sizeof(FProperty)) ||
+                enumProperty->ElementSize <= 0 ||
+                enumProperty->UnderlayingProperty->ElementSize <= 0 ||
+                enumProperty->UnderlayingProperty->ElementSize >
+                    enumProperty->ElementSize)
+            {
+                summary.complete = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            return ReadShadowIntegralValue(
+                enumProperty->UnderlayingProperty,
+                valueStorage,
+                summary);
+        }
+
+        if (IsSupportedIntegralProperty(property))
+        {
+            return ReadShadowIntegralValue(
+                property,
+                valueStorage,
+                summary);
+        }
+
+        summary.complete = false;
+        ++summary.unsupported;
+        return false;
+    }
+
 #if PERSISTENTIDFIX_REFLECTION_TEST_MODE
     const FProperty* FindFirstIntegralArrayProperty(
         const UStruct* descriptor)
@@ -697,6 +1347,66 @@ namespace
                             arrayProperty->InnerProperty))
                     {
                         return property;
+                    }
+                }
+
+                field = field->Next;
+            }
+
+            current = current->SuperStruct;
+        }
+
+        return nullptr;
+    }
+
+    const FProperty* FindIntegralArrayPropertyByOffset(
+        const UStruct* descriptor,
+        std::int32_t offset)
+    {
+        const UStruct* current = descriptor;
+        std::uint32_t inheritanceGuard = 0;
+
+        while (current != nullptr)
+        {
+            if (++inheritanceGuard > kShadowMaxStructDepth ||
+                !IsReadableRange(current, sizeof(UStruct)))
+            {
+                return nullptr;
+            }
+
+            const FField* field = current->ChildProperties;
+            std::uint64_t chainGuard = 0;
+
+            while (field != nullptr)
+            {
+                if (++chainGuard > kShadowMaxProperties ||
+                    !IsReadableRange(field, sizeof(FField)))
+                {
+                    return nullptr;
+                }
+
+                if (HasCastFlag(field, EClassCastFlags::ArrayProperty))
+                {
+                    const auto* property =
+                        reinterpret_cast<const FProperty*>(field);
+
+                    if (!IsReadableRange(property, sizeof(FArrayProperty)))
+                        return nullptr;
+
+                    if (property->Offset == offset)
+                    {
+                        const auto* arrayProperty =
+                            static_cast<const FArrayProperty*>(property);
+
+                        if (arrayProperty->InnerProperty != nullptr &&
+                            IsReadableRange(
+                                arrayProperty->InnerProperty,
+                                sizeof(FProperty)) &&
+                            IsSupportedIntegralProperty(
+                                arrayProperty->InnerProperty))
+                        {
+                            return property;
+                        }
                     }
                 }
 
@@ -766,6 +1476,107 @@ namespace
             static_cast<unsigned long long>(arraySummary.structs),
             static_cast<unsigned long long>(arraySummary.integralLeaves),
             static_cast<unsigned long long>(arraySummary.enumLeaves),
+            static_cast<unsigned long long>(arraySummary.unsupported),
+            static_cast<unsigned long long>(arraySummary.maxDepth));
+    }
+
+    void RunForcedReflectionValueTests(
+        const FCrCharacterPlayerBaseSaveDataPerPlayer& player)
+    {
+        ShadowValueSummary pidSummary{};
+
+        const bool pidComplete =
+            g_reflectionTestPersistentIdDescriptor != nullptr &&
+            TraverseShadowStructValue(
+                g_reflectionTestPersistentIdDescriptor,
+                &player.FloorPersistentEntityID,
+                0,
+                g_reflectionTestPersistentIdDescriptor,
+                pidSummary);
+
+        LOG_INFO(
+            "PersistentIdFix: forced reflection value test: "
+            "target=FloorPersistentEntityID complete=%u "
+            "exactPid=%llu integral=%llu candidates=%llu "
+            "first=%u last=%u expected=%u zero=%llu sentinel=%llu "
+            "unsupported=%llu maxDepth=%llu",
+            pidComplete ? 1u : 0u,
+            static_cast<unsigned long long>(pidSummary.exactPersistentIds),
+            static_cast<unsigned long long>(pidSummary.integralValues),
+            static_cast<unsigned long long>(pidSummary.candidateValues),
+            pidSummary.firstCandidate,
+            pidSummary.lastCandidate,
+            player.FloorPersistentEntityID.ID,
+            static_cast<unsigned long long>(pidSummary.zeros),
+            static_cast<unsigned long long>(pidSummary.invalidSentinels),
+            static_cast<unsigned long long>(pidSummary.unsupported),
+            static_cast<unsigned long long>(pidSummary.maxDepth));
+
+        const auto playerBase =
+            reinterpret_cast<std::uintptr_t>(&player);
+        const auto arrayAddress =
+            reinterpret_cast<std::uintptr_t>(&player.DiscoveredBuildings);
+
+        bool offsetValid = arrayAddress >= playerBase;
+        const std::uint64_t offsetWide =
+            offsetValid
+                ? static_cast<std::uint64_t>(arrayAddress - playerBase)
+                : 0;
+
+        if (offsetWide >
+            static_cast<std::uint64_t>(
+                (std::numeric_limits<std::int32_t>::max)()))
+        {
+            offsetValid = false;
+        }
+
+        const FProperty* discoveredProperty =
+            offsetValid
+                ? FindIntegralArrayPropertyByOffset(
+                    g_reflectionTestPlayerDescriptor,
+                    static_cast<std::int32_t>(offsetWide))
+                : nullptr;
+
+        ShadowValueSummary arraySummary{};
+        bool arrayComplete = false;
+
+        if (discoveredProperty != nullptr)
+        {
+            const auto* arrayStorage =
+                reinterpret_cast<const std::uint8_t*>(&player) +
+                discoveredProperty->Offset;
+
+            arrayComplete =
+                TraverseShadowPropertyValue(
+                    discoveredProperty,
+                    arrayStorage,
+                    0,
+                    g_reflectionTestPersistentIdDescriptor,
+                    arraySummary);
+        }
+        else
+        {
+            arraySummary.complete = false;
+            ++arraySummary.unsupported;
+        }
+
+        LOG_INFO(
+            "PersistentIdFix: forced reflection value test: "
+            "target=DiscoveredBuildings propertyFound=%u complete=%u "
+            "typedNum=%d arrays=%llu elements=%llu integral=%llu "
+            "candidates=%llu first=%u last=%u zero=%llu sentinel=%llu "
+            "unsupported=%llu maxDepth=%llu",
+            discoveredProperty != nullptr ? 1u : 0u,
+            arrayComplete ? 1u : 0u,
+            player.DiscoveredBuildings.Num(),
+            static_cast<unsigned long long>(arraySummary.arrays),
+            static_cast<unsigned long long>(arraySummary.arrayElements),
+            static_cast<unsigned long long>(arraySummary.integralValues),
+            static_cast<unsigned long long>(arraySummary.candidateValues),
+            arraySummary.firstCandidate,
+            arraySummary.lastCandidate,
+            static_cast<unsigned long long>(arraySummary.zeros),
+            static_cast<unsigned long long>(arraySummary.invalidSentinels),
             static_cast<unsigned long long>(arraySummary.unsupported),
             static_cast<unsigned long long>(arraySummary.maxDepth));
     }
@@ -949,6 +1760,7 @@ namespace PersistentIdFixIndependentSourceCollector
 #if PERSISTENTIDFIX_REFLECTION_TEST_MODE
         g_reflectionTestPersistentIdDescriptor = nullptr;
         g_reflectionTestMapMenuDescriptor = nullptr;
+        g_reflectionTestPlayerDescriptor = nullptr;
 #endif
 
         if (engineEvents == nullptr ||
@@ -1030,11 +1842,19 @@ namespace PersistentIdFixIndependentSourceCollector
             resolveTestDescriptor(
                 L"/Script/Chimera.CrPlayersMapMenuState");
 
+        g_reflectionTestPlayerDescriptor =
+            resolveTestDescriptor(
+                L"/Script/Chimera.CrCharacterPlayerBaseSaveDataPerPlayer");
+
         LOG_INFO(
             "PersistentIdFix: reflection test mode descriptor lookup: "
-            "persistentId=%p mapMenu=%p",
-            static_cast<const void*>(g_reflectionTestPersistentIdDescriptor),
-            static_cast<const void*>(g_reflectionTestMapMenuDescriptor));
+            "persistentId=%p mapMenu=%p player=%p",
+            static_cast<const void*>(
+                g_reflectionTestPersistentIdDescriptor),
+            static_cast<const void*>(
+                g_reflectionTestMapMenuDescriptor),
+            static_cast<const void*>(
+                g_reflectionTestPlayerDescriptor));
 #endif
 
         g_registryReady = true;
@@ -1056,6 +1876,7 @@ namespace PersistentIdFixIndependentSourceCollector
 #if PERSISTENTIDFIX_REFLECTION_TEST_MODE
         g_reflectionTestPersistentIdDescriptor = nullptr;
         g_reflectionTestMapMenuDescriptor = nullptr;
+        g_reflectionTestPlayerDescriptor = nullptr;
 #endif
     }
 
@@ -1230,6 +2051,10 @@ namespace PersistentIdFixIndependentSourceCollector
                     {
                         const auto& player = pair.Value();
                         ++players;
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+                        RunForcedReflectionValueTests(player);
+#endif
 
                         if (!Emit(
                                 staged,
