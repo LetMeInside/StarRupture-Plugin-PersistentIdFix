@@ -20,6 +20,10 @@
 #include <limits>
 #include <vector>
 
+#ifndef MODLOADER_BUILD_TAG
+#define MODLOADER_BUILD_TAG "1.3.0"
+#endif
+
 IPluginSelf* g_self = nullptr;
 IPluginSelf* GetSelf() { return g_self; }
 
@@ -297,10 +301,6 @@ static void LogReadiness(
         coverage.coverageAttachedToCurrentGeneration ? 1u : 0u,
         authoritativeWorldReady ? 1u : 0u);
 }
-
-#ifndef MODLOADER_BUILD_TAG
-#define MODLOADER_BUILD_TAG "1.2.0"
-#endif
 
 #ifdef MODLOADER_SERVER_BUILD
 #define PERSISTENT_ID_FIX_TARGET PLUGIN_TARGET_SERVER
