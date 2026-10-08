@@ -223,7 +223,7 @@ namespace
             !IsReadableRange(function, sizeof(UFunction)) ||
             function->Class != functionClass || function->Outer != libraryClass ||
             function->Size != sizeof(NameConversionParams) ||
-            (function->FunctionFlags & 0x2400u) != 0x2400u ||
+            (static_cast<std::uint32_t>(function->FunctionFlags) & 0x2400u) != 0x2400u ||
             function->ExecFunction == nullptr)
             return false;
 
