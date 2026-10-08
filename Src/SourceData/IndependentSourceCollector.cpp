@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace
@@ -85,6 +86,14 @@ namespace
     std::atomic<std::uint64_t> g_gameStateDeviceEmpty{0};
     std::atomic<std::uint64_t> g_gameStateDeviceMalformed{0};
     std::atomic<std::uint64_t> g_gameStateDeviceUnknownPresent{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceShadowSupported{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceShadowUnsupported{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceShadowProperties{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceShadowArrays{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceShadowStructs{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceShadowIntegralLeaves{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceShadowEnumLeaves{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceShadowMaxDepth{0};
     std::atomic<std::uint64_t> g_gameStateOpaqueStoreEntries{0};
     std::atomic<std::uint64_t> g_gameStateDiscoveredBuildingValues{0};
 
@@ -336,6 +345,313 @@ namespace
         }
 
         return true;
+    }
+
+    constexpr std::uint32_t kShadowMaxStructDepth = 16;
+    constexpr std::uint64_t kShadowMaxProperties = 512;
+
+    struct ShadowSchemaSummary
+    {
+        bool supported = true;
+        std::uint64_t properties = 0;
+        std::uint64_t arrays = 0;
+        std::uint64_t structs = 0;
+        std::uint64_t integralLeaves = 0;
+        std::uint64_t enumLeaves = 0;
+        std::uint64_t unsupported = 0;
+        std::uint64_t maxDepth = 0;
+    };
+
+    bool HasCastFlag(
+        const FField* field,
+        EClassCastFlags flag)
+    {
+        if (field == nullptr ||
+            !IsReadableRange(field, sizeof(FField)) ||
+            field->ClassPrivate == nullptr ||
+            !IsReadableRange(
+                field->ClassPrivate,
+                sizeof(FFieldClass)))
+        {
+            return false;
+        }
+
+        return
+            (field->ClassPrivate->CastFlags &
+                static_cast<std::uint64_t>(flag)) != 0;
+    }
+
+    bool IsSupportedIntegralProperty(
+        const FProperty* property)
+    {
+        if (property == nullptr)
+            return false;
+
+        return
+            HasCastFlag(property, EClassCastFlags::Int8Property) ||
+            HasCastFlag(property, EClassCastFlags::ByteProperty) ||
+            HasCastFlag(property, EClassCastFlags::Int16Property) ||
+            HasCastFlag(property, EClassCastFlags::UInt16Property) ||
+            HasCastFlag(property, EClassCastFlags::IntProperty) ||
+            HasCastFlag(property, EClassCastFlags::UInt32Property) ||
+            HasCastFlag(property, EClassCastFlags::Int64Property) ||
+            HasCastFlag(property, EClassCastFlags::UInt64Property) ||
+            HasCastFlag(property, EClassCastFlags::BoolProperty);
+    }
+
+    bool AnalyzeShadowPropertyShape(
+        const FProperty* property,
+        std::uint32_t depth,
+        ShadowSchemaSummary& summary);
+
+    bool AnalyzeShadowStructShape(
+        const UStruct* descriptor,
+        std::uint32_t depth,
+        ShadowSchemaSummary& summary)
+    {
+        if (descriptor == nullptr ||
+            depth > kShadowMaxStructDepth ||
+            !IsReadableRange(descriptor, sizeof(UStruct)) ||
+            descriptor->Size <= 0)
+        {
+            summary.supported = false;
+            ++summary.unsupported;
+            return false;
+        }
+
+        if (depth > summary.maxDepth)
+            summary.maxDepth = depth;
+
+        if (descriptor->SuperStruct != nullptr)
+        {
+            if (!AnalyzeShadowStructShape(
+                    descriptor->SuperStruct,
+                    depth + 1u,
+                    summary))
+            {
+                return false;
+            }
+        }
+
+        const FField* field = descriptor->ChildProperties;
+        std::uint64_t chainGuard = 0;
+
+        while (field != nullptr)
+        {
+            if (++chainGuard > kShadowMaxProperties ||
+                summary.properties >= kShadowMaxProperties ||
+                !IsReadableRange(field, sizeof(FField)) ||
+                !HasCastFlag(field, EClassCastFlags::Property))
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto* property =
+                reinterpret_cast<const FProperty*>(field);
+
+            if (!IsReadableRange(property, sizeof(FProperty)) ||
+                property->ArrayDim <= 0 ||
+                property->ElementSize <= 0 ||
+                property->Offset < 0)
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const std::uint64_t offset =
+                static_cast<std::uint64_t>(property->Offset);
+            const std::uint64_t elementSize =
+                static_cast<std::uint64_t>(property->ElementSize);
+            const std::uint64_t arrayDim =
+                static_cast<std::uint64_t>(property->ArrayDim);
+
+            if (arrayDim >
+                    (std::numeric_limits<std::uint64_t>::max)() /
+                        elementSize)
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const std::uint64_t byteCount =
+                elementSize * arrayDim;
+
+            if (offset >
+                    static_cast<std::uint64_t>(descriptor->Size) ||
+                byteCount >
+                    static_cast<std::uint64_t>(descriptor->Size) -
+                        offset)
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            ++summary.properties;
+
+            if (!AnalyzeShadowPropertyShape(
+                    property,
+                    depth,
+                    summary))
+            {
+                return false;
+            }
+
+            field = field->Next;
+        }
+
+        return true;
+    }
+
+    bool AnalyzeShadowPropertyShape(
+        const FProperty* property,
+        std::uint32_t depth,
+        ShadowSchemaSummary& summary)
+    {
+        if (property == nullptr ||
+            depth > kShadowMaxStructDepth ||
+            !IsReadableRange(property, sizeof(FProperty)))
+        {
+            summary.supported = false;
+            ++summary.unsupported;
+            return false;
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::ArrayProperty))
+        {
+            if (!IsReadableRange(
+                    property,
+                    sizeof(FArrayProperty)))
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto* arrayProperty =
+                static_cast<const FArrayProperty*>(property);
+
+            if (arrayProperty->InnerProperty == nullptr)
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            ++summary.arrays;
+
+            return AnalyzeShadowPropertyShape(
+                arrayProperty->InnerProperty,
+                depth + 1u,
+                summary);
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::StructProperty))
+        {
+            if (!IsReadableRange(
+                    property,
+                    sizeof(FStructProperty)))
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto* structProperty =
+                static_cast<const FStructProperty*>(property);
+
+            if (structProperty->Struct == nullptr)
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            ++summary.structs;
+
+            return AnalyzeShadowStructShape(
+                structProperty->Struct,
+                depth + 1u,
+                summary);
+        }
+
+        if (HasCastFlag(property, EClassCastFlags::EnumProperty))
+        {
+            if (!IsReadableRange(
+                    property,
+                    sizeof(FEnumProperty)))
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            const auto* enumProperty =
+                static_cast<const FEnumProperty*>(property);
+
+            if (enumProperty->UnderlayingProperty == nullptr ||
+                !IsSupportedIntegralProperty(
+                    enumProperty->UnderlayingProperty))
+            {
+                summary.supported = false;
+                ++summary.unsupported;
+                return false;
+            }
+
+            ++summary.enumLeaves;
+            return true;
+        }
+
+        if (IsSupportedIntegralProperty(property))
+        {
+            ++summary.integralLeaves;
+            return true;
+        }
+
+        summary.supported = false;
+        ++summary.unsupported;
+        return false;
+    }
+
+    bool AnalyzeShadowPayload(
+        const FInstancedStruct& payload,
+        ShadowSchemaSummary& summary,
+        std::string& descriptorName)
+    {
+        if (payload.ScriptStruct == nullptr ||
+            payload.StructMemory == nullptr ||
+            !IsReadableRange(
+                payload.ScriptStruct,
+                sizeof(UScriptStruct)) ||
+            payload.ScriptStruct->Size <= 0 ||
+            !IsReadableRange(
+                payload.StructMemory,
+                static_cast<std::size_t>(
+                    payload.ScriptStruct->Size)))
+        {
+            summary.supported = false;
+            ++summary.unsupported;
+            return false;
+        }
+
+        try
+        {
+            descriptorName =
+                payload.ScriptStruct->Name.ToString();
+        }
+        catch (...)
+        {
+            descriptorName = "<name-unavailable>";
+        }
+
+        return AnalyzeShadowStructShape(
+            payload.ScriptStruct,
+            0,
+            summary);
     }
 
     bool Emit(
@@ -850,6 +1166,85 @@ namespace PersistentIdFixIndependentSourceCollector
                             return false;
                         }
 
+                        ShadowSchemaSummary shadow{};
+                        std::string descriptorName;
+
+                        const bool shadowSupported =
+                            AnalyzeShadowPayload(
+                                payload,
+                                shadow,
+                                descriptorName);
+
+                        if (shadowSupported)
+                        {
+                            g_gameStateDeviceShadowSupported.fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                        }
+                        else
+                        {
+                            g_gameStateDeviceShadowUnsupported.fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                        }
+
+                        g_gameStateDeviceShadowProperties.fetch_add(
+                            shadow.properties,
+                            std::memory_order_relaxed);
+                        g_gameStateDeviceShadowArrays.fetch_add(
+                            shadow.arrays,
+                            std::memory_order_relaxed);
+                        g_gameStateDeviceShadowStructs.fetch_add(
+                            shadow.structs,
+                            std::memory_order_relaxed);
+                        g_gameStateDeviceShadowIntegralLeaves.fetch_add(
+                            shadow.integralLeaves,
+                            std::memory_order_relaxed);
+                        g_gameStateDeviceShadowEnumLeaves.fetch_add(
+                            shadow.enumLeaves,
+                            std::memory_order_relaxed);
+
+                        std::uint64_t observedDepth =
+                            g_gameStateDeviceShadowMaxDepth.load(
+                                std::memory_order_relaxed);
+
+                        while (observedDepth < shadow.maxDepth &&
+                            !g_gameStateDeviceShadowMaxDepth.compare_exchange_weak(
+                                observedDepth,
+                                shadow.maxDepth,
+                                std::memory_order_relaxed))
+                        {
+                        }
+
+                        LOG_INFO(
+                            "PersistentIdFix: device payload reflection shadow: "
+                            "schema=%s size=%d supportedShape=%u "
+                            "properties=%llu arrays=%llu structs=%llu "
+                            "integralLeaves=%llu enumLeaves=%llu "
+                            "unsupported=%llu maxDepth=%llu",
+                            descriptorName.empty()
+                                ? "<unnamed>"
+                                : descriptorName.c_str(),
+                            payload.ScriptStruct->Size,
+                            shadowSupported ? 1u : 0u,
+                            static_cast<unsigned long long>(
+                                shadow.properties),
+                            static_cast<unsigned long long>(
+                                shadow.arrays),
+                            static_cast<unsigned long long>(
+                                shadow.structs),
+                            static_cast<unsigned long long>(
+                                shadow.integralLeaves),
+                            static_cast<unsigned long long>(
+                                shadow.enumLeaves),
+                            static_cast<unsigned long long>(
+                                shadow.unsupported),
+                            static_cast<unsigned long long>(
+                                shadow.maxDepth));
+
+                        // Shadow-only for now: an otherwise valid payload
+                        // remains uncertified until value traversal and the
+                        // serialization-representation contract are proven.
                         ++deviceUnknownPresent;
                         return true;
                     }))
@@ -936,6 +1331,24 @@ namespace PersistentIdFixIndependentSourceCollector
             g_gameStateDeviceMalformed.load(std::memory_order_relaxed);
         result.gameStateDeviceUnknownPresent =
             g_gameStateDeviceUnknownPresent.load(std::memory_order_relaxed);
+        result.gameStateDeviceShadowSupported =
+            g_gameStateDeviceShadowSupported.load(std::memory_order_relaxed);
+        result.gameStateDeviceShadowUnsupported =
+            g_gameStateDeviceShadowUnsupported.load(std::memory_order_relaxed);
+        result.gameStateDeviceShadowProperties =
+            g_gameStateDeviceShadowProperties.load(std::memory_order_relaxed);
+        result.gameStateDeviceShadowArrays =
+            g_gameStateDeviceShadowArrays.load(std::memory_order_relaxed);
+        result.gameStateDeviceShadowStructs =
+            g_gameStateDeviceShadowStructs.load(std::memory_order_relaxed);
+        result.gameStateDeviceShadowIntegralLeaves =
+            g_gameStateDeviceShadowIntegralLeaves.load(
+                std::memory_order_relaxed);
+        result.gameStateDeviceShadowEnumLeaves =
+            g_gameStateDeviceShadowEnumLeaves.load(
+                std::memory_order_relaxed);
+        result.gameStateDeviceShadowMaxDepth =
+            g_gameStateDeviceShadowMaxDepth.load(std::memory_order_relaxed);
         result.gameStateOpaqueStoreEntries =
             g_gameStateOpaqueStoreEntries.load(std::memory_order_relaxed);
         result.gameStateDiscoveredBuildingValues =
@@ -1007,6 +1420,26 @@ namespace PersistentIdFixIndependentSourceCollector
             static_cast<unsigned long long>(snapshot.gameStateDeviceUnknownPresent),
             static_cast<unsigned long long>(snapshot.gameStateOpaqueStoreEntries),
             static_cast<unsigned long long>(snapshot.gameStateDiscoveredBuildingValues));
+
+        LOG_INFO(
+            "PersistentIdFix: GameState device reflection shadow [%s]: supported=%llu unsupported=%llu properties=%llu arrays=%llu structs=%llu integralLeaves=%llu enumLeaves=%llu maxDepth=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(
+                snapshot.gameStateDeviceShadowSupported),
+            static_cast<unsigned long long>(
+                snapshot.gameStateDeviceShadowUnsupported),
+            static_cast<unsigned long long>(
+                snapshot.gameStateDeviceShadowProperties),
+            static_cast<unsigned long long>(
+                snapshot.gameStateDeviceShadowArrays),
+            static_cast<unsigned long long>(
+                snapshot.gameStateDeviceShadowStructs),
+            static_cast<unsigned long long>(
+                snapshot.gameStateDeviceShadowIntegralLeaves),
+            static_cast<unsigned long long>(
+                snapshot.gameStateDeviceShadowEnumLeaves),
+            static_cast<unsigned long long>(
+                snapshot.gameStateDeviceShadowMaxDepth));
     }
 
     void Reset()
@@ -1021,6 +1454,18 @@ namespace PersistentIdFixIndependentSourceCollector
         g_gameStateDeviceEmpty.store(0, std::memory_order_relaxed);
         g_gameStateDeviceMalformed.store(0, std::memory_order_relaxed);
         g_gameStateDeviceUnknownPresent.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceShadowSupported.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceShadowUnsupported.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceShadowProperties.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceShadowArrays.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceShadowStructs.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceShadowIntegralLeaves.store(
+            0,
+            std::memory_order_relaxed);
+        g_gameStateDeviceShadowEnumLeaves.store(
+            0,
+            std::memory_order_relaxed);
+        g_gameStateDeviceShadowMaxDepth.store(0, std::memory_order_relaxed);
         g_gameStateOpaqueStoreEntries.store(0, std::memory_order_relaxed);
         g_gameStateDiscoveredBuildingValues.store(0, std::memory_order_relaxed);
 

@@ -58,6 +58,14 @@ namespace PersistentIdFixIndependentSourceCollector
         std::uint64_t gameStateDeviceEmpty = 0;
         std::uint64_t gameStateDeviceMalformed = 0;
         std::uint64_t gameStateDeviceUnknownPresent = 0;
+        std::uint64_t gameStateDeviceShadowSupported = 0;
+        std::uint64_t gameStateDeviceShadowUnsupported = 0;
+        std::uint64_t gameStateDeviceShadowProperties = 0;
+        std::uint64_t gameStateDeviceShadowArrays = 0;
+        std::uint64_t gameStateDeviceShadowStructs = 0;
+        std::uint64_t gameStateDeviceShadowIntegralLeaves = 0;
+        std::uint64_t gameStateDeviceShadowEnumLeaves = 0;
+        std::uint64_t gameStateDeviceShadowMaxDepth = 0;
         std::uint64_t gameStateOpaqueStoreEntries = 0;
         std::uint64_t gameStateDiscoveredBuildingValues = 0;
     };
