@@ -36,6 +36,19 @@ namespace
 
     constexpr int32_t InvalidHashIndex = -1;
 
+    // UCrMassPersistentIDSubsystem::IDHandleMap native layout.
+    // Verified against native GetHandleForID. Release allocation safety
+    // uses this forward lookup to verify bidirectional PID mappings.
+    constexpr size_t IDHandleMapElementsDataOffset = 0x00;
+    constexpr size_t IDHandleMapElementsNumOffset = 0x08;
+    constexpr size_t IDHandleMapHashInlineOffset = 0x38;
+    constexpr size_t IDHandleMapHashSecondaryOffset = 0x40;
+    constexpr size_t IDHandleMapHashSizeOffset = 0x48;
+    constexpr size_t IDHandleMapPersistentIdOffset = 0x00;
+    constexpr size_t IDHandleMapHandleOffset = 0x10;
+    constexpr size_t IDHandleMapHashNextIdOffset = 0x18;
+    constexpr size_t IDHandleMapElementStride = 0x20;
+
 
     static uint32_t HashMassEntityHandle(
         const SDK::FMassEntityHandle& handle)
@@ -101,6 +114,94 @@ namespace
 
         return a;
     }
+
+    static const SDK::FMassEntityHandle* FindHandleByPersistentId(
+        SDK::UCrMassPersistentIDSubsystem* subsystem,
+        std::uint32_t persistentId)
+    {
+        if (subsystem == nullptr)
+            return nullptr;
+
+        const auto* map =
+            reinterpret_cast<const std::uint8_t*>(
+                &subsystem->IDHandleMap);
+
+        const auto readPtr =
+            [](const std::uint8_t* address) -> const std::uint8_t*
+            {
+                return *reinterpret_cast<const std::uint8_t* const*>(address);
+            };
+
+        const std::uint8_t* elementsData =
+            readPtr(map + IDHandleMapElementsDataOffset);
+
+        const std::int32_t elementsNum =
+            *reinterpret_cast<const std::int32_t*>(
+                map + IDHandleMapElementsNumOffset);
+
+        const std::uint8_t* hashSecondary =
+            readPtr(map + IDHandleMapHashSecondaryOffset);
+
+        const std::int32_t hashSize =
+            *reinterpret_cast<const std::int32_t*>(
+                map + IDHandleMapHashSizeOffset);
+
+        if (elementsData == nullptr ||
+            elementsNum <= 0 ||
+            hashSize <= 0 ||
+            (hashSize & (hashSize - 1)) != 0)
+        {
+            return nullptr;
+        }
+
+        const std::uint8_t* hashData =
+            hashSecondary != nullptr
+            ? hashSecondary
+            : map + IDHandleMapHashInlineOffset;
+
+        const std::uint32_t bucket =
+            persistentId &
+            static_cast<std::uint32_t>(hashSize - 1);
+
+        std::int32_t elementIndex =
+            *reinterpret_cast<const std::int32_t*>(
+                hashData +
+                static_cast<std::size_t>(bucket) * sizeof(std::int32_t));
+
+        std::int32_t traversed = 0;
+
+        while (elementIndex != InvalidHashIndex)
+        {
+            if (elementIndex < 0 ||
+                elementIndex >= elementsNum ||
+                traversed++ >= elementsNum)
+            {
+                return nullptr;
+            }
+
+            const std::uint8_t* element =
+                elementsData +
+                static_cast<std::size_t>(elementIndex) *
+                IDHandleMapElementStride;
+
+            const std::uint32_t elementPersistentId =
+                *reinterpret_cast<const std::uint32_t*>(
+                    element + IDHandleMapPersistentIdOffset);
+
+            if (elementPersistentId == persistentId)
+            {
+                return reinterpret_cast<const SDK::FMassEntityHandle*>(
+                    element + IDHandleMapHandleOffset);
+            }
+
+            elementIndex =
+                *reinterpret_cast<const std::int32_t*>(
+                    element + IDHandleMapHashNextIdOffset);
+        }
+
+        return nullptr;
+    }
+
 
     static const SDK::FCrMassPersistentEntityID* FindPersistentIdByHandle(
         SDK::UCrMassPersistentIDSubsystem* subsystem,

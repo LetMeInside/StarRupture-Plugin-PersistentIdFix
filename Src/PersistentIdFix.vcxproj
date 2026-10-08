@@ -61,7 +61,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;PERSISTENTIDFIX_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;PERSISTENTIDFIX_DIAGNOSTICS;PERSISTENTIDFIX_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -111,6 +111,12 @@
     <ClInclude Include="UI\UI.h" />
     <ClInclude Include="Native\Fingerprints.h" />
     <ClInclude Include="Native\NativeIdLookup.h" />
+    <ClInclude Include="SourceData\SourceReadObserver.h" />
+    <ClInclude Include="SourceData\MassFragmentClassifier.h" />
+    <ClInclude Include="SourceData\IndependentSourceCollector.h" />
+    <ClInclude Include="SourceData\ReflectionWalker.h" />
+    <ClInclude Include="SourceData\ReflectionDiagnostics.h" />
+    <ClInclude Include="SourceData\SourceMemory.h" />
     <ClInclude Include="PersistentId\PersistentIdReuse.h" />
     <ClInclude Include="plugin.h" />
     <ClInclude Include="plugin_helpers.h" />
@@ -129,6 +135,11 @@
     <ClCompile Include="Config\Config.cpp" />
     <ClCompile Include="PersistentId\PersistentIdSystem.cpp" />
     <ClCompile Include="Native\Fingerprints.cpp" />
+    <ClCompile Include="SourceData\SourceReadObserver.cpp" />
+    <ClCompile Include="SourceData\MassFragmentClassifier.cpp" />
+    <ClCompile Include="SourceData\IndependentSourceCollector.cpp" />
+    <ClCompile Include="SourceData\ReflectionWalker.cpp" />
+    <ClCompile Include="SourceData\ReflectionDiagnostics.cpp" />
     <ClCompile Include="Network\Network.cpp" />
     <ClCompile Include="Stats\Stats.cpp" />
     <ClCompile Include="UI\UI.cpp" />

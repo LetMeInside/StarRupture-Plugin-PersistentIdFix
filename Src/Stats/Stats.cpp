@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <mutex>
 
 namespace
 {
@@ -48,6 +49,7 @@ namespace
     };
 
     PersistentIdStatistics g_statistics;
+    std::mutex g_statisticsMutex;
 
     const char* GetSessionName(EPluginNetMode netMode)
     {
@@ -179,11 +181,15 @@ namespace PersistentIdFixStats
 {
     void Reset()
     {
+        std::lock_guard<std::mutex> lock(g_statisticsMutex);
+
         g_statistics = {};
     }
 
     void RecordAssignment()
     {
+        std::lock_guard<std::mutex> lock(g_statisticsMutex);
+
         const auto now =
             std::chrono::steady_clock::now();
 
@@ -207,15 +213,24 @@ namespace PersistentIdFixStats
         std::uint64_t reusableIDCount,
         std::uint64_t reusableIDRanges)
     {
+        std::lock_guard<std::mutex> lock(g_statisticsMutex);
+
         AdvanceStatistics();
 
         g_statistics.snapshot.netMode = netMode;
         g_statistics.snapshot.totalEntities = totalEntities;
         g_statistics.snapshot.idCounterValue = idCounterValue;
 
+        constexpr std::uint32_t kMaxAssignablePersistentId =
+            UINT32_MAX - 1u;
+
         g_statistics.snapshot.remainingIDCount =
-            static_cast<std::uint64_t>(UINT32_MAX) -
-            static_cast<std::uint64_t>(idCounterValue);
+            idCounterValue < kMaxAssignablePersistentId
+                ? static_cast<std::uint64_t>(
+                    kMaxAssignablePersistentId) -
+                    static_cast<std::uint64_t>(
+                        idCounterValue)
+                : 0u;
 
         g_statistics.snapshot.reusableIDCount =
             reusableIDCount;
@@ -232,6 +247,8 @@ namespace PersistentIdFixStats
 
     Snapshot GetSnapshot()
     {
+        std::lock_guard<std::mutex> lock(g_statisticsMutex);
+
         /*
          * This is deliberately allowed to advance the current minute bucket,
          * but the actual IDs/minute calculation is cached and only changes

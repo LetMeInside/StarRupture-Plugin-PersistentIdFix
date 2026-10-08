@@ -1,5 +1,13 @@
 #include "Native/Fingerprints.h"
 
+#include <Windows.h>
+#include <Psapi.h>
+
+#include <cstring>
+#include <limits>
+
+#pragma comment(lib, "Psapi.lib")
+
 // ---------------------------------------------------------------------------
 // Pattern resolution.
 //
@@ -17,6 +25,336 @@
 // native implementation.
 // ---------------------------------------------------------------------------
 
+namespace
+{
+    bool TryDecodeRipRelativeTarget(
+        uintptr_t instructionAddress,
+        std::size_t instructionLength,
+        std::int32_t displacement,
+        uintptr_t& target)
+    {
+        target = 0;
+
+        constexpr uintptr_t maxAddress =
+            (std::numeric_limits<uintptr_t>::max)();
+
+        if (instructionAddress > maxAddress - instructionLength)
+            return false;
+
+        const uintptr_t instructionEnd =
+            instructionAddress + instructionLength;
+
+        if (displacement >= 0)
+        {
+            const uintptr_t delta =
+                static_cast<uintptr_t>(displacement);
+
+            if (instructionEnd > maxAddress - delta)
+                return false;
+
+            target = instructionEnd + delta;
+            return true;
+        }
+
+        const std::uint64_t magnitude =
+            static_cast<std::uint64_t>(
+                -static_cast<std::int64_t>(displacement));
+
+        if (magnitude > instructionEnd)
+            return false;
+
+        target =
+            instructionEnd - static_cast<uintptr_t>(magnitude);
+        return true;
+    }
+
+    bool IsInitializedWritableNonExecutableImageSectionRange(
+        HMODULE mainModule,
+        const MODULEINFO& moduleInfo,
+        uintptr_t address,
+        std::size_t size)
+    {
+        if (mainModule == nullptr ||
+            moduleInfo.lpBaseOfDll == nullptr ||
+            moduleInfo.SizeOfImage == 0 ||
+            address == 0 ||
+            size == 0)
+        {
+            return false;
+        }
+
+        const uintptr_t moduleBase =
+            reinterpret_cast<uintptr_t>(
+                moduleInfo.lpBaseOfDll);
+
+        const std::size_t moduleSize =
+            static_cast<std::size_t>(
+                moduleInfo.SizeOfImage);
+
+        if (moduleSize < sizeof(IMAGE_DOS_HEADER))
+            return false;
+
+        const auto* dosHeader =
+            reinterpret_cast<const IMAGE_DOS_HEADER*>(
+                moduleBase);
+
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE ||
+            dosHeader->e_lfanew < 0)
+        {
+            return false;
+        }
+
+        const std::size_t ntOffset =
+            static_cast<std::size_t>(
+                dosHeader->e_lfanew);
+
+        if (ntOffset > moduleSize - sizeof(IMAGE_NT_HEADERS64))
+            return false;
+
+        const auto* ntHeaders =
+            reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+                moduleBase + ntOffset);
+
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE ||
+            ntHeaders->OptionalHeader.Magic !=
+                IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+            ntHeaders->FileHeader.NumberOfSections == 0)
+        {
+            return false;
+        }
+
+        const std::size_t optionalHeaderOffset =
+            ntOffset +
+            offsetof(IMAGE_NT_HEADERS64, OptionalHeader);
+
+        const std::size_t optionalHeaderSize =
+            static_cast<std::size_t>(
+                ntHeaders->FileHeader.SizeOfOptionalHeader);
+
+        if (optionalHeaderOffset > moduleSize ||
+            optionalHeaderSize >
+                moduleSize - optionalHeaderOffset)
+        {
+            return false;
+        }
+
+        const std::size_t sectionTableOffset =
+            optionalHeaderOffset + optionalHeaderSize;
+
+        const std::size_t sectionCount =
+            static_cast<std::size_t>(
+                ntHeaders->FileHeader.NumberOfSections);
+
+        if (sectionCount >
+            (std::numeric_limits<std::size_t>::max)() /
+                sizeof(IMAGE_SECTION_HEADER))
+        {
+            return false;
+        }
+
+        const std::size_t sectionTableSize =
+            sectionCount * sizeof(IMAGE_SECTION_HEADER);
+
+        if (sectionTableOffset > moduleSize ||
+            sectionTableSize > moduleSize - sectionTableOffset)
+        {
+            return false;
+        }
+
+        constexpr uintptr_t maxAddress =
+            (std::numeric_limits<uintptr_t>::max)();
+
+        if (address < moduleBase ||
+            address > maxAddress - (size - 1u))
+        {
+            return false;
+        }
+
+        const uintptr_t rangeEndInclusive =
+            address + size - 1u;
+
+        if (rangeEndInclusive < moduleBase)
+            return false;
+
+        const std::uint64_t startRva =
+            static_cast<std::uint64_t>(
+                address - moduleBase);
+
+        const std::uint64_t endRva =
+            static_cast<std::uint64_t>(
+                rangeEndInclusive - moduleBase);
+
+        const auto* sections =
+            reinterpret_cast<const IMAGE_SECTION_HEADER*>(
+                moduleBase + sectionTableOffset);
+
+        for (std::size_t index = 0;
+             index < sectionCount;
+             ++index)
+        {
+            const IMAGE_SECTION_HEADER& section =
+                sections[index];
+
+            const std::uint64_t sectionStart =
+                static_cast<std::uint64_t>(
+                    section.VirtualAddress);
+
+            const std::uint64_t virtualSize =
+                static_cast<std::uint64_t>(
+                    section.Misc.VirtualSize);
+
+            const std::uint64_t rawSize =
+                static_cast<std::uint64_t>(
+                    section.SizeOfRawData);
+
+            const std::uint64_t sectionSpan =
+                virtualSize > rawSize
+                    ? virtualSize
+                    : rawSize;
+
+            if (sectionSpan == 0)
+                continue;
+
+            const std::uint64_t sectionEnd =
+                sectionStart + sectionSpan;
+
+            if (sectionEnd < sectionStart)
+                return false;
+
+            if (startRva < sectionStart ||
+                endRva >= sectionEnd)
+            {
+                continue;
+            }
+
+            const DWORD characteristics =
+                section.Characteristics;
+
+            const bool initializedData =
+                (characteristics &
+                    IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
+
+            const bool readable =
+                (characteristics & IMAGE_SCN_MEM_READ) != 0;
+
+            const bool writable =
+                (characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+
+            const bool executable =
+                (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+
+            return initializedData &&
+                readable &&
+                writable &&
+                !executable;
+        }
+
+        return false;
+    }
+
+    bool IsReadableNonExecutableMainImageRange(
+        uintptr_t address,
+        std::size_t size)
+    {
+        if (address == 0 || size == 0)
+            return false;
+
+        constexpr uintptr_t maxAddress =
+            (std::numeric_limits<uintptr_t>::max)();
+
+        if (address > maxAddress - (size - 1u))
+            return false;
+
+        const uintptr_t rangeEndInclusive =
+            address + size - 1u;
+
+        const HMODULE mainModule =
+            GetModuleHandleW(nullptr);
+
+        if (mainModule == nullptr)
+            return false;
+
+        MODULEINFO moduleInfo{};
+        if (!GetModuleInformation(
+                GetCurrentProcess(),
+                mainModule,
+                &moduleInfo,
+                sizeof(moduleInfo)))
+        {
+            return false;
+        }
+
+        const uintptr_t moduleBase =
+            reinterpret_cast<uintptr_t>(
+                moduleInfo.lpBaseOfDll);
+
+        if (moduleInfo.SizeOfImage == 0 ||
+            moduleBase > maxAddress - moduleInfo.SizeOfImage)
+        {
+            return false;
+        }
+
+        const uintptr_t moduleEnd =
+            moduleBase + moduleInfo.SizeOfImage;
+
+        if (address < moduleBase ||
+            rangeEndInclusive >= moduleEnd)
+        {
+            return false;
+        }
+
+        if (!IsInitializedWritableNonExecutableImageSectionRange(
+                mainModule,
+                moduleInfo,
+                address,
+                size))
+        {
+            return false;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(
+                reinterpret_cast<const void*>(address),
+                &mbi,
+                sizeof(mbi)) == 0)
+        {
+            return false;
+        }
+
+        if (mbi.State != MEM_COMMIT ||
+            mbi.Type != MEM_IMAGE ||
+            mbi.AllocationBase != mainModule ||
+            (mbi.Protect & PAGE_GUARD) != 0 ||
+            (mbi.Protect & PAGE_NOACCESS) != 0)
+        {
+            return false;
+        }
+
+        const DWORD baseProtection =
+            mbi.Protect & 0xFFu;
+
+        const bool readable =
+            baseProtection == PAGE_READONLY ||
+            baseProtection == PAGE_READWRITE ||
+            baseProtection == PAGE_WRITECOPY;
+
+        if (!readable)
+            return false;
+
+        const uintptr_t regionBase =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+
+        if (regionBase > maxAddress - mbi.RegionSize)
+            return false;
+
+        const uintptr_t regionEnd =
+            regionBase + mbi.RegionSize;
+
+        return address >= regionBase &&
+            rangeEndInclusive < regionEnd;
+    }
+}
+
 namespace PersistentIdFixFingerprints
 {
     bool Resolve(
@@ -31,11 +369,307 @@ namespace PersistentIdFixFingerprints
 
         uintptr_t getOrAddIDForHandleAddress = 0;
         uintptr_t setIDHandlePairAddress = 0;
+        uintptr_t getSaveDataAddress = 0;
+        uintptr_t onPreLoadMapAddress = 0;
+
+        uintptr_t getGameWorldAddress = 0;
+        uintptr_t getGameWorldFromAnchorAddress = 0;
+        uintptr_t hasBegunPlayAddress = 0;
+        uintptr_t gEngineAnchorAddress = 0;
+        uintptr_t gEngineStorageAddress = 0;
 
         uintptr_t getOrAddFingerprintMapAddress = 0;
         uintptr_t getOrAddFingerprintBucketAddress = 0;
         uintptr_t getOrAddFingerprintElementAddress = 0;
         uintptr_t getOrAddFingerprintMaxIDAddress = 0;
+
+        PluginScanRequest req = PLUGIN_SCAN_REQUEST_INIT;
+
+        // UCrSaveSubsystem::GetSaveData:
+        //
+        // Audited Hotfix 0.3.5 entry sequence, shared by Client and Server.
+        //
+        //   48 89 6C 24 10      mov [rsp+10h],rbp
+        //   48 89 74 24 18      mov [rsp+18h],rsi
+        //   57                  push rdi
+        //   41 56               push r14
+        //   41 57               push r15
+        //   48 83 EC 50         sub rsp,50h
+        //   8B 42 08            mov eax,[rdx+08h]
+        //   48 8D 79 30         lea rdi,[rcx+30h]
+        //   49 8B E9            mov rbp,r9
+        //   4D 8B F0            mov r14,r8
+        //   48 8B F2            mov rsi,rdx
+        //
+        // The function consumes a by-value FString section name, a UStruct*
+        // describing the destination type, and an initialized destination.
+        // PersistentIdFix observes successful native reads before the caller
+        // resumes; Step 2 installs only the passive hook infrastructure.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::GetSaveData";
+        req.pattern =
+            "48 89 6C 24 10 "
+            "48 89 74 24 18 "
+            "57 "
+            "41 56 "
+            "41 57 "
+            "48 83 EC 50 "
+            "8B 42 08 "
+            "48 8D 79 30 "
+            "49 8B E9 "
+            "4D 8B F0 "
+            "48 8B F2";
+
+        req.kind =
+            PLUGIN_SCAN_FUNCTION_START;
+
+        getSaveDataAddress =
+            scanner->Resolve(self, &req);
+
+        if (getSaveDataAddress == 0)
+            return false;
+
+        // UCrSaveSubsystem::OnPreLoadMap:
+        //
+        // Audited Hotfix 0.3.5 entry sequence, shared by Client
+        // and Server. The compiler emits a redundant 0x40 REX prefix
+        // on push rbx, so include the complete two-byte instruction
+        // rather than matching from its second byte.
+        //
+        //   40 53                    push rbx
+        //   48 83 EC 20              sub rsp,20h
+        //   48 8B D9                 mov rbx,rcx
+        //   48 81 C1 78 01 00 00     add rcx,178h
+        //   E8 ?? ?? ?? ??           call OnPreSaveLoaded broadcast helper
+        //   48 8B 93 10 01 00 00     mov rdx,[rbx+110h]
+        //   48 85 D2                 test rdx,rdx
+        //   74 0C                    je cleanup-complete
+        //
+        // +0x178 is UCrSaveSubsystem::OnPreSaveLoaded and +0x110 is
+        // the pending load-map handle. The fixed structural bytes
+        // through the +0x110 read/test distinguish this function from
+        // the unrelated prologue collision observed in the Client.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::OnPreLoadMap";
+        req.pattern =
+            "40 53 "
+            "48 83 EC 20 "
+            "48 8B D9 "
+            "48 81 C1 78 01 00 00 "
+            "E8 ?? ?? ?? ?? "
+            "48 8B 93 10 01 00 00 "
+            "48 85 D2 "
+            "74 0C";
+
+        req.kind =
+            PLUGIN_SCAN_FUNCTION_START;
+
+        onPreLoadMapAddress =
+            scanner->Resolve(self, &req);
+
+        if (onPreLoadMapAddress == 0)
+            return false;
+
+        // H2 early-attachment probe: native UGameEngine::GetGameWorld.
+        //
+        // Client and Dedicated Server use different WorldList field
+        // displacements, so certify the expected target-specific body.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::UGameEngine::GetGameWorld";
+#ifdef MODLOADER_SERVER_BUILD
+        req.pattern =
+            "48 89 5C 24 08 "
+            "48 89 74 24 10 "
+            "57 "
+            "48 83 EC 30 "
+            "48 8B F1 "
+            "33 DB "
+            "85 DB "
+            "78 6D "
+            "3B 9E A8 11 00 00 "
+            "7D 65";
+#else
+        req.pattern =
+            "48 89 5C 24 08 "
+            "48 89 74 24 10 "
+            "57 "
+            "48 83 EC 30 "
+            "48 8B F1 "
+            "33 DB "
+            "85 DB "
+            "78 6D "
+            "3B 9E D0 11 00 00 "
+            "7D 65";
+#endif
+        req.kind =
+            PLUGIN_SCAN_FUNCTION_START;
+
+        getGameWorldAddress =
+            scanner->Resolve(self, &req);
+
+        if (getGameWorldAddress == 0)
+            return false;
+
+        // H2 early-attachment probe: UWorld::HasBegunPlay.
+        // This leaf function has no unwind entry in either executable;
+        // fingerprint the complete body and certify executable code.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::UWorld::HasBegunPlay";
+        req.pattern =
+            "F6 81 8D 01 00 00 01 "
+            "74 15 "
+            "48 8B 41 30 "
+            "48 85 C0 "
+            "74 0C "
+            "83 B8 A8 00 00 00 00 "
+            "74 03 "
+            "B0 01 "
+            "C3 "
+            "32 C0 "
+            "C3";
+        req.kind =
+            PLUGIN_SCAN_CODE;
+
+        hasBegunPlayAddress =
+            scanner->Resolve(self, &req);
+
+        if (hasBegunPlayAddress == 0)
+            return false;
+
+        // H2 early-attachment probe: native GEngine reference.
+        // The scanner certifies a unique code anchor beginning with
+        // 'mov rbx,[rip+disp32]'; decode only that RIP-relative data
+        // reference locally because FOLLOW_REL32 is E8/E9-only.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::GEngine.Reference";
+        req.pattern =
+            "48 8B 1D ?? ?? ?? ?? "
+            "48 85 DB "
+            "74 3A "
+            "E8 ?? ?? ?? ?? "
+            "48 8B 4B 10 "
+            "4C 8D 40 30 "
+            "48 63 40 38 "
+            "3B 41 38 "
+            "7F 24 "
+            "48 8B D0 "
+            "48 8B 41 30 "
+            "4C 39 04 D0 "
+            "75 17 "
+            "48 8B CB "
+            "E8 ?? ?? ?? ?? "
+            "48 85 C0 "
+            "74 0A "
+            "B2 01 "
+            "48 8B C8 "
+            "E8 ?? ?? ?? ??";
+        req.kind =
+            PLUGIN_SCAN_IN_FUNCTION;
+
+        gEngineAnchorAddress =
+            scanner->Resolve(self, &req);
+
+        if (gEngineAnchorAddress == 0)
+            return false;
+
+        const auto* gEngineAnchor =
+            reinterpret_cast<const std::uint8_t*>(
+                gEngineAnchorAddress);
+
+        if (gEngineAnchor[0] != 0x48 ||
+            gEngineAnchor[1] != 0x8B ||
+            gEngineAnchor[2] != 0x1D)
+        {
+            scanner->ReportFailure(
+                self,
+                "PersistentIdFix::GEngine.Reference",
+                "Resolved anchor did not begin with expected RIP-relative GEngine load");
+            return false;
+        }
+
+        std::int32_t gEngineDisp32 = 0;
+        std::memcpy(
+            &gEngineDisp32,
+            gEngineAnchor + 3,
+            sizeof(gEngineDisp32));
+
+        if (!TryDecodeRipRelativeTarget(
+                gEngineAnchorAddress,
+                7u,
+                gEngineDisp32,
+                gEngineStorageAddress) ||
+            gEngineStorageAddress == 0 ||
+            (gEngineStorageAddress & (alignof(void*) - 1u)) != 0)
+        {
+            scanner->ReportFailure(
+                self,
+                "PersistentIdFix::GEngine.Reference",
+                "Decoded GEngine pointer storage arithmetic was invalid or misaligned");
+            return false;
+        }
+
+        if (!IsReadableNonExecutableMainImageRange(
+                gEngineStorageAddress,
+                sizeof(void*)))
+        {
+            scanner->ReportFailure(
+                self,
+                "PersistentIdFix::GEngine.Reference",
+                "Decoded GEngine pointer storage was not a readable non-executable range in the main image");
+            return false;
+        }
+
+        // Independently follow the same anchor's GetGameWorld call.
+        req = PLUGIN_SCAN_REQUEST_INIT;
+        req.hookName =
+            "PersistentIdFix::GEngine.GetGameWorldCrossCheck";
+        req.pattern =
+            "48 8B 1D ?? ?? ?? ?? "
+            "48 85 DB "
+            "74 3A "
+            "E8 ?? ?? ?? ?? "
+            "48 8B 4B 10 "
+            "4C 8D 40 30 "
+            "48 63 40 38 "
+            "3B 41 38 "
+            "7F 24 "
+            "48 8B D0 "
+            "48 8B 41 30 "
+            "4C 39 04 D0 "
+            "75 17 "
+            "48 8B CB "
+            "E8 ?? ?? ?? ?? "
+            "48 85 C0 "
+            "74 0A "
+            "B2 01 "
+            "48 8B C8 "
+            "E8 ?? ?? ?? ??";
+        req.kind =
+            PLUGIN_SCAN_FUNCTION_START;
+        req.flags =
+            PLUGIN_SCAN_FLAG_FOLLOW_REL32;
+        req.followRel32At = 0x32;
+
+        getGameWorldFromAnchorAddress =
+            scanner->Resolve(self, &req);
+
+        if (getGameWorldFromAnchorAddress == 0)
+            return false;
+
+        if (getGameWorldFromAnchorAddress !=
+            getGameWorldAddress)
+        {
+            scanner->ReportFailure(
+                self,
+                "PersistentIdFix::UGameEngine::GetGameWorld",
+                "Direct function fingerprint and GEngine call-site cross-check disagreed");
+            return false;
+        }
 
         // SetIDHandlePair:
         //
@@ -67,7 +701,7 @@ namespace PersistentIdFixFingerprints
         //
         // A successful result must resolve to the function start.
 
-        PluginScanRequest req = PLUGIN_SCAN_REQUEST_INIT;
+        req = PLUGIN_SCAN_REQUEST_INIT;
         req.hookName =
             "PersistentIdFix::SetIDHandlePair";
         req.pattern =
@@ -361,6 +995,11 @@ namespace PersistentIdFixFingerprints
 
         addresses.getOrAddIDForHandle = getOrAddIDForHandleAddress;
         addresses.setIDHandlePair = setIDHandlePairAddress;
+        addresses.getSaveData = getSaveDataAddress;
+        addresses.onPreLoadMap = onPreLoadMapAddress;
+        addresses.gEngineStorage = gEngineStorageAddress;
+        addresses.getGameWorld = getGameWorldAddress;
+        addresses.hasBegunPlay = hasBegunPlayAddress;
 
         return true;
     }

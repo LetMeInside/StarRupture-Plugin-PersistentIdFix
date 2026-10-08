@@ -20,12 +20,18 @@ void PersistentIdReuse::Clear()
 
     sessionMaxID_ = 0;
     ranges_.clear();
+    rangeIndex_ = 0;
     reusableIDCount_ = 0;
+
+    stagedRanges_.clear();
+    stagedReusableIDCount_ = 0;
+    stagedPoolReady_ = false;
 }
 
 void PersistentIdReuse::BuildPool()
 {
     ranges_.clear();
+    rangeIndex_ = 0;
     reusableIDCount_ = 0;
 
     if (subsystem_ == nullptr)
@@ -86,18 +92,109 @@ void PersistentIdReuse::BuildPool()
     }
 }
 
+bool PersistentIdReuse::StagePoolFromBlockedIds(
+    const std::vector<std::uint32_t>& blockedIds,
+    std::uint32_t highWater)
+{
+    stagedRanges_.clear();
+    stagedReusableIDCount_ = 0;
+    stagedPoolReady_ = false;
+
+    if (highWater == 0)
+        return false;
+
+    std::uint32_t previous = 0;
+
+    for (const std::uint32_t id : blockedIds)
+    {
+        if (id == 0 || id >= highWater)
+            return false;
+
+        if (previous != 0 && id <= previous)
+            return false;
+
+        previous = id;
+    }
+
+    try
+    {
+        std::uint32_t nextID = 1;
+
+        for (const std::uint32_t blockedID : blockedIds)
+        {
+            if (nextID < blockedID)
+            {
+                const std::uint32_t first = nextID;
+                const std::uint32_t last = blockedID - 1u;
+
+                stagedRanges_.push_back({ first, last });
+
+                stagedReusableIDCount_ +=
+                    static_cast<std::uint64_t>(last) -
+                    static_cast<std::uint64_t>(first) + 1u;
+            }
+
+            nextID = blockedID + 1u;
+        }
+
+        if (nextID < highWater)
+        {
+            const std::uint32_t first = nextID;
+            const std::uint32_t last = highWater - 1u;
+
+            stagedRanges_.push_back({ first, last });
+
+            stagedReusableIDCount_ +=
+                static_cast<std::uint64_t>(last) -
+                static_cast<std::uint64_t>(first) + 1u;
+        }
+    }
+    catch (...)
+    {
+        stagedRanges_.clear();
+        stagedReusableIDCount_ = 0;
+        return false;
+    }
+
+    stagedPoolReady_ = true;
+    return true;
+}
+
+void PersistentIdReuse::ClearStagedPool()
+{
+    stagedRanges_.clear();
+    stagedReusableIDCount_ = 0;
+    stagedPoolReady_ = false;
+}
+
+bool PersistentIdReuse::PromoteStagedPool()
+{
+    if (!stagedPoolReady_)
+        return false;
+
+    ranges_.swap(stagedRanges_);
+    rangeIndex_ = 0;
+    reusableIDCount_ = stagedReusableIDCount_;
+
+    stagedRanges_.clear();
+    stagedReusableIDCount_ = 0;
+    stagedPoolReady_ = false;
+
+    return true;
+}
+
 PersistentIdAllocationResult PersistentIdReuse::TryAllocate(
     SDK::FMassEntityHandle handle,
     SDK::FCrMassPersistentEntityID& outId)
 {
     if (subsystem_ == nullptr ||
         setIDHandlePair_ == nullptr ||
-        ranges_.empty())
+        rangeIndex_ >= ranges_.size())
     {
         return PersistentIdAllocationResult::NoReusableId;
     }
 
-    IdRange& range = ranges_.front();
+    IdRange& range = ranges_[rangeIndex_];
 
     const uint32_t id = range.first;
 
@@ -130,7 +227,7 @@ PersistentIdAllocationResult PersistentIdReuse::TryAllocate(
     --reusableIDCount_;
 
     if (range.first > range.last)
-        ranges_.erase(ranges_.begin());
+        ++rangeIndex_;
 
     // For debugging:
     //LOG_INFO(
@@ -159,18 +256,55 @@ uint64_t PersistentIdReuse::GetReusableIDCount() const
 
 size_t PersistentIdReuse::GetRangeCount() const
 {
-    return ranges_.size();
+    if (rangeIndex_ >= ranges_.size())
+        return 0;
+
+    return ranges_.size() - rangeIndex_;
+}
+
+uint64_t PersistentIdReuse::GetStagedReusableIDCount() const
+{
+    return stagedReusableIDCount_;
+}
+
+size_t PersistentIdReuse::GetStagedRangeCount() const
+{
+    return stagedRanges_.size();
+}
+
+bool PersistentIdReuse::GetStagedFirstRange(
+    uint32_t& first,
+    uint32_t& last) const
+{
+    if (stagedRanges_.empty())
+        return false;
+
+    first = stagedRanges_.front().first;
+    last = stagedRanges_.front().last;
+    return true;
+}
+
+bool PersistentIdReuse::GetStagedLastRange(
+    uint32_t& first,
+    uint32_t& last) const
+{
+    if (stagedRanges_.empty())
+        return false;
+
+    first = stagedRanges_.back().first;
+    last = stagedRanges_.back().last;
+    return true;
 }
 
 bool PersistentIdReuse::GetFirstRange(
     uint32_t& first,
     uint32_t& last) const
 {
-    if (ranges_.empty())
+    if (rangeIndex_ >= ranges_.size())
         return false;
 
-    first = ranges_.front().first;
-    last = ranges_.front().last;
+    first = ranges_[rangeIndex_].first;
+    last = ranges_[rangeIndex_].last;
 
     return true;
 }
@@ -179,7 +313,7 @@ bool PersistentIdReuse::GetLastRange(
     uint32_t& first,
     uint32_t& last) const
 {
-    if (ranges_.empty())
+    if (rangeIndex_ >= ranges_.size())
         return false;
 
     first = ranges_.back().first;

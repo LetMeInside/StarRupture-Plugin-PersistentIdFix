@@ -4,31 +4,303 @@
 #include "Config/Config.h"
 #include "Network/Network.h"
 #include "Native/Fingerprints.h"
+#include "SourceData/SourceReadObserver.h"
+#include "SourceData/MassFragmentClassifier.h"
+#include "SourceData/IndependentSourceCollector.h"
+
+#include <Windows.h>
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
+#pragma comment(lib, "User32.lib")
 #endif
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <vector>
+
+#ifndef MODLOADER_BUILD_TAG
+#define MODLOADER_BUILD_TAG "1.3.0"
+#endif
 
 IPluginSelf* g_self = nullptr;
 IPluginSelf* GetSelf() { return g_self; }
 
 static HookHandle g_getOrAddIDForHandleHook = nullptr;
+static HookHandle g_setIDHandlePairHook = nullptr;
+static HookHandle g_getSaveDataHook = nullptr;
+static HookHandle g_onPreLoadMapHook = nullptr;
 
 // SDK hook output; passed to PersistentIdFixSystem for native delegation.
 static GetOrAddIDForHandleFn g_originalGetOrAddIDForHandle = nullptr;
+static SetIDHandlePairFn g_originalSetIDHandlePair = nullptr;
+
+// Native source-read observer trampolines. GetSaveData is observed so
+// serialized persistent-ID references can be certified before reuse activates.
+static GetSaveDataFn g_originalGetSaveData = nullptr;
+static OnPreLoadMapFn g_originalOnPreLoadMap = nullptr;
 
 static uintptr_t g_getOrAddIDForHandleAddress = 0;
+static uintptr_t g_getSaveDataAddress = 0;
+static uintptr_t g_onPreLoadMapAddress = 0;
 
 static uintptr_t g_setIDHandlePairAddress = 0;
 
+// Engine-owned startup probe dependencies used to detect late attachment.
+static uintptr_t g_gEngineStorageAddress = 0;
+static uintptr_t g_getGameWorldAddress = 0;
+static uintptr_t g_hasBegunPlayAddress = 0;
+
+static bool g_authoritativeWorldReadyObserved = false;
+static bool g_engineShutdownObserved = false;
+
+static void ResetProtectedIdPublication();
+
+static bool GetSaveDataDetour(
+    void* saveSubsystem,
+    void* sectionName,
+    const void* structType,
+    void* destination)
+{
+    return PersistentIdFixSourceReadObserver::ObserveGetSaveData(
+        g_originalGetSaveData,
+        saveSubsystem,
+        sectionName,
+        structType,
+        destination);
+}
+
+static void OnPreLoadMapDetour(
+    void* saveSubsystem,
+    const void* mapName)
+{
+    // Reset before native OnPreLoadMap broadcasts OnPreSaveLoaded.
+    // Any GetSaveData calls made by that delegate therefore belong to
+    // the fresh generation rather than inheriting prior-world state.
+    g_authoritativeWorldReadyObserved = false;
+    ResetProtectedIdPublication();
+
+    PersistentIdFixSourceReadObserver::BeginLoadGeneration(
+        saveSubsystem);
+
+    const auto coverage =
+        PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+    PersistentIdFixSystem::BeginLoadGeneration(
+        coverage.loadGeneration);
+
+    if (g_originalOnPreLoadMap != nullptr)
+    {
+        g_originalOnPreLoadMap(
+            saveSubsystem,
+            mapName);
+    }
+}
+
 static bool g_networkSessionActive = false;
 static bool g_gameWorldActive = false;
+static SDK::UWorld* g_gameWorld = nullptr;
 
-#ifndef MODLOADER_BUILD_TAG
-#define MODLOADER_BUILD_TAG "1.2.0"
-#endif
+// Generation-bound protected IDs published from the certified serialized
+// source domains. Candidate-pool construction consumes this snapshot.
+static std::vector<std::uint32_t> g_publishedProtectedIds;
+static std::uint64_t g_publishedProtectedGeneration = 0;
+
+enum class AuthorityReadiness : std::uint8_t
+{
+    Unresolved = 0,
+    Authoritative,
+    RemoteClient
+};
+
+static const char* NetModeName(EPluginNetMode netMode)
+{
+    switch (netMode)
+    {
+    case EPluginNetMode::Standalone:
+        return "Standalone";
+    case EPluginNetMode::ListenServer:
+        return "ListenServer";
+    case EPluginNetMode::DedicatedServer:
+        return "DedicatedServer";
+    case EPluginNetMode::Client:
+        return "Client";
+    default:
+        return "Unknown";
+    }
+}
+
+static AuthorityReadiness GetAuthorityReadiness(
+    EPluginNetMode netMode)
+{
+    switch (netMode)
+    {
+    case EPluginNetMode::Standalone:
+    case EPluginNetMode::ListenServer:
+    case EPluginNetMode::DedicatedServer:
+        return AuthorityReadiness::Authoritative;
+
+    case EPluginNetMode::Client:
+        return AuthorityReadiness::RemoteClient;
+
+    default:
+        return AuthorityReadiness::Unresolved;
+    }
+}
+
+static const char* AuthorityReadinessName(
+    AuthorityReadiness readiness)
+{
+    switch (readiness)
+    {
+    case AuthorityReadiness::Authoritative:
+        return "Authoritative";
+    case AuthorityReadiness::RemoteClient:
+        return "RemoteClient";
+    default:
+        return "Unresolved";
+    }
+}
+
+static bool IsAuthoritativeWorldReady()
+{
+    const auto coverage =
+        PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+    const EPluginNetMode netMode =
+        PersistentIdFixSystem::GetSessionNetMode();
+
+    return
+        coverage.sourceCoverageComplete &&
+        coverage.coverageAttachedToCurrentGeneration &&
+        GetAuthorityReadiness(netMode) ==
+            AuthorityReadiness::Authoritative;
+}
+
+static bool PublishProtectedIdsWhileFrozen()
+{
+    // The caller owns the exclusive source-publication freeze for the
+    // complete certification -> publication -> candidate -> activation
+    // transaction. Revalidate readiness only after that freeze is held.
+    const auto coverage =
+        PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+    if (!IsAuthoritativeWorldReady() ||
+        coverage.loadGeneration == 0)
+    {
+        return false;
+    }
+
+    const auto activityBefore =
+        PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
+
+    if (activityBefore.activeFrames != 0)
+    {
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication acquired source freeze but active observer frames=%llu",
+            static_cast<unsigned long long>(activityBefore.activeFrames));
+        return false;
+    }
+
+    std::vector<std::uint32_t> staged;
+
+    if (!PersistentIdFixMassFragmentClassifier::AppendCollectedValues(staged) ||
+        !PersistentIdFixIndependentSourceCollector::AppendCollectedValues(staged))
+    {
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication failed while copying collected source values");
+        return false;
+    }
+
+    const auto activityAfter =
+        PersistentIdFixSourceReadObserver::GetObserverActivitySnapshot();
+
+    if (activityAfter.activeFrames != 0 ||
+        activityAfter.frameTransitions != activityBefore.frameTransitions)
+    {
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication source freeze coherence failure");
+        return false;
+    }
+
+    const std::size_t occurrences = staged.size();
+
+    std::sort(staged.begin(), staged.end());
+    staged.erase(
+        std::unique(staged.begin(), staged.end()),
+        staged.end());
+
+    const std::uint32_t sentinel =
+        (std::numeric_limits<std::uint32_t>::max)();
+
+    const bool hasZero =
+        std::binary_search(staged.begin(), staged.end(), 0u);
+    const bool hasSentinel =
+        std::binary_search(staged.begin(), staged.end(), sentinel);
+
+    const std::size_t ordinaryUnique =
+        staged.size() -
+        (hasZero ? 1u : 0u) -
+        (hasSentinel ? 1u : 0u);
+
+    try
+    {
+        g_publishedProtectedIds = std::move(staged);
+        g_publishedProtectedGeneration = coverage.loadGeneration;
+    }
+    catch (...)
+    {
+        g_publishedProtectedIds.clear();
+        g_publishedProtectedGeneration = 0;
+        LOG_ERROR(
+            "PersistentIdFix: protected-ID publication failed while committing staged values");
+        return false;
+    }
+
+    LOG_INFO(
+        "PersistentIdFix: protected-ID publication: generation=%llu occurrences=%llu unique=%llu ordinaryUnique=%llu zeroPresent=%u sentinelPresent=%u observerTransitions=%llu",
+        static_cast<unsigned long long>(g_publishedProtectedGeneration),
+        static_cast<unsigned long long>(occurrences),
+        static_cast<unsigned long long>(g_publishedProtectedIds.size()),
+        static_cast<unsigned long long>(ordinaryUnique),
+        hasZero ? 1u : 0u,
+        hasSentinel ? 1u : 0u,
+        static_cast<unsigned long long>(activityBefore.frameTransitions));
+
+    return true;
+}
+
+static void ResetProtectedIdPublication()
+{
+    g_publishedProtectedIds.clear();
+    g_publishedProtectedGeneration = 0;
+}
+
+static void LogReadiness(
+    const char* phase)
+{
+    const auto coverage =
+        PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+    const EPluginNetMode netMode =
+        PersistentIdFixSystem::GetSessionNetMode();
+
+    const AuthorityReadiness authority =
+        GetAuthorityReadiness(netMode);
+
+    const bool authoritativeWorldReady =
+        IsAuthoritativeWorldReady();
+
+    LOG_INFO(
+        "PersistentIdFix: readiness [%s]: netMode=%s authority=%s sourceCoverage=%u currentGeneration=%u authoritativeWorldReady=%u",
+        phase != nullptr ? phase : "<null>",
+        NetModeName(netMode),
+        AuthorityReadinessName(authority),
+        coverage.sourceCoverageComplete ? 1u : 0u,
+        coverage.coverageAttachedToCurrentGeneration ? 1u : 0u,
+        authoritativeWorldReady ? 1u : 0u);
+}
 
 #ifdef MODLOADER_SERVER_BUILD
 #define PERSISTENT_ID_FIX_TARGET PLUGIN_TARGET_SERVER
@@ -45,10 +317,506 @@ static PluginInfo s_pluginInfo = {
     PERSISTENT_ID_FIX_TARGET
 };
 
+static void OnEngineShutdown()
+{
+    g_engineShutdownObserved = true;
+}
+
+#ifdef MODLOADER_CLIENT_BUILD
+static void ShowHotUnloadMessageBox()
+{
+    HWND owner = GetForegroundWindow();
+
+    MessageBoxW(
+        owner,
+        L"PersistentIdFix is being unloaded while a game world is still active.\n\n"
+        L"Persistent ID reuse will stop for this running session.\n\n"
+        L"If this world is approaching the uint32 persistent-ID limit, continuing without PersistentIdFix can exhaust or overflow the available ID space.\n\n"
+        L"Return to the main menu before loading PersistentIdFix again. Do not hot-load it back into this already-running world.\n\n"
+        L"Existing saves can normally be loaded again safely unless persistent-ID exhaustion or overflow had already occurred before the save was written.",
+        L"PersistentIdFix - Active world",
+        MB_OK | MB_ICONWARNING | MB_TASKMODAL |
+            MB_SETFOREGROUND | MB_TOPMOST);
+}
+#endif
+
+enum class InitialAttachmentProbeResult : std::uint8_t
+{
+    Unknown = 0,
+    NotActiveGameplay,
+    ActiveGameplay
+};
+
+using GetGameWorldFn = SDK::UWorld* (*)(void* engine);
+using HasBegunPlayFn = bool (*)(const SDK::UWorld* world);
+
+static int FilterNativeProbeMemoryFault(
+    unsigned long exceptionCode)
+{
+    if (exceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+        exceptionCode == EXCEPTION_IN_PAGE_ERROR)
+    {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static bool TryReadPointerStorage(
+    uintptr_t storageAddress,
+    void*& value)
+{
+    value = nullptr;
+
+    __try
+    {
+        value =
+            *reinterpret_cast<void* const*>(
+                storageAddress);
+        return true;
+    }
+    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
+    {
+        value = nullptr;
+        return false;
+    }
+}
+
+static bool TryGetGameWorld(
+    GetGameWorldFn getGameWorld,
+    void* engine,
+    SDK::UWorld*& world)
+{
+    world = nullptr;
+
+    __try
+    {
+        world = getGameWorld(engine);
+        return true;
+    }
+    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
+    {
+        world = nullptr;
+        return false;
+    }
+}
+
+static bool TryReadWorldLifecycleFlags(
+    const SDK::UWorld* world,
+    bool& tearingDown,
+    bool& beingCleanedUp)
+{
+    tearingDown = false;
+    beingCleanedUp = false;
+
+    __try
+    {
+        const auto* worldBytes =
+            reinterpret_cast<const std::uint8_t*>(world);
+
+        tearingDown =
+            (worldBytes[0x18D] & 0x20u) != 0;
+
+        beingCleanedUp =
+            worldBytes[0x190] != 0;
+
+        return true;
+    }
+    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
+    {
+        tearingDown = false;
+        beingCleanedUp = false;
+        return false;
+    }
+}
+
+static bool TryHasBegunPlay(
+    HasBegunPlayFn hasBegunPlay,
+    const SDK::UWorld* world,
+    bool& begunPlay)
+{
+    begunPlay = false;
+
+    __try
+    {
+        begunPlay = hasBegunPlay(world);
+        return true;
+    }
+    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
+    {
+        begunPlay = false;
+        return false;
+    }
+}
+
+static bool IsReadableRange(
+    const void* address,
+    std::size_t size)
+{
+    if (address == nullptr || size == 0)
+        return false;
+
+    const uintptr_t start =
+        reinterpret_cast<uintptr_t>(address);
+
+    constexpr uintptr_t maxAddress =
+        (std::numeric_limits<uintptr_t>::max)();
+
+    if (start > maxAddress - (size - 1u))
+        return false;
+
+    const uintptr_t endInclusive =
+        start + size - 1u;
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(
+            address,
+            &mbi,
+            sizeof(mbi)) == 0)
+    {
+        return false;
+    }
+
+    if (mbi.State != MEM_COMMIT ||
+        (mbi.Protect & PAGE_GUARD) != 0 ||
+        (mbi.Protect & PAGE_NOACCESS) != 0)
+    {
+        return false;
+    }
+
+    const DWORD baseProtection =
+        mbi.Protect & 0xFFu;
+
+    const bool readable =
+        baseProtection == PAGE_READONLY ||
+        baseProtection == PAGE_READWRITE ||
+        baseProtection == PAGE_WRITECOPY ||
+        baseProtection == PAGE_EXECUTE_READ ||
+        baseProtection == PAGE_EXECUTE_READWRITE ||
+        baseProtection == PAGE_EXECUTE_WRITECOPY;
+
+    if (!readable)
+        return false;
+
+    const uintptr_t regionBase =
+        reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+
+    if (regionBase > maxAddress - mbi.RegionSize)
+        return false;
+
+    const uintptr_t regionEnd =
+        regionBase + mbi.RegionSize;
+
+    return start >= regionBase &&
+        endInclusive < regionEnd;
+}
+
+enum class ExactClassLookupResult : std::uint8_t
+{
+    Unknown = 0,
+    CompleteNoMatch,
+    ExactMatch
+};
+
+static ExactClassLookupResult FindExactObjectByClass(
+    void* object,
+    const char* className,
+    PluginObjectInfo& matchedInfo)
+{
+    matchedInfo = {};
+
+    if (object == nullptr ||
+        className == nullptr ||
+        g_self == nullptr ||
+        g_self->hooks == nullptr ||
+        g_self->hooks->ObjectWalker == nullptr ||
+        g_self->hooks->ObjectWalker->IsReady == nullptr ||
+        g_self->hooks->ObjectWalker->FindObjectsByClassNameInto == nullptr ||
+        !g_self->hooks->ObjectWalker->IsReady())
+    {
+        return ExactClassLookupResult::Unknown;
+    }
+
+    constexpr int InitialCapacity = 8;
+    constexpr int MaximumCapacity = 64;
+    PluginObjectInfo initial[InitialCapacity] = {};
+
+    const int total =
+        g_self->hooks->ObjectWalker->FindObjectsByClassNameInto(
+            className,
+            PluginObjectLookup_InstanceOnly,
+            initial,
+            InitialCapacity);
+
+    if (total < 0)
+        return ExactClassLookupResult::Unknown;
+
+    const int initialCount =
+        (std::min)(total, InitialCapacity);
+
+    for (int i = 0; i < initialCount; ++i)
+    {
+        if (initial[i].object == object)
+        {
+            matchedInfo = initial[i];
+            return ExactClassLookupResult::ExactMatch;
+        }
+    }
+
+    if (total <= InitialCapacity)
+        return ExactClassLookupResult::CompleteNoMatch;
+
+    if (total > MaximumCapacity)
+        return ExactClassLookupResult::Unknown;
+
+    try
+    {
+        std::vector<PluginObjectInfo> all(
+            static_cast<std::size_t>(total));
+
+        const int repeatedTotal =
+            g_self->hooks->ObjectWalker->FindObjectsByClassNameInto(
+                className,
+                PluginObjectLookup_InstanceOnly,
+                all.data(),
+                total);
+
+        if (repeatedTotal < 0 ||
+            repeatedTotal > total)
+        {
+            return ExactClassLookupResult::Unknown;
+        }
+
+        for (int i = 0; i < repeatedTotal; ++i)
+        {
+            if (all[static_cast<std::size_t>(i)].object == object)
+            {
+                matchedInfo = all[static_cast<std::size_t>(i)];
+                return ExactClassLookupResult::ExactMatch;
+            }
+        }
+
+        if (repeatedTotal != total)
+            return ExactClassLookupResult::Unknown;
+
+        return ExactClassLookupResult::CompleteNoMatch;
+    }
+    catch (...)
+    {
+        return ExactClassLookupResult::Unknown;
+    }
+}
+static InitialAttachmentProbeResult ProbeInitialAttachment()
+{
+    if (g_gEngineStorageAddress == 0 ||
+        g_getGameWorldAddress == 0 ||
+        g_hasBegunPlayAddress == 0)
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe has an unresolved native dependency");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    if (!IsReadableRange(
+            reinterpret_cast<const void*>(
+                g_gEngineStorageAddress),
+            sizeof(void*)))
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: GEngine storage is not readable; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    void* engine = nullptr;
+    if (!TryReadPointerStorage(
+            g_gEngineStorageAddress,
+            engine))
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: GEngine storage read faulted; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    if (engine == nullptr)
+    {
+        LOG_INFO(
+            "PersistentIdFix: startup attachment probe: engine=null result=NotActive");
+        return InitialAttachmentProbeResult::NotActiveGameplay;
+    }
+
+    PluginObjectInfo engineInfo{};
+    const ExactClassLookupResult engineLookup =
+        FindExactObjectByClass(
+            engine,
+            "GameEngine",
+            engineInfo);
+
+    if (engineLookup != ExactClassLookupResult::ExactMatch)
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=%s result=Unknown",
+            engine,
+            engineLookup == ExactClassLookupResult::CompleteNoMatch
+                ? "0"
+                : "unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+#ifdef MODLOADER_SERVER_BUILD
+    constexpr std::size_t RequiredEngineReadableSize = 0x11ACu;
+#else
+    constexpr std::size_t RequiredEngineReadableSize = 0x11D4u;
+#endif
+
+    if (!IsReadableRange(
+            engine,
+            RequiredEngineReadableSize))
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 readable=0 result=Unknown",
+            engine);
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    const auto getGameWorld =
+        reinterpret_cast<GetGameWorldFn>(
+            g_getGameWorldAddress);
+
+    SDK::UWorld* world = nullptr;
+    if (!TryGetGameWorld(
+            getGameWorld,
+            engine,
+            world))
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: GetGameWorld faulted; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    if (world == nullptr)
+    {
+        LOG_INFO(
+            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=null result=NotActive",
+            engine);
+        return InitialAttachmentProbeResult::NotActiveGameplay;
+    }
+
+    PluginObjectInfo worldInfo{};
+    const ExactClassLookupResult worldLookup =
+        FindExactObjectByClass(
+            world,
+            "World",
+            worldInfo);
+
+    if (worldLookup != ExactClassLookupResult::ExactMatch)
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: engine=%p world=%p WorldIdentity=%s result=Unknown",
+            engine,
+            static_cast<void*>(world),
+            worldLookup == ExactClassLookupResult::CompleteNoMatch
+                ? "0"
+                : "unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    const bool isChimeraMain =
+        std::strcmp(
+            worldInfo.objectName,
+            "ChimeraMain") == 0;
+
+    if (!isChimeraMain)
+    {
+        LOG_INFO(
+            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 objectName=%s ChimeraMainIdentity=0 result=NotActive",
+            engine,
+            static_cast<void*>(world),
+            worldInfo.objectName);
+        return InitialAttachmentProbeResult::NotActiveGameplay;
+    }
+
+    constexpr std::size_t RequiredWorldReadableSize = 0x191u;
+    if (!IsReadableRange(
+            world,
+            RequiredWorldReadableSize))
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: engine=%p world=%p WorldIdentity=1 ChimeraMainIdentity=1 readable=0 result=Unknown",
+            engine,
+            static_cast<void*>(world));
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    bool tearingDown = false;
+    bool beingCleanedUp = false;
+
+    if (!TryReadWorldLifecycleFlags(
+            world,
+            tearingDown,
+            beingCleanedUp))
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: World lifecycle read faulted; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    if (tearingDown || beingCleanedUp)
+    {
+        LOG_INFO(
+            "PersistentIdFix: startup attachment probe: engine=%p world=%p GameEngineIdentity=1 WorldIdentity=1 ChimeraMainIdentity=1 tearingDown=%u beingCleanedUp=%u result=Unknown",
+            engine,
+            static_cast<void*>(world),
+            tearingDown ? 1u : 0u,
+            beingCleanedUp ? 1u : 0u);
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    const auto hasBegunPlay =
+        reinterpret_cast<HasBegunPlayFn>(
+            g_hasBegunPlayAddress);
+
+    bool begunPlay = false;
+    if (!TryHasBegunPlay(
+            hasBegunPlay,
+            world,
+            begunPlay))
+    {
+        LOG_WARN(
+            "PersistentIdFix: startup attachment probe: HasBegunPlay faulted; result=Unknown");
+        return InitialAttachmentProbeResult::Unknown;
+    }
+
+    const InitialAttachmentProbeResult result =
+        begunPlay
+            ? InitialAttachmentProbeResult::ActiveGameplay
+            : InitialAttachmentProbeResult::Unknown;
+
+    LOG_INFO(
+        "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 ChimeraMainIdentity=1 begunPlay=%u tearingDown=0 beingCleanedUp=0 result=%s",
+        engine,
+        static_cast<void*>(world),
+        begunPlay ? 1u : 0u,
+        result == InitialAttachmentProbeResult::ActiveGameplay
+            ? "Active"
+            : "Unknown");
+
+    return result;
+}
+
 static void OnTick(
     float delta)
 {
     (void)delta;
+
+
+#ifdef MODLOADER_CLIENT_BUILD
+    if (PersistentIdFixSystem::ConsumeLateAttachmentNotification())
+    {
+        LOG_WARN(
+            "PersistentIdFix: displaying late-attachment warning through ImGui");
+        PersistentIdFixUI::ShowLateAttachmentWarning();
+    }
+#endif
 
     if (g_self == nullptr ||
         g_self->hooks == nullptr ||
@@ -63,7 +831,19 @@ static void OnTick(
 
     if (g_gameWorldActive)
     {
+        const EPluginNetMode before =
+            PersistentIdFixSystem::GetSessionNetMode();
+
         PersistentIdFixSystem::SetSessionNetMode(netMode);
+
+        const EPluginNetMode after =
+            PersistentIdFixSystem::GetSessionNetMode();
+
+        if (before == EPluginNetMode::Unknown &&
+            after != EPluginNetMode::Unknown)
+        {
+            LogReadiness("role-settled");
+        }
     }
 
     /*
@@ -104,6 +884,104 @@ static void OnTick(
         }
     }
 
+    if (g_gameWorldActive &&
+        !g_authoritativeWorldReadyObserved &&
+        IsAuthoritativeWorldReady())
+    {
+        if (!PersistentIdFixSourceReadObserver::BeginPublicationFreeze())
+        {
+            LOG_ERROR(
+                "PersistentIdFix: certified-pool transaction failed to acquire source freeze");
+        }
+        else
+        {
+            struct PublicationFreezeRelease
+            {
+                ~PublicationFreezeRelease()
+                {
+                    PersistentIdFixSourceReadObserver::EndPublicationFreeze();
+                }
+            } publicationFreezeRelease;
+
+            // The readiness trigger above is intentionally only a hint.
+            // A source read or generation boundary could theoretically
+            // occur before the exclusive gate is acquired, so certify the
+            // actual frozen state before publishing or activating reuse.
+            if (!IsAuthoritativeWorldReady())
+            {
+                LOG_WARN(
+                    "PersistentIdFix: authoritative readiness changed before the source freeze was acquired; certified-pool transaction deferred");
+            }
+            else
+            {
+                g_authoritativeWorldReadyObserved = true;
+
+                LOG_INFO(
+                    "PersistentIdFix: authoritative world readiness became true during active gameplay");
+
+                LogReadiness("ready-transition");
+
+                if (!PublishProtectedIdsWhileFrozen())
+                {
+                    LOG_WARN(
+                        "PersistentIdFix: protected-ID publication was not accepted for the frozen ready generation");
+                }
+                else
+                {
+                    const auto candidate =
+                        PersistentIdFixSystem::BuildCandidatePoolDiagnostic(
+                            g_publishedProtectedGeneration,
+                            g_publishedProtectedIds);
+
+                    if (!candidate.valid)
+                    {
+                        LOG_WARN(
+                            "PersistentIdFix: certified candidate-pool diagnostic was not accepted");
+                    }
+                    else
+                    {
+                        const auto coverage =
+                            PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+                        const auto highWater =
+                            PersistentIdFixSystem::LogHighWaterCrossCheck(
+                                "pre-activation",
+                                coverage.loadGeneration,
+                                coverage.savedHighWaterCaptured,
+                                coverage.savedHighWaterConflict,
+                                coverage.savedHighWater,
+                                true);
+
+                        const bool highWaterCertified =
+                            highWater.available &&
+                            highWater.restoredAtLeastSaved &&
+                            highWater.exactAccountingValid &&
+                            highWater.exactAccountingMatch;
+
+                        if (!highWaterCertified)
+                        {
+                            LOG_ERROR(
+                                "PersistentIdFix: certified pool activation rejected: serialized/live high-water accounting is not exact");
+                        }
+                        else if (!PersistentIdFixSystem::ActivateCertifiedPool(
+                                     g_publishedProtectedGeneration))
+                        {
+                            LOG_WARN(
+                                "PersistentIdFix: certified reusable pool activation was rejected");
+                        }
+                    }
+                }
+            }
+        }
+
+        PersistentIdFixSystem::LogAssignmentLedger(
+            "ready-transition");
+
+
+        PersistentIdFixSystem::LogSetPairObserver(
+            "ready-transition");
+    }
+
     if (netMode == EPluginNetMode::Unknown)
         return;
 
@@ -112,7 +990,6 @@ static void OnTick(
 
 static void OnWorldBeginPlay(SDK::UWorld* world)
 {
-    (void)world;
 
     if (g_self == nullptr ||
         g_self->hooks == nullptr ||
@@ -142,6 +1019,10 @@ static void OnWorldBeginPlay(SDK::UWorld* world)
      * network state becomes usable.
      */
     g_gameWorldActive = true;
+    g_gameWorld = world;
+
+    PersistentIdFixSystem::BeginGameWorld(world);
+    PersistentIdFixSourceReadObserver::AttachCurrentGenerationToGameWorld();
 
     /*
      * Server/listen-server sessions normally have their final NetMode
@@ -185,6 +1066,38 @@ static void OnWorldBeginPlay(SDK::UWorld* world)
     }
 }
 
+static void OnSaveLoaded()
+{
+    PersistentIdFixSystem::OnSaveLoaded();
+
+    PersistentIdFixSystem::LogAssignmentLedger(
+        "save-loaded");
+
+    {
+        const auto coverage =
+            PersistentIdFixSourceReadObserver::GetCoverageSnapshot();
+
+        PersistentIdFixSystem::LogHighWaterCrossCheck(
+            "save-loaded",
+            coverage.loadGeneration,
+            coverage.savedHighWaterCaptured,
+            coverage.savedHighWaterConflict,
+            coverage.savedHighWater,
+            false);
+    }
+
+    PersistentIdFixSystem::LogSetPairObserver(
+        "save-loaded");
+
+
+
+    PersistentIdFixSourceReadObserver::LogCoverage(
+        "save-loaded");
+
+    LogReadiness(
+        "save-loaded");
+}
+
 // ---------------------------------------------------------------------------
 // World-end callback.
 //
@@ -200,25 +1113,49 @@ static void OnAfterWorldEndPlay(
     SDK::UWorld* world,
     const char* worldName)
 {
+    /*
+     * WorldEndPlay is global and fires for Untitled, Map_MainMenu and
+     * other intermediate worlds as well as ChimeraMain. Only the exact
+     * world that received our OnWorldBeginPlay callback owns this plugin
+     * lifecycle. Unrelated world-end callbacks must not detach coverage,
+     * end the persistent-ID session, reset networking, or hide the UI.
+     */
+    if (!g_gameWorldActive ||
+        g_gameWorld == nullptr ||
+        world != g_gameWorld)
+    {
+        return;
+    }
+
     LOG_INFO(
-        "PersistentIdFix: world ended: %s",
+        "PersistentIdFix: gameplay world ended: %s",
         worldName != nullptr ? worldName : "<null>");
 
-    /*
-     * The actual game world has ended. Prevent OnTick() from starting a new
-     * network session while the process is transitioning through a menu or
-     * another intermediate world.
-     */
+    PersistentIdFixSourceReadObserver::LogCoverage(
+        "world-end");
+
+    LogReadiness(
+        "world-end");
+
+    PersistentIdFixSourceReadObserver::DetachGameWorld();
+    PersistentIdFixSystem::EndGameWorld(world);
+
     g_gameWorldActive = false;
+    g_gameWorld = nullptr;
+    ResetProtectedIdPublication();
+
+    PersistentIdFixSystem::LogAssignmentLedger(
+        "world-end");
+
+    PersistentIdFixSystem::LogSetPairObserver(
+        "world-end");
 
     PersistentIdFixSystem::EndSession();
 
     /*
      * End the network session independently of the local persistent-ID
-     * session.
-     *
-     * This is required for remote clients because they do not necessarily
-     * create a local PersistentIdFix persistent-ID session.
+     * session. Remote clients do not necessarily create a local allocator
+     * session, but the exact gameplay-world boundary still owns networking.
      */
     if (g_networkSessionActive)
     {
@@ -228,16 +1165,9 @@ static void OnAfterWorldEndPlay(
 
 #ifdef MODLOADER_CLIENT_BUILD
     /*
-     * The UI belongs to the game world, not to the local persistent-ID session.
-     *
-     * A remote client can have a visible statistics window without ever
-     * creating a local persistent-ID session because the server owns the
-     * persistent-ID subsystem. Therefore the UI must also be hidden when the
-     * game world ends on a remote client.
-     *
-     * PersistentIdFixNetwork::ResetSession() has already happened above, so
-     * Hide() will not attempt to send a subscription packet for the ended
-     * session.
+     * The UI belongs to the exact gameplay world as well. ResetSession()
+     * has already happened, so Hide() cannot send a subscription update
+     * for a world that is ending.
      */
     if (PersistentIdFixUI::IsVisible())
     {
@@ -245,7 +1175,6 @@ static void OnAfterWorldEndPlay(
     }
 #endif
 }
-
 // ---------------------------------------------------------------------------
 // Pattern resolution.
 //
@@ -279,6 +1208,21 @@ void OnPluginLoadHooks(
 
     g_setIDHandlePairAddress =
         addresses.setIDHandlePair;
+
+    g_getSaveDataAddress =
+        addresses.getSaveData;
+
+    g_onPreLoadMapAddress =
+        addresses.onPreLoadMap;
+
+    g_gEngineStorageAddress =
+        addresses.gEngineStorage;
+
+    g_getGameWorldAddress =
+        addresses.getGameWorld;
+
+    g_hasBegunPlayAddress =
+        addresses.hasBegunPlay;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +1290,20 @@ extern "C"
                 break;
             }
 
+            if (g_getSaveDataAddress == 0)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: GetSaveData address was not resolved");
+                break;
+            }
+
+            if (g_onPreLoadMapAddress == 0)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: OnPreLoadMap address was not resolved");
+                break;
+            }
+
             if (g_self->hooks->Hooks == nullptr)
             {
                 LOG_ERROR(
@@ -361,9 +1319,120 @@ extern "C"
                 "PersistentIdFix: SetIDHandlePair resolved at %p",
                 reinterpret_cast<void*>(g_setIDHandlePairAddress));
 
+            LOG_INFO(
+                "PersistentIdFix: GetSaveData resolved at %p",
+                reinterpret_cast<void*>(g_getSaveDataAddress));
+
+            LOG_INFO(
+                "PersistentIdFix: OnPreLoadMap resolved at %p",
+                reinterpret_cast<void*>(g_onPreLoadMapAddress));
+
             //
+            // Resolve and certify the finite Mass descriptor registry before
+            // any GetSaveData callback can attempt Mass fragment traversal.
+            //
+            if (!PersistentIdFixMassFragmentClassifier::InitializeDescriptorRegistry(
+                g_self->hooks->Engine))
+            {
+                LOG_WARN(
+                    "PersistentIdFix: Mass descriptor registry unavailable; Mass classification remains fail-closed");
+            }
+
+            //
+            // Install OnPreLoadMap generation-boundary hook.
+            //
+            // This remains observational: it only starts a fresh source
+            // observation generation before native OnPreSaveLoaded runs.
+            //
+            g_onPreLoadMapHook =
+                g_self->hooks->Hooks->Install(
+                    g_onPreLoadMapAddress,
+                    reinterpret_cast<void*>(&OnPreLoadMapDetour),
+                    reinterpret_cast<void**>(
+                        &g_originalOnPreLoadMap));
+
+            if (g_onPreLoadMapHook == nullptr ||
+                g_originalOnPreLoadMap == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: failed to install OnPreLoadMap hook");
+
+                g_onPreLoadMapHook = nullptr;
+                g_originalOnPreLoadMap = nullptr;
+
+                break;
+            }
+
+            LOG_INFO(
+                "PersistentIdFix: OnPreLoadMap generation hook installed");
+
+            //
+            // Install GetSaveData source-read observer hook.
+            //
+            // The observer forwards the native call while collecting and
+            // certifying the recognized serialized persistent-ID sources.
+            //
+            g_getSaveDataHook =
+                g_self->hooks->Hooks->Install(
+                    g_getSaveDataAddress,
+                    reinterpret_cast<void*>(&GetSaveDataDetour),
+                    reinterpret_cast<void**>(
+                        &g_originalGetSaveData));
+
+            if (g_getSaveDataHook == nullptr ||
+                g_originalGetSaveData == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: failed to install GetSaveData hook");
+
+                g_getSaveDataHook = nullptr;
+                g_originalGetSaveData = nullptr;
+
+                break;
+            }
+
+            LOG_INFO(
+                "PersistentIdFix: GetSaveData observer hook installed");
+
+#ifdef PERSISTENTIDFIX_DIAGNOSTICS
+            // Diagnostic builds observe native SetIDHandlePair provenance.
+            // Public Release must not pay this restoration-path cost.
+            g_setIDHandlePairHook =
+                g_self->hooks->Hooks->Install(
+                    g_setIDHandlePairAddress,
+                    reinterpret_cast<void*>(&PersistentIdFixSystem::SetIDHandlePairDetour),
+                    reinterpret_cast<void**>(
+                        &g_originalSetIDHandlePair));
+
+            if (g_setIDHandlePairHook == nullptr ||
+                g_originalSetIDHandlePair == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: failed to install SetIDHandlePair diagnostic observer hook");
+                g_setIDHandlePairHook = nullptr;
+                g_originalSetIDHandlePair = nullptr;
+                break;
+            }
+
+            LOG_INFO(
+                "PersistentIdFix: SetIDHandlePair diagnostic observer hook installed");
+#else
+            // Public Release calls the resolved native setter directly.
+            // It does not intercept native restoration traffic.
+            g_setIDHandlePairHook = nullptr;
+            g_originalSetIDHandlePair =
+                reinterpret_cast<SetIDHandlePairFn>(
+                    g_setIDHandlePairAddress);
+
+            if (g_originalSetIDHandlePair == nullptr)
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: resolved SetIDHandlePair address is null");
+                break;
+            }
+#endif
+
             // Install GetOrAddIDForHandle hook
-            //
             g_getOrAddIDForHandleHook =
                 g_self->hooks->Hooks->Install(
                     g_getOrAddIDForHandleAddress,
@@ -390,9 +1459,11 @@ extern "C"
 
             PersistentIdFixSystem::Configure(
                 g_self,
-                reinterpret_cast<SetIDHandlePairFn>(
-                    g_setIDHandlePairAddress),
+                g_originalSetIDHandlePair,
                 g_originalGetOrAddIDForHandle);
+
+            const InitialAttachmentProbeResult initialAttachmentProbe =
+                ProbeInitialAttachment();
 
             //
             // World callbacks
@@ -411,7 +1482,7 @@ extern "C"
                 "PersistentIdFix: registered OnWorldBeginPlay callback");
 
             g_self->hooks->World->RegisterOnSaveLoaded(
-                &PersistentIdFixSystem::OnSaveLoaded);
+                &OnSaveLoaded);
 
             LOG_INFO(
                 "PersistentIdFix: registered OnSaveLoaded callback");
@@ -443,6 +1514,10 @@ extern "C"
 
             g_networkSessionActive = false;
             g_gameWorldActive = false;
+            g_gameWorld = nullptr;
+            g_authoritativeWorldReadyObserved = false;
+            g_engineShutdownObserved = false;
+            ResetProtectedIdPublication();
 
 #ifdef MODLOADER_CLIENT_BUILD
 
@@ -474,8 +1549,38 @@ extern "C"
             g_self->hooks->Engine->RegisterOnTick(
                 &OnTick);
 
+            g_self->hooks->Engine->RegisterOnShutdown(
+                &OnEngineShutdown);
+
             LOG_INFO(
-                "PersistentIdFix: registered OnTick callback");
+                "PersistentIdFix: registered OnTick and OnShutdown callbacks");
+
+            if (initialAttachmentProbe ==
+                InitialAttachmentProbeResult::ActiveGameplay)
+            {
+                PersistentIdFixSystem::MarkLateAttachmentDetected();
+
+                LOG_WARN(
+                    "PersistentIdFix: startup attachment probe detected attachment to an already-active ChimeraMain world; persistent ID reuse remains disabled for this running world");
+
+#ifdef MODLOADER_CLIENT_BUILD
+                PersistentIdFixUI::ShowLateAttachmentWarning();
+                (void)PersistentIdFixSystem::ConsumeLateAttachmentNotification();
+#else
+                LOG_WARN(
+                    "========== PersistentIdFix: LATE ATTACHMENT ==========");
+                LOG_WARN(
+                    "This gameplay world began before PersistentIdFix was loaded.");
+                LOG_WARN(
+                    "Complete persistent-ID provenance was not observed.");
+                LOG_WARN(
+                    "ID reuse remains DISABLED for this running world.");
+                LOG_WARN(
+                    "Restart the server with PersistentIdFix active before relying on ID reuse again.");
+                LOG_WARN(
+                    "========================================================");
+#endif
+            }
 
             LOG_INFO(
                 "PersistentIdFix: initialization complete");
@@ -512,7 +1617,7 @@ extern "C"
                     &OnWorldBeginPlay);
 
                 g_self->hooks->World->UnregisterOnSaveLoaded(
-                    &PersistentIdFixSystem::OnSaveLoaded);
+                    &OnSaveLoaded);
 
                 g_self->hooks->World->UnregisterOnAfterWorldEndPlay(
                     &OnAfterWorldEndPlay);
@@ -532,6 +1637,42 @@ extern "C"
             g_originalGetOrAddIDForHandle = nullptr;
         }
 
+        if (g_setIDHandlePairHook != nullptr)
+        {
+            if (g_self->hooks->Hooks != nullptr)
+            {
+                g_self->hooks->Hooks->Remove(
+                    g_setIDHandlePairHook);
+            }
+
+            g_setIDHandlePairHook = nullptr;
+            g_originalSetIDHandlePair = nullptr;
+        }
+
+        if (g_getSaveDataHook != nullptr)
+        {
+            if (g_self->hooks->Hooks != nullptr)
+            {
+                g_self->hooks->Hooks->Remove(
+                    g_getSaveDataHook);
+            }
+
+            g_getSaveDataHook = nullptr;
+            g_originalGetSaveData = nullptr;
+        }
+
+        if (g_onPreLoadMapHook != nullptr)
+        {
+            if (g_self->hooks->Hooks != nullptr)
+            {
+                g_self->hooks->Hooks->Remove(
+                    g_onPreLoadMapHook);
+            }
+
+            g_onPreLoadMapHook = nullptr;
+            g_originalOnPreLoadMap = nullptr;
+        }
+
         if (bInitConfig)
         {
             //
@@ -545,7 +1686,12 @@ extern "C"
 
         g_networkSessionActive = false;
         g_gameWorldActive = false;
+        g_gameWorld = nullptr;
+        g_authoritativeWorldReadyObserved = false;
+        ResetProtectedIdPublication();
 
+        PersistentIdFixSourceReadObserver::Reset();
+        PersistentIdFixMassFragmentClassifier::ResetDescriptorRegistry();
         PersistentIdFixSystem::Reset();
 
         g_self = nullptr;
@@ -563,9 +1709,40 @@ extern "C"
             LOG_INFO(
                 "PersistentIdFix: shutting down");
 
+            const bool activeWorldAtUnload =
+                g_gameWorldActive ||
+                PersistentIdFixSystem::IsLateAttachmentDetected();
+
+            if (activeWorldAtUnload && !g_engineShutdownObserved)
+            {
+#ifdef MODLOADER_CLIENT_BUILD
+                LOG_WARN(
+                    "PersistentIdFix: hot unload detected while a game world is active; displaying client warning");
+                ShowHotUnloadMessageBox();
+#else
+                LOG_WARN(
+                    "PersistentIdFix: hot unload detected while a game world is active");
+                LOG_WARN(
+                    "========== PersistentIdFix: ACTIVE-WORLD UNLOAD ==========");
+                LOG_WARN(
+                    "PersistentIdFix is being unloaded while gameplay is active.");
+                LOG_WARN(
+                    "Persistent ID reuse will stop for this running session.");
+                LOG_WARN(
+                    "Do not hot-load PersistentIdFix back into this same running world.");
+                LOG_WARN(
+                    "Restart or reload the world with PersistentIdFix active before relying on ID reuse again.");
+                LOG_WARN(
+                    "============================================================");
+#endif
+            }
+
             PersistentIdFixNetwork::Shutdown();
             g_networkSessionActive = false;
             g_gameWorldActive = false;
+            g_gameWorld = nullptr;
+            g_authoritativeWorldReadyObserved = false;
+            ResetProtectedIdPublication();
 
 #ifdef MODLOADER_CLIENT_BUILD
             PersistentIdFixUI::Shutdown();
@@ -578,6 +1755,9 @@ extern "C"
                 {
                     g_self->hooks->Engine->UnregisterOnTick(
                         &OnTick);
+
+                    g_self->hooks->Engine->UnregisterOnShutdown(
+                        &OnEngineShutdown);
                 }
 
                 if (g_self->hooks->World != nullptr)
@@ -586,7 +1766,7 @@ extern "C"
                         &OnWorldBeginPlay);
 
                     g_self->hooks->World->UnregisterOnSaveLoaded(
-                        &PersistentIdFixSystem::OnSaveLoaded);
+                        &OnSaveLoaded);
 
                     g_self->hooks->World->UnregisterOnAfterWorldEndPlay(
                         &OnAfterWorldEndPlay);
@@ -598,15 +1778,50 @@ extern "C"
                     g_self->hooks->Hooks->Remove(
                         g_getOrAddIDForHandleHook);
                 }
+
+                if (g_setIDHandlePairHook != nullptr &&
+                    g_self->hooks->Hooks != nullptr)
+                {
+                    g_self->hooks->Hooks->Remove(
+                        g_setIDHandlePairHook);
+                }
+
+                if (g_getSaveDataHook != nullptr &&
+                    g_self->hooks->Hooks != nullptr)
+                {
+                    g_self->hooks->Hooks->Remove(
+                        g_getSaveDataHook);
+                }
+
+                if (g_onPreLoadMapHook != nullptr &&
+                    g_self->hooks->Hooks != nullptr)
+                {
+                    g_self->hooks->Hooks->Remove(
+                        g_onPreLoadMapHook);
+                }
             }
 
+            PersistentIdFixSourceReadObserver::Reset();
+            PersistentIdFixMassFragmentClassifier::ResetDescriptorRegistry();
             PersistentIdFixSystem::Reset();
             g_gameWorldActive = false;
+            g_gameWorld = nullptr;
 
             g_getOrAddIDForHandleHook = nullptr;
             g_originalGetOrAddIDForHandle = nullptr;
 
+            g_setIDHandlePairHook = nullptr;
+            g_originalSetIDHandlePair = nullptr;
+
+            g_getSaveDataHook = nullptr;
+            g_originalGetSaveData = nullptr;
+
+            g_onPreLoadMapHook = nullptr;
+            g_originalOnPreLoadMap = nullptr;
+
             g_getOrAddIDForHandleAddress = 0;
+            g_getSaveDataAddress = 0;
+            g_onPreLoadMapAddress = 0;
             g_setIDHandlePairAddress = 0;
 
             g_self = nullptr;
