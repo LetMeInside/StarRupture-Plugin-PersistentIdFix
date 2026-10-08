@@ -23,7 +23,7 @@
 #include <vector>
 
 #ifndef PERSISTENTIDFIX_REFLECTION_TEST_MODE
-#define PERSISTENTIDFIX_REFLECTION_TEST_MODE 1
+#define PERSISTENTIDFIX_REFLECTION_TEST_MODE 0
 #endif
 
 namespace
@@ -86,6 +86,36 @@ namespace
     std::array<const UScriptStruct*, 6> g_descriptors{};
     bool g_registryReady = false;
 
+    struct MulticardsNames
+    {
+        FName Field;
+        FName ArrayClass;
+        FName IntClass;
+    };
+
+    // Production-owned values only: never retain optional asset/function pointers.
+    StaticFindObjectSafeByNameFn g_multicardsResolver = nullptr;
+    MulticardsNames g_multicardsNames{};
+    bool g_multicardsNamesAttempted = false;
+    bool g_multicardsNamesReady = false;
+    std::uint64_t g_registryEpoch = 0;
+
+    struct NameConversionParams
+    {
+        FString InString;
+        FName ReturnValue;
+    };
+
+    static_assert(sizeof(FName) == 0x08);
+    static_assert(offsetof(FName, ComparisonIndex) == 0);
+    static_assert(offsetof(FName, Number) == 4);
+    static_assert(offsetof(FField, Name) == 0x20);
+    static_assert(sizeof(NameConversionParams) == 0x18);
+    static_assert(alignof(NameConversionParams) == 8);
+    static_assert(offsetof(NameConversionParams, ReturnValue) == 0x10);
+    static_assert(sizeof(TArray<std::int32_t>) == 0x10);
+    static_assert(alignof(TArray<std::int32_t>) == 8);
+
 
     std::atomic<std::uint64_t> g_gameStatePlayers{0};
     std::atomic<std::uint64_t> g_gameStateFloorValues{0};
@@ -94,6 +124,7 @@ namespace
     std::atomic<std::uint64_t> g_gameStateDeviceEmpty{0};
     std::atomic<std::uint64_t> g_gameStateDeviceMalformed{0};
     std::atomic<std::uint64_t> g_gameStateDeviceUnknownPresent{0};
+    std::atomic<std::uint64_t> g_gameStateDeviceRecognizedPidFree{0};
     std::atomic<std::uint64_t> g_gameStateDeviceShadowSupported{0};
     std::atomic<std::uint64_t> g_gameStateDeviceShadowUnsupported{0};
     std::atomic<std::uint64_t> g_gameStateDeviceShadowProperties{0};
@@ -146,6 +177,202 @@ namespace
         }
 
         return IsReadableRange(data, countWide * sizeof(T));
+    }
+
+    bool ValidateMulticardsIndexes(const TArray<std::int32_t>& indexes)
+    {
+        // An explicit compatibility bound; exceeding it leaves coverage unknown.
+        constexpr std::int32_t maxKeycardIndexes = 65536;
+        if (indexes.Num() < 0 || indexes.Max() < 0 || indexes.Num() > indexes.Max() ||
+            indexes.Max() > maxKeycardIndexes ||
+            (indexes.GetDataPtr() != nullptr &&
+                reinterpret_cast<std::uintptr_t>(indexes.GetDataPtr()) % alignof(std::int32_t) != 0))
+            return false;
+        return ValidateArray(indexes);
+    }
+
+    bool SameName(const FName& actual, const FName& expected)
+    {
+        return actual.ComparisonIndex == expected.ComparisonIndex &&
+            actual.Number == expected.Number;
+    }
+
+    bool InitializeMulticardsNames(StaticFindObjectSafeByNameFn findSafe,
+        IPluginObjectWalker* walker, MulticardsNames& names)
+    {
+        // The public resolver selects class/function by name. Independently
+        // verify the resolved function's owner and the non-null CDO target.
+        UObject* classObject = findSafe(nullptr, nullptr, L"/Script/CoreUObject.Class", true);
+        if (!IsReadableRange(classObject, sizeof(UClass)))
+            return false;
+        auto* classClass = reinterpret_cast<UClass*>(classObject);
+        auto* libraryClass = reinterpret_cast<UClass*>(findSafe(classClass, nullptr,
+            L"/Script/Engine.KismetStringLibrary", true));
+        auto* functionClass = reinterpret_cast<UClass*>(findSafe(classClass, nullptr,
+            L"/Script/CoreUObject.Function", true));
+        if (!IsReadableRange(libraryClass, sizeof(UClass)) ||
+            !IsReadableRange(functionClass, sizeof(UClass)) ||
+            libraryClass->Class != classClass || functionClass->Class != classClass)
+            return false;
+
+        UObject* target = findSafe(libraryClass, nullptr,
+            L"/Script/Engine.Default__KismetStringLibrary", true);
+        auto* function = static_cast<UFunction*>(walker->ResolveUFunction(
+            "KismetStringLibrary", "Conv_StringToName"));
+        if (!IsReadableRange(target, sizeof(UObject)) || target->Class != libraryClass ||
+            !IsReadableRange(function, sizeof(UFunction)) ||
+            function->Class != functionClass || function->Outer != libraryClass ||
+            function->Size != sizeof(NameConversionParams) ||
+            (function->FunctionFlags & 0x2400u) != 0x2400u ||
+            function->ExecFunction == nullptr)
+            return false;
+
+        // Verify the reflected parameter layout before supplying borrowed input.
+        const FField* parameter = function->ChildProperties;
+        bool inputSeen = false;
+        bool outputSeen = false;
+        for (std::size_t i = 0; i < 2; ++i)
+        {
+            const auto* property = reinterpret_cast<const FProperty*>(parameter);
+            if (!IsReadableRange(property, sizeof(FProperty)) ||
+                !IsReadableRange(property->ClassPrivate, sizeof(FFieldClass)) ||
+                property->ArrayDim != 1)
+                return false;
+            const auto flags = static_cast<EClassCastFlags>(property->ClassPrivate->CastFlags);
+            if (property->Offset == 0 && property->ElementSize == 0x10 &&
+                (flags & EClassCastFlags::StrProperty) && !inputSeen &&
+                (property->PropertyFlags & 0x480u) == 0x80u)
+                inputSeen = true;
+            else if (property->Offset == 0x10 && property->ElementSize == 8 &&
+                (flags & EClassCastFlags::NameProperty) && !outputSeen &&
+                (property->PropertyFlags & 0x480u) == 0x480u)
+                outputSeen = true;
+            else
+                return false;
+            parameter = property->Next;
+        }
+        if (parameter != nullptr || !inputSeen || !outputSeen)
+            return false;
+
+        const auto convert = [&](const wchar_t* literal, FName& name)
+        {
+            // SDK FString(const wchar_t*) is a non-owning header. The literal
+            // outlives ProcessEvent; the audited thunk owns/frees its input copy.
+            NameConversionParams params{FString(literal), FName{}};
+            if (!walker->InvokeResolvedUFunction(target, function, &params) ||
+                params.ReturnValue.IsNone() || params.ReturnValue.Number != 0)
+                return false;
+            name = params.ReturnValue;
+            return true;
+        };
+
+        return convert(L"EnteredKeycardIndexes_4_BC9CABA9934C80F62FC5349C733585CA", names.Field) &&
+            convert(L"ArrayProperty", names.ArrayClass) &&
+            convert(L"IntProperty", names.IntClass);
+    }
+
+    bool GetMulticardsNames(StaticFindObjectSafeByNameFn& findSafe,
+        MulticardsNames& names)
+    {
+        IPluginObjectWalker* walker = g_self != nullptr && g_self->hooks != nullptr
+            ? g_self->hooks->ObjectWalker : nullptr;
+        if (walker == nullptr || walker->IsReady == nullptr || !walker->IsReady() ||
+            walker->ResolveUFunction == nullptr || walker->InvokeResolvedUFunction == nullptr)
+            return false;
+
+        std::uint64_t epoch = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_registryMutex);
+            if (!g_registryReady || g_multicardsResolver == nullptr)
+                return false;
+            findSafe = g_multicardsResolver;
+            if (g_multicardsNamesReady)
+            {
+                names = g_multicardsNames;
+                return true;
+            }
+            if (g_multicardsNamesAttempted)
+                return false;
+            g_multicardsNamesAttempted = true;
+            epoch = g_registryEpoch;
+        }
+
+        // Never hold the registry lock across ProcessEvent. Concurrent or
+        // reentrant observations fail closed while this one attempt is pending.
+        MulticardsNames resolved{};
+        const bool ready = InitializeMulticardsNames(findSafe, walker, resolved);
+        std::lock_guard<std::mutex> lock(g_registryMutex);
+        if (epoch != g_registryEpoch || !g_registryReady)
+            return false;
+        g_multicardsNamesReady = ready;
+        if (ready)
+        {
+            g_multicardsNames = resolved;
+            names = resolved;
+        }
+        LOG_INFO("PersistentIdFix: Multicards PID-free schema names: ready=%u", ready ? 1u : 0u);
+        return ready;
+    }
+
+    bool ExactPropertyClass(const FProperty* property, const FName& name,
+        EClassCastFlags requiredFlag)
+    {
+        if (!IsReadableRange(property, sizeof(FProperty)) ||
+            !IsReadableRange(property->ClassPrivate, sizeof(FFieldClass)))
+            return false;
+        FName actual{};
+        std::memcpy(&actual, &property->ClassPrivate->Name, sizeof(actual));
+        return SameName(actual, name) &&
+            (static_cast<EClassCastFlags>(property->ClassPrivate->CastFlags) & requiredFlag);
+    }
+
+    bool IsVerifiedMulticardsPayload(const FInstancedStruct& payload)
+    {
+        StaticFindObjectSafeByNameFn findSafe = nullptr;
+        MulticardsNames names{};
+        if (!GetMulticardsNames(findSafe, names))
+            return false;
+
+        auto* expectedClass = reinterpret_cast<UClass*>(findSafe(nullptr, nullptr,
+            L"/Script/CoreUObject.UserDefinedStruct", true));
+        if (!IsReadableRange(expectedClass, sizeof(UClass)))
+            return false;
+        auto* expected = reinterpret_cast<const UUserDefinedStruct*>(findSafe(
+            expectedClass, nullptr,
+            L"/Game/Chimera/Environment/Megamachines/MulticardsTerminalSaveData.MulticardsTerminalSaveData",
+            true));
+        if (expected == nullptr || payload.ScriptStruct != expected ||
+            !IsReadableRange(expected, sizeof(UUserDefinedStruct)) ||
+            expected->Class != expectedClass ||
+            expected->Status != EUserDefinedStructureStatus::UDSS_UpToDate ||
+            expected->Size != 0x10 || expected->MinAlignment != 8 ||
+            expected->SuperStruct != nullptr || expected->Children != nullptr ||
+            !IsReadableRange(payload.StructMemory, 0x10) ||
+            reinterpret_cast<std::uintptr_t>(payload.StructMemory) % 8 != 0)
+            return false;
+
+        // Exactly one top-level field: no unbounded chain walk or skipped fields.
+        const auto* property = reinterpret_cast<const FProperty*>(expected->ChildProperties);
+        if (!ExactPropertyClass(property, names.ArrayClass, EClassCastFlags::ArrayProperty) ||
+            !IsReadableRange(property, sizeof(FArrayProperty)) || property->Next != nullptr ||
+            property->Offset != 0 || property->ArrayDim != 1 || property->ElementSize != 0x10)
+            return false;
+        FName actualName{};
+        std::memcpy(&actualName, &property->Name, sizeof(actualName));
+        if (!SameName(actualName, names.Field))
+            return false;
+        const auto* inner = static_cast<const FArrayProperty*>(property)->InnerProperty;
+        if (!ExactPropertyClass(inner, names.IntClass, EClassCastFlags::IntProperty) ||
+            inner->Offset != 0 || inner->ArrayDim != 1 || inner->ElementSize != 4 ||
+            inner->Next != nullptr)
+            return false;
+
+        TArray<std::int32_t> indexes{};
+        std::memcpy(&indexes, payload.StructMemory, sizeof(indexes));
+        // This exact, audited Blueprint schema contains keycard indices, not
+        // Mass PIDs. Runtime metadata cannot recover text fields discarded by
+        // the native importer; this is not a generic serialization certificate.
+        return ValidateMulticardsIndexes(indexes);
     }
 
     void ContainerFailure(Section section)
@@ -469,6 +696,11 @@ namespace PersistentIdFixIndependentSourceCollector
 
         g_registryReady = false;
         g_descriptors.fill(nullptr);
+        g_multicardsResolver = nullptr;
+        g_multicardsNames = {};
+        g_multicardsNamesAttempted = false;
+        g_multicardsNamesReady = false;
+        ++g_registryEpoch;
 
 #if PERSISTENTIDFIX_REFLECTION_TEST_MODE
         PersistentIdFixReflectionDiagnostics::ResetDescriptorRegistry();
@@ -537,6 +769,7 @@ namespace PersistentIdFixIndependentSourceCollector
         PersistentIdFixReflectionDiagnostics::InitializeDescriptorRegistry(findSafe, scriptStructClass);
 #endif
 
+        g_multicardsResolver = findSafe;
         g_registryReady = true;
 
         LOG_INFO(
@@ -552,6 +785,11 @@ namespace PersistentIdFixIndependentSourceCollector
         std::lock_guard<std::mutex> lock(g_registryMutex);
         g_registryReady = false;
         g_descriptors.fill(nullptr);
+        g_multicardsResolver = nullptr;
+        g_multicardsNames = {};
+        g_multicardsNamesAttempted = false;
+        g_multicardsNamesReady = false;
+        ++g_registryEpoch;
 
 #if PERSISTENTIDFIX_REFLECTION_TEST_MODE
         PersistentIdFixReflectionDiagnostics::ResetDescriptorRegistry();
@@ -720,6 +958,7 @@ namespace PersistentIdFixIndependentSourceCollector
         std::uint64_t deviceEmpty = 0;
         std::uint64_t deviceMalformed = 0;
         std::uint64_t deviceUnknownPresent = 0;
+        std::uint64_t deviceRecognizedPidFree = 0;
         std::uint64_t opaqueStoreEntries = 0;
         std::uint64_t discoveredBuildingValues = 0;
 
@@ -835,61 +1074,78 @@ namespace PersistentIdFixIndependentSourceCollector
                             return false;
                         }
 
-                        PersistentIdFixReflectionDiagnostics::ShadowSchemaSummary shadow{};
-
-                        const bool shadowSupported =
-                            PersistentIdFixReflectionDiagnostics::AnalyzeShadowPayload(
-                                payload,
-                                shadow);
-
-                        if (shadowSupported)
+                        if (!IsReadableRange(payload.ScriptStruct, sizeof(UScriptStruct)))
                         {
-                            g_gameStateDeviceShadowSupported.fetch_add(
-                                1,
-                                std::memory_order_relaxed);
+                            ++deviceMalformed;
+                            return false;
                         }
+
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+                        try
+                        {
+                            PersistentIdFixReflectionDiagnostics::ShadowSchemaSummary shadow{};
+
+                            const bool shadowSupported =
+                                PersistentIdFixReflectionDiagnostics::AnalyzeShadowPayload(
+                                    payload,
+                                    shadow);
+
+                            if (shadowSupported)
+                            {
+                                g_gameStateDeviceShadowSupported.fetch_add(
+                                    1,
+                                    std::memory_order_relaxed);
+                            }
+                            else
+                            {
+                                g_gameStateDeviceShadowUnsupported.fetch_add(
+                                    1,
+                                    std::memory_order_relaxed);
+                            }
+
+                            g_gameStateDeviceShadowProperties.fetch_add(
+                                shadow.properties,
+                                std::memory_order_relaxed);
+                            g_gameStateDeviceShadowArrays.fetch_add(
+                                shadow.arrays,
+                                std::memory_order_relaxed);
+                            g_gameStateDeviceShadowStructs.fetch_add(
+                                shadow.structs,
+                                std::memory_order_relaxed);
+                            g_gameStateDeviceShadowIntegralLeaves.fetch_add(
+                                shadow.integralLeaves,
+                                std::memory_order_relaxed);
+                            g_gameStateDeviceShadowEnumLeaves.fetch_add(
+                                shadow.enumLeaves,
+                                std::memory_order_relaxed);
+
+                            std::uint64_t observedDepth =
+                                g_gameStateDeviceShadowMaxDepth.load(
+                                    std::memory_order_relaxed);
+
+                            while (observedDepth < shadow.maxDepth &&
+                                !g_gameStateDeviceShadowMaxDepth.compare_exchange_weak(
+                                    observedDepth,
+                                    shadow.maxDepth,
+                                    std::memory_order_relaxed))
+                            {
+                            }
+
+                            PersistentIdFixReflectionDiagnostics::LogPayloadShape(
+                                payload, shadowSupported, shadow);
+                        }
+                        catch (...)
+                        {
+                            // Optional diagnostics cannot fail production collection.
+                            g_gameStateDeviceShadowUnsupported.fetch_add(1, std::memory_order_relaxed);
+                        }
+#endif
+
+                        // Shadow results never determine production acceptance.
+                        if (IsVerifiedMulticardsPayload(payload))
+                            ++deviceRecognizedPidFree;
                         else
-                        {
-                            g_gameStateDeviceShadowUnsupported.fetch_add(
-                                1,
-                                std::memory_order_relaxed);
-                        }
-
-                        g_gameStateDeviceShadowProperties.fetch_add(
-                            shadow.properties,
-                            std::memory_order_relaxed);
-                        g_gameStateDeviceShadowArrays.fetch_add(
-                            shadow.arrays,
-                            std::memory_order_relaxed);
-                        g_gameStateDeviceShadowStructs.fetch_add(
-                            shadow.structs,
-                            std::memory_order_relaxed);
-                        g_gameStateDeviceShadowIntegralLeaves.fetch_add(
-                            shadow.integralLeaves,
-                            std::memory_order_relaxed);
-                        g_gameStateDeviceShadowEnumLeaves.fetch_add(
-                            shadow.enumLeaves,
-                            std::memory_order_relaxed);
-
-                        std::uint64_t observedDepth =
-                            g_gameStateDeviceShadowMaxDepth.load(
-                                std::memory_order_relaxed);
-
-                        while (observedDepth < shadow.maxDepth &&
-                            !g_gameStateDeviceShadowMaxDepth.compare_exchange_weak(
-                                observedDepth,
-                                shadow.maxDepth,
-                                std::memory_order_relaxed))
-                        {
-                        }
-
-                        PersistentIdFixReflectionDiagnostics::LogPayloadShape(
-                            payload, shadowSupported, shadow);
-
-                        // Shadow-only for now: an otherwise valid payload
-                        // remains uncertified until value traversal and the
-                        // serialization-representation contract are proven.
-                        ++deviceUnknownPresent;
+                            ++deviceUnknownPresent;
                         return true;
                     }))
             {
@@ -924,6 +1180,9 @@ namespace PersistentIdFixIndependentSourceCollector
                 std::memory_order_relaxed);
             g_gameStateDeviceUnknownPresent.fetch_add(
                 deviceUnknownPresent,
+                std::memory_order_relaxed);
+            g_gameStateDeviceRecognizedPidFree.fetch_add(
+                deviceRecognizedPidFree,
                 std::memory_order_relaxed);
             g_gameStateOpaqueStoreEntries.fetch_add(
                 opaqueStoreEntries,
@@ -975,6 +1234,8 @@ namespace PersistentIdFixIndependentSourceCollector
             g_gameStateDeviceMalformed.load(std::memory_order_relaxed);
         result.gameStateDeviceUnknownPresent =
             g_gameStateDeviceUnknownPresent.load(std::memory_order_relaxed);
+        result.gameStateDeviceRecognizedPidFree =
+            g_gameStateDeviceRecognizedPidFree.load(std::memory_order_relaxed);
         result.gameStateDeviceShadowSupported =
             g_gameStateDeviceShadowSupported.load(std::memory_order_relaxed);
         result.gameStateDeviceShadowUnsupported =
@@ -1053,7 +1314,7 @@ namespace PersistentIdFixIndependentSourceCollector
             snapshot.gameStateData);
 
         LOG_INFO(
-            "PersistentIdFix: GameState source details [%s]: players=%llu floor=%llu antennaFog=%llu devicePayloads=%llu deviceEmpty=%llu deviceMalformed=%llu deviceUnknown=%llu opaqueStoreEntries=%llu discoveredBuildings=%llu",
+            "PersistentIdFix: GameState source details [%s]: players=%llu floor=%llu antennaFog=%llu devicePayloads=%llu deviceEmpty=%llu deviceMalformed=%llu deviceUnknown=%llu deviceRecognizedPidFree=%llu opaqueStoreEntries=%llu discoveredBuildings=%llu",
             phase != nullptr ? phase : "<null>",
             static_cast<unsigned long long>(snapshot.gameStatePlayers),
             static_cast<unsigned long long>(snapshot.gameStateFloorValues),
@@ -1062,6 +1323,7 @@ namespace PersistentIdFixIndependentSourceCollector
             static_cast<unsigned long long>(snapshot.gameStateDeviceEmpty),
             static_cast<unsigned long long>(snapshot.gameStateDeviceMalformed),
             static_cast<unsigned long long>(snapshot.gameStateDeviceUnknownPresent),
+            static_cast<unsigned long long>(snapshot.gameStateDeviceRecognizedPidFree),
             static_cast<unsigned long long>(snapshot.gameStateOpaqueStoreEntries),
             static_cast<unsigned long long>(snapshot.gameStateDiscoveredBuildingValues));
 
@@ -1098,6 +1360,7 @@ namespace PersistentIdFixIndependentSourceCollector
         g_gameStateDeviceEmpty.store(0, std::memory_order_relaxed);
         g_gameStateDeviceMalformed.store(0, std::memory_order_relaxed);
         g_gameStateDeviceUnknownPresent.store(0, std::memory_order_relaxed);
+        g_gameStateDeviceRecognizedPidFree.store(0, std::memory_order_relaxed);
         g_gameStateDeviceShadowSupported.store(0, std::memory_order_relaxed);
         g_gameStateDeviceShadowUnsupported.store(0, std::memory_order_relaxed);
         g_gameStateDeviceShadowProperties.store(0, std::memory_order_relaxed);

@@ -7,7 +7,7 @@
 #include <cstdint>
 
 #ifndef PERSISTENTIDFIX_REFLECTION_TEST_MODE
-#define PERSISTENTIDFIX_REFLECTION_TEST_MODE 1
+#define PERSISTENTIDFIX_REFLECTION_TEST_MODE 0
 #endif
 
 namespace PersistentIdFixReflectionWalker
