@@ -57,6 +57,9 @@ namespace
     const UScriptStruct* g_reflectionTestMapMenuDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestPlayerDescriptor = nullptr;
     const UScriptStruct* g_reflectionTestAntennaDescriptor = nullptr;
+    const UScriptStruct* g_reflectionTestMassDescriptor = nullptr;
+    const UScriptStruct* g_reflectionTestStabilityDescriptor = nullptr;
+    const UScriptStruct* g_reflectionTestPidArrayDescriptor = nullptr;
     // Patch 28: diagnostic-only canonical identities; never used for PID certification.
     const UScriptStruct* g_step28Store = nullptr;
     const UScriptStruct* g_step28ItemId = nullptr;
@@ -1115,6 +1118,290 @@ namespace
         }
     }
 
+    namespace
+    {
+        constexpr std::size_t kRampObservationCapacity = 4096;
+        constexpr std::int32_t kRampOracleMaxSlots = 65536;
+        constexpr std::uint64_t kRampOracleMaxNestedElements = 4096;
+
+        bool RampDescriptorReady(const UScriptStruct* descriptor,
+            std::size_t size, std::size_t alignment)
+        {
+            return descriptor != nullptr && IsReadableRange(descriptor, sizeof(UScriptStruct)) &&
+                descriptor->Size == size && descriptor->MinAlignment == alignment;
+        }
+
+        bool RampStructPropertyMatches(const FProperty* property,
+            const UScriptStruct* descriptor, std::size_t size)
+        {
+            return property != nullptr &&
+                HasCastFlag(property, EClassCastFlags::StructProperty) &&
+                IsReadableRange(property, sizeof(FStructProperty)) &&
+                property->ArrayDim == 1 && property->ElementSize == size &&
+                reinterpret_cast<const FStructProperty*>(property)->Struct == descriptor;
+        }
+
+        const FArrayProperty* FindRampValuesProperty(const UStruct* descriptor)
+        {
+            std::uint32_t inheritanceGuard = 0;
+            while (descriptor != nullptr)
+            {
+                if (++inheritanceGuard > kShadowMaxStructDepth ||
+                    !IsReadableRange(descriptor, sizeof(UStruct)))
+                    return nullptr;
+                const FField* field = descriptor->ChildProperties;
+                std::uint64_t chainGuard = 0;
+                while (field != nullptr)
+                {
+                    if (++chainGuard > kShadowMaxProperties ||
+                        !IsReadableRange(field, sizeof(FField)))
+                        return nullptr;
+                    if (HasCastFlag(field, EClassCastFlags::ArrayProperty))
+                    {
+                        const auto* property = reinterpret_cast<const FArrayProperty*>(field);
+                        if (!IsReadableRange(property, sizeof(FArrayProperty)))
+                            return nullptr;
+                        if (property->Offset == offsetof(FCrMassPersistentEntityIDArray, Values) &&
+                            property->ArrayDim == 1 &&
+                            property->ElementSize == sizeof(TArray<FCrMassPersistentEntityID>))
+                            return property;
+                    }
+                    field = field->Next;
+                }
+                descriptor = descriptor->SuperStruct;
+            }
+            return nullptr;
+        }
+
+        // Independent SDK iterator/indexing oracle. No reflected container
+        // helper or native reflection map-slot decoder participates here.
+        bool CollectRampOracle(const FCrMassSaveData& mass, ShadowExactPidSink& oracle,
+            std::uint64_t& mapEntries, std::uint64_t& nestedElements, const char*& reason)
+        {
+            const auto fail = [&](const char* value) { reason = value; return false; };
+            const auto& values = mass.StabilitySubsystemState.RampConnectionData;
+            if (!IsReadableRange(&values, sizeof(values)))
+                return fail("oracle-header-unreadable");
+            const auto live = values.Num();
+            const auto allocated = values.NumAllocated();
+            const auto capacity = values.Max();
+            const auto& flags = values.GetAllocationFlags();
+            if (live < 0 || allocated < 0 || capacity < 0 || live > allocated ||
+                allocated > capacity || allocated > kRampOracleMaxSlots ||
+                static_cast<std::size_t>(live) > oracle.Capacity ||
+                flags.Num() != allocated || flags.Max() < flags.Num())
+                return fail("oracle-count-or-capacity-invalid");
+            if (allocated == 0)
+                return live == 0;
+            const auto words = (static_cast<std::size_t>(allocated) + 31u) / 32u;
+            if (!values.IsValid() || words >
+                    (std::numeric_limits<std::size_t>::max)() / sizeof(std::uint32_t) ||
+                !IsReadableRange(flags.GetData(), words * sizeof(std::uint32_t)))
+                return fail("oracle-bitmap-unreadable");
+            struct SparseDataHeader
+            {
+                const void* Data;
+                std::int32_t Num;
+                std::int32_t Max;
+            };
+            static_assert(sizeof(SparseDataHeader) == 0x10);
+            SparseDataHeader sparse{};
+            std::memcpy(&sparse, &values, sizeof(sparse));
+            using Map = TMap<FCrMassPersistentEntityID, FCrMassPersistentEntityIDArray>;
+            using Slot = UC::ContainerImpl::SetElement<Map::ElementType>;
+            if (sparse.Num != allocated || sparse.Max != capacity || sparse.Data == nullptr ||
+                reinterpret_cast<std::uintptr_t>(sparse.Data) % alignof(Slot) != 0 ||
+                static_cast<std::size_t>(allocated) >
+                    (std::numeric_limits<std::size_t>::max)() / sizeof(Slot) ||
+                !IsReadableRange(sparse.Data, static_cast<std::size_t>(allocated) * sizeof(Slot)))
+                return fail("oracle-slots-unreadable-or-invalid");
+            for (auto it = begin(values); it != end(values); ++it)
+            {
+                if (mapEntries >= static_cast<std::uint64_t>(live) ||
+                    oracle.Count >= oracle.Capacity)
+                    return fail("oracle-entry-or-occurrence-limit");
+                ++mapEntries;
+                oracle.Observe(it->Key().ID);
+                const auto& array = it->Value().Values;
+                if (!IsReadableRange(&array, sizeof(array)))
+                    return fail("oracle-array-header-unreadable");
+                const auto count = array.Num();
+                const auto maximum = array.Max();
+                const auto* data = array.GetDataPtr();
+                if (count < 0 || maximum < 0 || count > maximum ||
+                    (maximum > 0 && data == nullptr))
+                    return fail("oracle-array-count-or-storage-invalid");
+                const auto countWide = static_cast<std::size_t>(count);
+                if (countWide > kRampOracleMaxNestedElements - nestedElements ||
+                    countWide > oracle.Capacity - oracle.Count)
+                    return fail("oracle-array-or-occurrence-limit");
+                if (count != 0 && (data == nullptr ||
+                    reinterpret_cast<std::uintptr_t>(data) % alignof(FCrMassPersistentEntityID) != 0 ||
+                    countWide > (std::numeric_limits<std::size_t>::max)() /
+                        sizeof(FCrMassPersistentEntityID) ||
+                    !IsReadableRange(data, countWide * sizeof(FCrMassPersistentEntityID))))
+                    return fail("oracle-array-alignment-or-extent-invalid");
+                for (std::int32_t index = 0; index < count; ++index)
+                {
+                    if (!array.IsValidIndex(index))
+                        return fail("oracle-array-index-invalid");
+                    oracle.Observe(array[index].ID);
+                    ++nestedElements;
+                }
+                if (array.Num() != count || array.Max() != maximum || array.GetDataPtr() != data)
+                    return fail("oracle-array-header-changed");
+            }
+            if (mapEntries != static_cast<std::uint64_t>(live) || oracle.Overflow ||
+                values.Num() != live || values.NumAllocated() != allocated || values.Max() != capacity)
+                return fail("oracle-incomplete-or-header-changed");
+            return true;
+        }
+    }
+
+    void RunStabilityRampMapValueTest(const UScriptStruct* suppliedDescriptor,
+        const FCrMassSaveData& data) noexcept
+    {
+        try
+        {
+            std::array<std::uint32_t, kRampObservationCapacity> found{}, expected{};
+            ShadowExactPidSink discoveries{found.data(), found.size()};
+            ShadowExactPidSink oracle{expected.data(), expected.size()};
+            std::uint64_t mapEntries = 0, nestedElements = 0;
+            const bool descriptorReady = suppliedDescriptor == g_reflectionTestMassDescriptor &&
+                RampDescriptorReady(g_reflectionTestMassDescriptor, sizeof(data), alignof(FCrMassSaveData)) &&
+                RampDescriptorReady(g_reflectionTestStabilityDescriptor,
+                    sizeof(FCrBuildingStabilitySubsystemState), alignof(FCrBuildingStabilitySubsystemState)) &&
+                RampDescriptorReady(g_reflectionTestPidArrayDescriptor,
+                    sizeof(FCrMassPersistentEntityIDArray), alignof(FCrMassPersistentEntityIDArray)) &&
+                RampDescriptorReady(g_reflectionTestPersistentIdDescriptor,
+                    sizeof(FCrMassPersistentEntityID), alignof(FCrMassPersistentEntityID)) &&
+                IsReadableRange(&data, sizeof(data)) &&
+                reinterpret_cast<std::uintptr_t>(&data) % alignof(FCrMassSaveData) == 0;
+            const auto* stabilityProperty = descriptorReady ? FindStructPropertyByOffset(
+                suppliedDescriptor, offsetof(FCrMassSaveData, StabilitySubsystemState),
+                g_reflectionTestStabilityDescriptor) : nullptr;
+            const bool rootLink = stabilityProperty != nullptr &&
+                stabilityProperty->ElementSize == sizeof(FCrBuildingStabilitySubsystemState);
+            const auto* property = rootLink ? FindShadowTestMapPropertyByOffset(
+                g_reflectionTestStabilityDescriptor,
+                offsetof(FCrBuildingStabilitySubsystemState, RampConnectionData)) : nullptr;
+            const bool mapFound = property != nullptr &&
+                IsReadableRange(property, kShadowNativeMapDescriptorSize);
+            const bool exactKey = mapFound && RampStructPropertyMatches(property->KeyProperty,
+                g_reflectionTestPersistentIdDescriptor, sizeof(FCrMassPersistentEntityID));
+            const bool exactValue = mapFound && RampStructPropertyMatches(property->ValueProperty,
+                g_reflectionTestPidArrayDescriptor, sizeof(FCrMassPersistentEntityIDArray));
+            const auto* arrayProperty = exactValue ?
+                FindRampValuesProperty(g_reflectionTestPidArrayDescriptor) : nullptr;
+            const bool exactArrayInner = arrayProperty != nullptr &&
+                RampStructPropertyMatches(arrayProperty->InnerProperty,
+                    g_reflectionTestPersistentIdDescriptor, sizeof(FCrMassPersistentEntityID));
+            const bool schemaReady = descriptorReady && rootLink && mapFound &&
+                exactKey && exactValue && exactArrayInner;
+            const char* oracleReason = schemaReady ? "none" : "schema-not-validated";
+            const bool oracleComplete = schemaReady &&
+                CollectRampOracle(data, oracle, mapEntries, nestedElements, oracleReason);
+            auto summary = MakeShadowFixtureSummary();
+            summary.ExactPidSink = &discoveries;
+            LOG_INFO("PersistentIdFix: reflection stability ramp map test begin: "
+                "root=%p destination=%p descriptorReady=%u rootLink=%u mapFound=%u "
+                "exactKey=%u exactValue=%u exactArrayInner=%u oracleComplete=%u "
+                "mapEntries=%llu nestedElements=%llu oracleReason=%s",
+                static_cast<const void*>(suppliedDescriptor), static_cast<const void*>(&data),
+                descriptorReady ? 1u : 0u, rootLink ? 1u : 0u, mapFound ? 1u : 0u,
+                exactKey ? 1u : 0u, exactValue ? 1u : 0u, exactArrayInner ? 1u : 0u,
+                oracleComplete ? 1u : 0u, static_cast<unsigned long long>(mapEntries),
+                static_cast<unsigned long long>(nestedElements), oracleReason);
+            // The complete independent typed preflight (including every array's
+            // alignment) must succeed before any reflected fixture visitation.
+            const bool traversed = oracleComplete && TraverseShadowPropertyValue(property,
+                &data.StabilitySubsystemState.RampConnectionData, 0,
+                g_reflectionTestPersistentIdDescriptor, summary);
+            const bool reflectedComplete = traversed && summary.complete;
+            const bool comparisonComplete = oracleComplete && reflectedComplete &&
+                !discoveries.Overflow && discoveries.Count == discoveries.Observed &&
+                discoveries.Observed == summary.exactPersistentIds;
+            std::sort(found.begin(), found.begin() + discoveries.Count);
+            std::sort(expected.begin(), expected.begin() + oracle.Count);
+            std::size_t missing = 0, unexpected = 0, i = 0, j = 0;
+            constexpr std::size_t sampleLimit = 8;
+            std::array<std::uint32_t, sampleLimit> missingSample{}, unexpectedSample{};
+            while (i < oracle.Count || j < discoveries.Count)
+            {
+                if (i < oracle.Count && j < discoveries.Count && expected[i] == found[j])
+                {
+                    ++i;
+                    ++j;
+                }
+                else if (j == discoveries.Count || (i < oracle.Count && expected[i] < found[j]))
+                {
+                    if (missing < sampleLimit)
+                        missingSample[missing] = expected[i];
+                    ++missing;
+                    ++i;
+                }
+                else
+                {
+                    if (unexpected < sampleLimit)
+                        unexpectedSample[unexpected] = found[j];
+                    ++unexpected;
+                    ++j;
+                }
+            }
+            const auto count = [](const auto& values, std::size_t n, std::uint32_t value)
+            {
+                return static_cast<unsigned long long>(
+                    std::count(values.begin(), values.begin() + n, value));
+            };
+            const char* reason = !schemaReady ? "descriptor-or-property-schema" :
+                !oracleComplete ? "oracle-preflight-incomplete" :
+                !reflectedComplete ? summary.failureReason :
+                discoveries.Overflow ? "discovery-sink-overflow" :
+                !comparisonComplete ? "observation-count-mismatch" :
+                missing != 0 || unexpected != 0 ? "multiset-mismatch" : "none";
+            LOG_INFO("PersistentIdFix: reflection stability ramp map test: "
+                "descriptorReady=%u rootLink=%u mapFound=%u exactKey=%u exactValue=%u "
+                "exactArrayInner=%u oracleComplete=%u comparisonComplete=%u exactMatch=%u "
+                "mapPopulated=%u mapEntries=%llu nestedElements=%llu expected=%llu "
+                "observed=%llu stored=%llu overflow=%u missing=%llu unexpected=%llu "
+                "oracleZero=%llu discoveredZero=%llu oracleSentinel=%llu discoveredSentinel=%llu "
+                "exactPid=%llu reflectedComplete=%u semanticCertified=0 "
+                "arrays=%llu arrayElements=%llu unsupported=%llu opaque=%llu "
+                "budgetFailures=%llu depthFailures=%llu maxDepth=%llu reason=%s oracleReason=%s",
+                descriptorReady ? 1u : 0u, rootLink ? 1u : 0u, mapFound ? 1u : 0u,
+                exactKey ? 1u : 0u, exactValue ? 1u : 0u, exactArrayInner ? 1u : 0u,
+                oracleComplete ? 1u : 0u, comparisonComplete ? 1u : 0u,
+                comparisonComplete && missing == 0 && unexpected == 0 ? 1u : 0u,
+                mapEntries != 0 ? 1u : 0u, static_cast<unsigned long long>(mapEntries),
+                static_cast<unsigned long long>(nestedElements), static_cast<unsigned long long>(oracle.Count),
+                static_cast<unsigned long long>(discoveries.Observed),
+                static_cast<unsigned long long>(discoveries.Count), discoveries.Overflow ? 1u : 0u,
+                static_cast<unsigned long long>(missing), static_cast<unsigned long long>(unexpected),
+                count(expected, oracle.Count, 0), count(found, discoveries.Count, 0),
+                count(expected, oracle.Count, UINT32_MAX), count(found, discoveries.Count, UINT32_MAX),
+                static_cast<unsigned long long>(summary.exactPersistentIds), reflectedComplete ? 1u : 0u,
+                static_cast<unsigned long long>(summary.arrays), static_cast<unsigned long long>(summary.arrayElements),
+                static_cast<unsigned long long>(summary.unsupported), static_cast<unsigned long long>(summary.opaqueBoundaries),
+                static_cast<unsigned long long>(summary.budgetFailures), static_cast<unsigned long long>(summary.depthFailures),
+                static_cast<unsigned long long>(summary.maxDepth), reason, oracleReason);
+            for (std::size_t n = 0; n < (std::min)(missing, sampleLimit); ++n)
+                LOG_WARN("PersistentIdFix: reflection stability ramp mismatch sample: "
+                    "kind=missing pid=%u conclusive=%u", missingSample[n], comparisonComplete ? 1u : 0u);
+            for (std::size_t n = 0; n < (std::min)(unexpected, sampleLimit); ++n)
+                LOG_WARN("PersistentIdFix: reflection stability ramp mismatch sample: "
+                    "kind=unexpected pid=%u conclusive=%u", unexpectedSample[n], comparisonComplete ? 1u : 0u);
+        }
+        catch (...)
+        {
+            try
+            {
+                LOG_WARN("PersistentIdFix: reflection stability ramp map test: "
+                    "comparisonComplete=0 exactMatch=0 semanticCertified=0 reason=diagnostic-exception");
+            }
+            catch (...) {}
+        }
+    }
+
     void InitializeDescriptorRegistry(Resolver findSafe, UClass* scriptStructClass)
     {
         const auto resolveTestDescriptor =
@@ -1151,6 +1438,14 @@ namespace
                 return nullptr;
             return result;
         };
+        g_reflectionTestMassDescriptor = resolveStep28(
+            L"/Script/Chimera.CrMassSaveData", sizeof(FCrMassSaveData));
+        g_reflectionTestStabilityDescriptor = resolveStep28(
+            L"/Script/Chimera.CrBuildingStabilitySubsystemState",
+            sizeof(FCrBuildingStabilitySubsystemState));
+        g_reflectionTestPidArrayDescriptor = resolveStep28(
+            L"/Script/ChimeraMassCommon.CrMassPersistentEntityIDArray",
+            sizeof(FCrMassPersistentEntityIDArray));
         g_reflectionTestAntennaDescriptor = resolveStep28(
             L"/Script/Chimera.CrAntennaSaveData", sizeof(FCrAntennaSaveData));
         g_step28Store = resolveStep28(
@@ -1186,6 +1481,9 @@ namespace
         g_reflectionTestMapMenuDescriptor = nullptr;
         g_reflectionTestPlayerDescriptor = nullptr;
         g_reflectionTestAntennaDescriptor = nullptr;
+        g_reflectionTestMassDescriptor = nullptr;
+        g_reflectionTestStabilityDescriptor = nullptr;
+        g_reflectionTestPidArrayDescriptor = nullptr;
         g_step28Store = nullptr;
         g_step28ItemId = nullptr;
         g_step28Guid = nullptr;

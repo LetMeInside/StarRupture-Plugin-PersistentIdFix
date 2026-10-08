@@ -2,6 +2,7 @@
 
 #include "plugin_helpers.h"
 #include "IndependentSourceCollector.h"
+#include "ReflectionDiagnostics.h"
 
 #include "SDK/Chimera_structs.hpp"
 #include "SDK/AuActorPlacement_structs.hpp"
@@ -1737,6 +1738,15 @@ namespace PersistentIdFixMassFragmentClassifier
             LOG_WARN(
                 "PersistentIdFix: fixed-layout Mass remainder collection failed");
         }
+#if PERSISTENTIDFIX_REFLECTION_TEST_MODE
+        else
+        {
+            // Each successful source observation gets its own synchronous test.
+            // No diagnostic state or values carry across observations/generations.
+            PersistentIdFixReflectionDiagnostics::RunStabilityRampMapValueTest(
+                structType, *massSaveData);
+        }
+#endif
 
         if (!CheckedSparseMap(
                 massSaveData->Entities,
