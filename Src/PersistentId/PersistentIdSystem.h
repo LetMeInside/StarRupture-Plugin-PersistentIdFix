@@ -130,11 +130,11 @@ namespace PersistentIdFixSystem
 
     bool IsSessionActive();
 
-    // Late attachment can be established by either the allocator
-    // fallback or the engine-owned startup probe. Notification is
-    // consumed later from a safe lifecycle callback.
+    // Only positive startup evidence establishes confirmed late attachment.
+    // Pre-ownership allocator activity is a separate diagnostic, never authority.
     void MarkLateAttachmentDetected();
     bool ConsumeLateAttachmentNotification();
+    bool ConsumePreOwnershipNotification();
     bool IsLateAttachmentDetected();
 
     bool SetIDHandlePairDetour(

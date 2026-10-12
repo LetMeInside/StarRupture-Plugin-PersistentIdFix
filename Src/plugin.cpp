@@ -814,9 +814,17 @@ static void OnTick(
     {
         LOG_WARN(
             "PersistentIdFix: displaying late-attachment warning through ImGui");
-        PersistentIdFixUI::ShowLateAttachmentWarning();
+        PersistentIdFixUI::ShowAttachmentWarning(true);
     }
 #endif
+
+    if (PersistentIdFixSystem::ConsumePreOwnershipNotification())
+    {
+#ifdef MODLOADER_CLIENT_BUILD
+        PersistentIdFixUI::ShowAttachmentWarning(PersistentIdFixSystem::IsLateAttachmentDetected());
+#endif
+        // Dedicated servers already received the allocator's log-only diagnostic.
+    }
 
     if (g_self == nullptr ||
         g_self->hooks == nullptr ||
@@ -1561,10 +1569,10 @@ extern "C"
                 PersistentIdFixSystem::MarkLateAttachmentDetected();
 
                 LOG_WARN(
-                    "PersistentIdFix: startup attachment probe detected attachment to an already-active ChimeraMain world; persistent ID reuse remains disabled for this running world");
+                    "PersistentIdFix: startup attachment probe detected attachment to an already-active ChimeraMain world; local reuse requires independently established load certification and ownership");
 
 #ifdef MODLOADER_CLIENT_BUILD
-                PersistentIdFixUI::ShowLateAttachmentWarning();
+                PersistentIdFixUI::ShowAttachmentWarning(true);
                 (void)PersistentIdFixSystem::ConsumeLateAttachmentNotification();
 #else
                 LOG_WARN(
@@ -1574,9 +1582,9 @@ extern "C"
                 LOG_WARN(
                     "Complete persistent-ID provenance was not observed.");
                 LOG_WARN(
-                    "ID reuse remains DISABLED for this running world.");
+                    "Local ID reuse requires independently established load certification and ownership.");
                 LOG_WARN(
-                    "Restart the server with PersistentIdFix active before relying on ID reuse again.");
+                    "Reload with PersistentIdFix active if certification cannot be established; a newly observed complete load can recover.");
                 LOG_WARN(
                     "========================================================");
 #endif
@@ -1709,6 +1717,8 @@ extern "C"
             LOG_INFO(
                 "PersistentIdFix: shutting down");
 
+            // Unresolved pre-ownership diagnostics never imply active-world ownership.
+            // Preserve the existing conservative treatment of positive startup evidence.
             const bool activeWorldAtUnload =
                 g_gameWorldActive ||
                 PersistentIdFixSystem::IsLateAttachmentDetected();

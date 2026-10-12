@@ -20,6 +20,7 @@ namespace
 	bool g_keybindRegistered = false;
 	std::atomic_bool g_lateAttachmentWarningPending{ false };
 	std::atomic_bool g_lateAttachmentPopupOpened{ false };
+	std::atomic_bool g_attachmentConfirmedLate{ false };
 
 	PluginWindowHints g_hints = {};
 
@@ -90,7 +91,7 @@ namespace
 		if (g_lateAttachmentWarningPending)
 		{
 			constexpr const char* popupName =
-				"PersistentIdFix - ID reuse disabled";
+				"PersistentIdFix - Attachment timing";
 
 			if (!g_lateAttachmentPopupOpened)
 			{
@@ -114,16 +115,18 @@ namespace
 				ui->PushTextWrapPos(
 					ui->GetCursorPosX() + warningContentWidth);
 				ui->TextWrapped(
-					"PersistentIdFix was loaded after this game world had already begun.");
+					g_attachmentConfirmedLate ?
+					"PersistentIdFix detected an already-active gameplay world when attaching." :
+					"Allocator activity occurred before gameplay ownership was established. Attachment timing is unresolved. Local ID reuse requires independent load certification.");
 				ui->Spacing();
 				ui->TextWrapped(
-					"The plugin did not observe the complete load sequence, so persistent ID reuse cannot be enabled safely for this running world.");
+					"This diagnostic does not authorize or permanently disable reuse. Local ID reuse depends on independently established load certification and ownership.");
 				ui->Spacing();
 				ui->TextWrapped(
-					"PersistentIdFix will remain fail-closed and use bounded monotonic allocation only.");
+					"Local allocations remain bounded and monotonic while certified reuse is unavailable.");
 				ui->Spacing();
 				ui->TextWrapped(
-					"Return to the main menu and load the world again with PersistentIdFix already active before relying on ID reuse.");
+					"If certification cannot be established, return to the main menu and reload with PersistentIdFix already active before relying on ID reuse.");
 				ui->Spacing();
 				ui->TextWrapped(
 					"Existing saves can normally be loaded again safely. PersistentIdFix cannot repair a save in which persistent-ID exhaustion or overflow had already occurred.");
@@ -652,7 +655,7 @@ namespace PersistentIdFixUI
 		}
 	}
 
-	void ShowLateAttachmentWarning()
+	void ShowAttachmentWarning(bool confirmedLate)
 	{
 		if (g_self == nullptr ||
 			g_self->hooks == nullptr ||
@@ -660,10 +663,13 @@ namespace PersistentIdFixUI
 			g_widget == nullptr)
 		{
 			LOG_ERROR(
-				"PersistentIdFix: cannot display late-attachment ImGui warning: UI is unavailable");
+				"PersistentIdFix: cannot display attachment-timing ImGui warning: UI is unavailable");
 			return;
 		}
 
+		// An unresolved notification must not replace pending positive evidence.
+		if (confirmedLate || !g_lateAttachmentWarningPending.load())
+			g_attachmentConfirmedLate = confirmedLate;
 		g_lateAttachmentWarningPending = true;
 		g_lateAttachmentPopupOpened = false;
 
@@ -674,7 +680,7 @@ namespace PersistentIdFixUI
 			true);
 
 		LOG_WARN(
-			"PersistentIdFix: queued in-game late-attachment warning");
+			"PersistentIdFix: queued in-game attachment warning: confirmedLate=%u", g_attachmentConfirmedLate.load() ? 1u : 0u);
 	}
 
 	bool IsVisible()

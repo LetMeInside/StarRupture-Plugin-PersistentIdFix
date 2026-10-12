@@ -27,9 +27,34 @@ namespace
     static SDK::UCrMassPersistentIDSubsystem* g_persistentIdSubsystem = nullptr;
     static SDK::UWorld* g_activeGameWorld = nullptr;
     static bool g_subsystemWorldVerified = false;
-    static bool g_unboundAllocatorWarningLogged = false;
     static std::atomic_bool g_lateAttachmentDetected{ false };
     static std::atomic_bool g_lateAttachmentNotificationPending{ false };
+    static std::atomic_bool g_preOwnershipNotificationPending{ false };
+
+    // Diagnostic evidence only. Addresses are opaque and never authorize reuse.
+    struct PreOwnershipIdentity
+    {
+        std::uintptr_t subsystem = 0, outer = 0;
+        std::uint64_t sourceGeneration = 0, ledgerGeneration = 0;
+        bool boundaryObserved = false;
+    };
+    static std::mutex g_preOwnershipMutex;
+    static PreOwnershipIdentity g_preOwnership, g_preOwnershipConflict;
+    static bool g_preOwnershipPresent = false, g_preOwnershipConflicted = false;
+    static std::uint64_t g_observedSourceGeneration = 0;
+    static bool g_loadBoundaryObserved = false;
+
+    static void RetirePreOwnership(const char* reason)
+    {
+        std::lock_guard<std::mutex> lock(g_preOwnershipMutex);
+        if (g_preOwnershipPresent)
+            LOG_INFO("PersistentIdFix: pre-ownership observation retired: reason=%s sourceGeneration=%llu conflicted=%u",
+                reason, static_cast<unsigned long long>(g_preOwnership.sourceGeneration), g_preOwnershipConflicted ? 1u : 0u);
+        g_preOwnership = {}; g_preOwnershipConflict = {};
+        g_preOwnershipPresent = g_preOwnershipConflicted = false;
+        g_loadBoundaryObserved = false;
+        g_preOwnershipNotificationPending.store(false);
+    }
 
     static void* ReadUObjectOuter(const void* object)
     {
@@ -457,6 +482,80 @@ namespace
         }
     }
 
+    static void ObservePreOwnership(SDK::UCrMassPersistentIDSubsystem* subsystem)
+    {
+        PreOwnershipIdentity observed;
+        observed.subsystem = reinterpret_cast<std::uintptr_t>(subsystem);
+        observed.outer = reinterpret_cast<std::uintptr_t>(ReadUObjectOuter(subsystem));
+        {
+            std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
+            observed.ledgerGeneration = g_assignmentLedgerGeneration;
+        }
+        std::lock_guard<std::mutex> lock(g_preOwnershipMutex);
+        observed.sourceGeneration = g_observedSourceGeneration;
+        observed.boundaryObserved = g_loadBoundaryObserved;
+        if (!g_preOwnershipPresent)
+        {
+            g_preOwnership = observed;
+            g_preOwnershipPresent = true;
+            g_preOwnershipNotificationPending.store(true);
+            LOG_WARN("PersistentIdFix: UnresolvedPreOwnership: allocator activity occurred before gameplay ownership was established. Attachment timing is unresolved. Local ID reuse requires independent load certification. subsystem=%p outer=%p sourceGeneration=%llu ledgerGeneration=%llu boundaryObserved=%u; boundary is historical evidence, not proof of ongoing loading",
+                subsystem, reinterpret_cast<void*>(observed.outer),
+                static_cast<unsigned long long>(observed.sourceGeneration),
+                static_cast<unsigned long long>(observed.ledgerGeneration), observed.boundaryObserved ? 1u : 0u);
+        }
+        else if (!g_preOwnershipConflicted &&
+            (observed.subsystem != g_preOwnership.subsystem || observed.outer != g_preOwnership.outer ||
+                observed.sourceGeneration != g_preOwnership.sourceGeneration || observed.ledgerGeneration != g_preOwnership.ledgerGeneration))
+        {
+            g_preOwnershipConflicted = true;
+            g_preOwnershipConflict = observed;
+            LOG_WARN("PersistentIdFix: pre-ownership allocator conflict: firstSubsystem=%p firstOuter=%p firstSource=%llu firstLedger=%llu conflictingSubsystem=%p conflictingOuter=%p conflictingSource=%llu conflictingLedger=%llu; first evidence retained; authorization unchanged",
+                reinterpret_cast<void*>(g_preOwnership.subsystem), reinterpret_cast<void*>(g_preOwnership.outer),
+                static_cast<unsigned long long>(g_preOwnership.sourceGeneration), static_cast<unsigned long long>(g_preOwnership.ledgerGeneration),
+                subsystem, reinterpret_cast<void*>(observed.outer),
+                static_cast<unsigned long long>(observed.sourceGeneration), static_cast<unsigned long long>(observed.ledgerGeneration));
+        }
+    }
+
+    static void ReconcilePreOwnership(const char* phase, SDK::UWorld* world,
+        SDK::UCrMassPersistentIDSubsystem* selectedSubsystem)
+    {
+        std::uint64_t ledgerGeneration;
+        {
+            std::lock_guard<std::mutex> lock(g_assignmentLedgerMutex);
+            ledgerGeneration = g_assignmentLedgerGeneration;
+        }
+        std::lock_guard<std::mutex> lock(g_preOwnershipMutex);
+        if (!g_preOwnershipPresent) return;
+        const bool generationConsistent = g_preOwnership.boundaryObserved && g_loadBoundaryObserved &&
+            g_preOwnership.sourceGeneration != 0 && g_preOwnership.sourceGeneration == g_observedSourceGeneration &&
+            g_preOwnership.ledgerGeneration == g_observedSourceGeneration && ledgerGeneration == g_observedSourceGeneration;
+        const bool ownershipConflict = (world && g_preOwnership.outer && g_preOwnership.outer != reinterpret_cast<std::uintptr_t>(world)) ||
+            (selectedSubsystem && g_preOwnership.subsystem != reinterpret_cast<std::uintptr_t>(selectedSubsystem));
+        const bool generationConflict = g_preOwnership.sourceGeneration != g_observedSourceGeneration ||
+            g_preOwnership.ledgerGeneration != ledgerGeneration ||
+            (g_preOwnership.sourceGeneration != 0 && g_preOwnership.sourceGeneration != g_preOwnership.ledgerGeneration);
+        // Matching addresses establish consistency only, never object lifetime or load continuity.
+        const char* result = g_preOwnershipConflicted || ownershipConflict || generationConflict ? "conflicting" :
+            generationConsistent && world && selectedSubsystem && g_preOwnership.outer == reinterpret_cast<std::uintptr_t>(world) ?
+                "consistent_with_independently_established_session" : "still_unresolved";
+        LOG_INFO("PersistentIdFix: pre-ownership reconciliation [%s]: result=%s observedSubsystem=%p observedOuter=%p world=%p selectedSubsystem=%p observedSource=%llu observedLedger=%llu currentSource=%llu currentLedger=%llu; diagnostic only; uninterrupted loading not proven",
+            phase, result, reinterpret_cast<void*>(g_preOwnership.subsystem), reinterpret_cast<void*>(g_preOwnership.outer),
+            world, selectedSubsystem, static_cast<unsigned long long>(g_preOwnership.sourceGeneration),
+            static_cast<unsigned long long>(g_preOwnership.ledgerGeneration), static_cast<unsigned long long>(g_observedSourceGeneration),
+            static_cast<unsigned long long>(ledgerGeneration));
+        if (ownershipConflict || generationConflict)
+        {
+            // Latch the first conflicting established identity rather than replacing the observation.
+            if (!g_preOwnershipConflicted)
+                g_preOwnershipConflict = { reinterpret_cast<std::uintptr_t>(selectedSubsystem), reinterpret_cast<std::uintptr_t>(world),
+                    g_observedSourceGeneration, ledgerGeneration, g_loadBoundaryObserved };
+            g_preOwnershipConflicted = true;
+            LOG_WARN("PersistentIdFix: pre-ownership evidence conflicts with lifecycle ownership/generation; inspect the retained identities and certification diagnostics; reuse authorization is unchanged");
+        }
+    }
+
     static EPluginNetMode GetEffectiveSessionNetMode()
     {
         if (g_sessionNetMode != EPluginNetMode::Unknown)
@@ -852,7 +951,11 @@ namespace PersistentIdFixSystem
         g_sessionNetMode = EPluginNetMode::Unknown;
         g_activeGameWorld = nullptr;
         g_subsystemWorldVerified = false;
-        g_unboundAllocatorWarningLogged = false;
+        RetirePreOwnership("system reset/shutdown");
+        {
+            std::lock_guard<std::mutex> lock(g_preOwnershipMutex);
+            g_observedSourceGeneration = 0;
+        }
         g_lateAttachmentDetected.store(false);
         g_lateAttachmentNotificationPending.store(false);
 
@@ -877,12 +980,18 @@ namespace PersistentIdFixSystem
         RevokeCertifiedPool("new load generation");
 
         // A newly observed OnPreLoadMap boundary restores provenance.
-        g_unboundAllocatorWarningLogged = false;
+        RetirePreOwnership("new observed load generation");
         g_lateAttachmentDetected.store(false);
         g_lateAttachmentNotificationPending.store(false);
 
         ResetAssignmentLedger(loadGeneration);
         ResetSetPairObserver(loadGeneration);
+
+        {
+            std::lock_guard<std::mutex> lock(g_preOwnershipMutex);
+            g_observedSourceGeneration = loadGeneration;
+            g_loadBoundaryObserved = loadGeneration != 0;
+        }
 
         LOG_INFO(
             "PersistentIdFix: assignment ledger generation started: %llu",
@@ -1469,6 +1578,7 @@ namespace PersistentIdFixSystem
 
         g_activeGameWorld = world;
         g_subsystemWorldVerified = false;
+        ReconcilePreOwnership("world-begin", world, nullptr);
 
         if (world == nullptr)
         {
@@ -1510,6 +1620,7 @@ namespace PersistentIdFixSystem
     {
         if (world != nullptr && g_activeGameWorld == world)
         {
+            RetirePreOwnership("matching gameplay world end");
             LOG_INFO(
                 "PersistentIdFix: gameplay world binding ended: world=%p",
                 static_cast<void*>(world));
@@ -1522,10 +1633,13 @@ namespace PersistentIdFixSystem
     {
         if (!InitializeSession(nullptr))
         {
+            ReconcilePreOwnership("save-loaded selection unavailable", g_activeGameWorld, nullptr);
             LOG_ERROR(
                 "PersistentIdFix: persistent ID system initialization failed after save load");
             return;
         }
+
+        ReconcilePreOwnership("save-loaded", g_activeGameWorld, g_persistentIdSubsystem);
 
         if (!RefreshPersistentIdStatistics())
         {
@@ -1702,6 +1816,11 @@ namespace PersistentIdFixSystem
     bool ConsumeLateAttachmentNotification()
     {
         return g_lateAttachmentNotificationPending.exchange(false);
+    }
+
+    bool ConsumePreOwnershipNotification()
+    {
+        return g_preOwnershipNotificationPending.exchange(false);
     }
 
     bool IsLateAttachmentDetected()
@@ -1959,19 +2078,10 @@ namespace PersistentIdFixSystem
 
         if (!g_sessionActive &&
             g_activeGameWorld == nullptr &&
-            !g_unboundAllocatorWarningLogged &&
             (persistentIDSubsystem->MaxID != 0 ||
                 persistentIDSubsystem->IDHandleMap.Num() != 0))
         {
-            g_unboundAllocatorWarningLogged = true;
-            g_lateAttachmentDetected.store(true);
-            g_lateAttachmentNotificationPending.store(true);
-            LOG_WARN(
-                "PersistentIdFix: allocator activity observed without an OnWorldBeginPlay ownership boundary; treating this as late/hot attachment and keeping reuse fail-closed: subsystem=%p outer=%p MaxID=%u entities=%d",
-                static_cast<void*>(persistentIDSubsystem),
-                ReadUObjectOuter(persistentIDSubsystem),
-                persistentIDSubsystem->MaxID,
-                persistentIDSubsystem->IDHandleMap.Num());
+            ObservePreOwnership(persistentIDSubsystem);
         }
 
         /*
