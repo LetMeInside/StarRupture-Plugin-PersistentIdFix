@@ -43,6 +43,32 @@ namespace PersistentIdFixFingerprints
 
         PluginScanRequest req = PLUGIN_SCAN_REQUEST_INIT;
 
+        // Client map keys keep these signatures as the resolver's fallback.
+        // Server and legacy builds retain the plugin-scoped scanner names.
+#if defined(MODLOADER_CLIENT_BUILD) && !defined(MODLOADER_SERVER_BUILD)
+        constexpr const char* getSaveDataHookName =
+            "UCrSaveSubsystem::GetSaveData";
+        constexpr const char* onPreLoadMapHookName =
+            "UCrSaveSubsystem::OnPreLoadMap";
+        constexpr const char* setIDHandlePairHookName =
+            "UCrMassPersistentIDSubsystem::SetIDHandlePair";
+        constexpr const char* getOrAddIDForHandleHookName =
+            "UCrMassPersistentIDSubsystem::GetOrAddIDForHandle";
+        constexpr uint32_t primaryFunctionFlags =
+            PLUGIN_SCAN_FLAG_MAP_KEY;
+#else
+        constexpr const char* getSaveDataHookName =
+            "PersistentIdFix::GetSaveData";
+        constexpr const char* onPreLoadMapHookName =
+            "PersistentIdFix::OnPreLoadMap";
+        constexpr const char* setIDHandlePairHookName =
+            "PersistentIdFix::SetIDHandlePair";
+        constexpr const char* getOrAddIDForHandleHookName =
+            "PersistentIdFix::GetOrAddIDForHandle";
+        constexpr uint32_t primaryFunctionFlags =
+            PLUGIN_SCAN_FLAG_NONE;
+#endif
+
         // UCrSaveSubsystem::GetSaveData:
         //
         // Audited Hotfix 0.3.5 entry sequence, shared by Client and Server.
@@ -65,7 +91,7 @@ namespace PersistentIdFixFingerprints
         // resumes; Step 2 installs only the passive hook infrastructure.
         req = PLUGIN_SCAN_REQUEST_INIT;
         req.hookName =
-            "PersistentIdFix::GetSaveData";
+            getSaveDataHookName;
         req.pattern =
             "48 89 6C 24 10 "
             "48 89 74 24 18 "
@@ -81,6 +107,8 @@ namespace PersistentIdFixFingerprints
 
         req.kind =
             PLUGIN_SCAN_FUNCTION_START;
+        req.flags =
+            primaryFunctionFlags;
 
         getSaveDataAddress =
             scanner->Resolve(self, &req);
@@ -110,7 +138,7 @@ namespace PersistentIdFixFingerprints
         // the unrelated prologue collision observed in the Client.
         req = PLUGIN_SCAN_REQUEST_INIT;
         req.hookName =
-            "PersistentIdFix::OnPreLoadMap";
+            onPreLoadMapHookName;
         req.pattern =
             "40 53 "
             "48 83 EC 20 "
@@ -123,6 +151,8 @@ namespace PersistentIdFixFingerprints
 
         req.kind =
             PLUGIN_SCAN_FUNCTION_START;
+        req.flags =
+            primaryFunctionFlags;
 
         onPreLoadMapAddress =
             scanner->Resolve(self, &req);
@@ -162,7 +192,7 @@ namespace PersistentIdFixFingerprints
 
         req = PLUGIN_SCAN_REQUEST_INIT;
         req.hookName =
-            "PersistentIdFix::SetIDHandlePair";
+            setIDHandlePairHookName;
         req.pattern =
             "4C 89 44 24 18 "
             "48 89 54 24 10 "
@@ -173,6 +203,8 @@ namespace PersistentIdFixFingerprints
 
         req.kind =
             PLUGIN_SCAN_FUNCTION_START;
+        req.flags =
+            primaryFunctionFlags;
 
         setIDHandlePairAddress =
             scanner->Resolve(self, &req);
@@ -230,7 +262,7 @@ namespace PersistentIdFixFingerprints
 
         req = PLUGIN_SCAN_REQUEST_INIT;
         req.hookName =
-            "PersistentIdFix::GetOrAddIDForHandle";
+            getOrAddIDForHandleHookName;
         req.pattern =
             "48 89 5C 24 10 "
             "4C 89 44 24 18 "
@@ -244,6 +276,8 @@ namespace PersistentIdFixFingerprints
 
         req.kind =
             PLUGIN_SCAN_FUNCTION_START;
+        req.flags =
+            primaryFunctionFlags;
 
         getOrAddIDForHandleAddress =
             scanner->Resolve(self, &req);

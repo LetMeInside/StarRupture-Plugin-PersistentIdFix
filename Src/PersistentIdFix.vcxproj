@@ -107,6 +107,7 @@
     <ClInclude Include="Config\Config.h" />
     <ClInclude Include="PersistentId\PersistentIdSystem.h" />
     <ClInclude Include="Network\Network.h" />
+    <ClInclude Include="resource.h" />
     <ClInclude Include="Stats\Stats.h" />
     <ClInclude Include="UI\UI.h" />
     <ClInclude Include="Native\Fingerprints.h" />
@@ -148,6 +149,9 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="resource.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="PersistentIdFix.props" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
