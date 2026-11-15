@@ -8,11 +8,8 @@
 #include "SourceData/MassFragmentClassifier.h"
 #include "SourceData/IndependentSourceCollector.h"
 
-#include <Windows.h>
-
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
-#pragma comment(lib, "User32.lib")
 #endif
 
 #include <algorithm>
@@ -47,13 +44,7 @@ static uintptr_t g_onPreLoadMapAddress = 0;
 
 static uintptr_t g_setIDHandlePairAddress = 0;
 
-// Engine-owned startup probe dependencies used to detect late attachment.
-static uintptr_t g_gEngineStorageAddress = 0;
-static uintptr_t g_getGameWorldAddress = 0;
-static uintptr_t g_hasBegunPlayAddress = 0;
-
 static bool g_authoritativeWorldReadyObserved = false;
-static bool g_engineShutdownObserved = false;
 
 static void ResetProtectedIdPublication();
 
@@ -314,517 +305,16 @@ static PluginInfo s_pluginInfo = {
     "Kian369",
     "Reuses unused persistent IDs from the loaded save to prevent persistent ID exhaustion",
     PLUGIN_INTERFACE_VERSION,
-    PERSISTENT_ID_FIX_TARGET
+    PERSISTENT_ID_FIX_TARGET,
+    PLUGIN_GAME_BUILT_CL,
+    PluginLoadSetting(PluginReload::MENU) |
+        PluginUnloadSetting(PluginReload::MENU)
 };
-
-static void OnEngineShutdown()
-{
-    g_engineShutdownObserved = true;
-}
-
-#ifdef MODLOADER_CLIENT_BUILD
-static void ShowHotUnloadMessageBox()
-{
-    HWND owner = GetForegroundWindow();
-
-    MessageBoxW(
-        owner,
-        L"PersistentIdFix is being unloaded while a game world is still active.\n\n"
-        L"Persistent ID reuse will stop for this running session.\n\n"
-        L"If this world is approaching the uint32 persistent-ID limit, continuing without PersistentIdFix can exhaust or overflow the available ID space.\n\n"
-        L"Return to the main menu before loading PersistentIdFix again. Do not hot-load it back into this already-running world.\n\n"
-        L"Existing saves can normally be loaded again safely unless persistent-ID exhaustion or overflow had already occurred before the save was written.",
-        L"PersistentIdFix - Active world",
-        MB_OK | MB_ICONWARNING | MB_TASKMODAL |
-            MB_SETFOREGROUND | MB_TOPMOST);
-}
-#endif
-
-enum class InitialAttachmentProbeResult : std::uint8_t
-{
-    Unknown = 0,
-    NotActiveGameplay,
-    ActiveGameplay
-};
-
-using GetGameWorldFn = SDK::UWorld* (*)(void* engine);
-using HasBegunPlayFn = bool (*)(const SDK::UWorld* world);
-
-static int FilterNativeProbeMemoryFault(
-    unsigned long exceptionCode)
-{
-    if (exceptionCode == EXCEPTION_ACCESS_VIOLATION ||
-        exceptionCode == EXCEPTION_IN_PAGE_ERROR)
-    {
-        return EXCEPTION_EXECUTE_HANDLER;
-    }
-
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
-static bool TryReadPointerStorage(
-    uintptr_t storageAddress,
-    void*& value)
-{
-    value = nullptr;
-
-    __try
-    {
-        value =
-            *reinterpret_cast<void* const*>(
-                storageAddress);
-        return true;
-    }
-    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
-    {
-        value = nullptr;
-        return false;
-    }
-}
-
-static bool TryGetGameWorld(
-    GetGameWorldFn getGameWorld,
-    void* engine,
-    SDK::UWorld*& world)
-{
-    world = nullptr;
-
-    __try
-    {
-        world = getGameWorld(engine);
-        return true;
-    }
-    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
-    {
-        world = nullptr;
-        return false;
-    }
-}
-
-static bool TryReadWorldLifecycleFlags(
-    const SDK::UWorld* world,
-    bool& tearingDown,
-    bool& beingCleanedUp)
-{
-    tearingDown = false;
-    beingCleanedUp = false;
-
-    __try
-    {
-        const auto* worldBytes =
-            reinterpret_cast<const std::uint8_t*>(world);
-
-        tearingDown =
-            (worldBytes[0x18D] & 0x20u) != 0;
-
-        beingCleanedUp =
-            worldBytes[0x190] != 0;
-
-        return true;
-    }
-    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
-    {
-        tearingDown = false;
-        beingCleanedUp = false;
-        return false;
-    }
-}
-
-static bool TryHasBegunPlay(
-    HasBegunPlayFn hasBegunPlay,
-    const SDK::UWorld* world,
-    bool& begunPlay)
-{
-    begunPlay = false;
-
-    __try
-    {
-        begunPlay = hasBegunPlay(world);
-        return true;
-    }
-    __except (FilterNativeProbeMemoryFault(GetExceptionCode()))
-    {
-        begunPlay = false;
-        return false;
-    }
-}
-
-static bool IsReadableRange(
-    const void* address,
-    std::size_t size)
-{
-    if (address == nullptr || size == 0)
-        return false;
-
-    const uintptr_t start =
-        reinterpret_cast<uintptr_t>(address);
-
-    constexpr uintptr_t maxAddress =
-        (std::numeric_limits<uintptr_t>::max)();
-
-    if (start > maxAddress - (size - 1u))
-        return false;
-
-    const uintptr_t endInclusive =
-        start + size - 1u;
-
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(
-            address,
-            &mbi,
-            sizeof(mbi)) == 0)
-    {
-        return false;
-    }
-
-    if (mbi.State != MEM_COMMIT ||
-        (mbi.Protect & PAGE_GUARD) != 0 ||
-        (mbi.Protect & PAGE_NOACCESS) != 0)
-    {
-        return false;
-    }
-
-    const DWORD baseProtection =
-        mbi.Protect & 0xFFu;
-
-    const bool readable =
-        baseProtection == PAGE_READONLY ||
-        baseProtection == PAGE_READWRITE ||
-        baseProtection == PAGE_WRITECOPY ||
-        baseProtection == PAGE_EXECUTE_READ ||
-        baseProtection == PAGE_EXECUTE_READWRITE ||
-        baseProtection == PAGE_EXECUTE_WRITECOPY;
-
-    if (!readable)
-        return false;
-
-    const uintptr_t regionBase =
-        reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-
-    if (regionBase > maxAddress - mbi.RegionSize)
-        return false;
-
-    const uintptr_t regionEnd =
-        regionBase + mbi.RegionSize;
-
-    return start >= regionBase &&
-        endInclusive < regionEnd;
-}
-
-enum class ExactClassLookupResult : std::uint8_t
-{
-    Unknown = 0,
-    CompleteNoMatch,
-    ExactMatch
-};
-
-static ExactClassLookupResult FindExactObjectByClass(
-    void* object,
-    const char* className,
-    PluginObjectInfo& matchedInfo)
-{
-    matchedInfo = {};
-
-    if (object == nullptr ||
-        className == nullptr ||
-        g_self == nullptr ||
-        g_self->hooks == nullptr ||
-        g_self->hooks->ObjectWalker == nullptr ||
-        g_self->hooks->ObjectWalker->IsReady == nullptr ||
-        g_self->hooks->ObjectWalker->FindObjectsByClassNameInto == nullptr ||
-        !g_self->hooks->ObjectWalker->IsReady())
-    {
-        return ExactClassLookupResult::Unknown;
-    }
-
-    constexpr int InitialCapacity = 8;
-    constexpr int MaximumCapacity = 64;
-    PluginObjectInfo initial[InitialCapacity] = {};
-
-    const int total =
-        g_self->hooks->ObjectWalker->FindObjectsByClassNameInto(
-            className,
-            PluginObjectLookup_InstanceOnly,
-            initial,
-            InitialCapacity);
-
-    if (total < 0)
-        return ExactClassLookupResult::Unknown;
-
-    const int initialCount =
-        (std::min)(total, InitialCapacity);
-
-    for (int i = 0; i < initialCount; ++i)
-    {
-        if (initial[i].object == object)
-        {
-            matchedInfo = initial[i];
-            return ExactClassLookupResult::ExactMatch;
-        }
-    }
-
-    if (total <= InitialCapacity)
-        return ExactClassLookupResult::CompleteNoMatch;
-
-    if (total > MaximumCapacity)
-        return ExactClassLookupResult::Unknown;
-
-    try
-    {
-        std::vector<PluginObjectInfo> all(
-            static_cast<std::size_t>(total));
-
-        const int repeatedTotal =
-            g_self->hooks->ObjectWalker->FindObjectsByClassNameInto(
-                className,
-                PluginObjectLookup_InstanceOnly,
-                all.data(),
-                total);
-
-        if (repeatedTotal < 0 ||
-            repeatedTotal > total)
-        {
-            return ExactClassLookupResult::Unknown;
-        }
-
-        for (int i = 0; i < repeatedTotal; ++i)
-        {
-            if (all[static_cast<std::size_t>(i)].object == object)
-            {
-                matchedInfo = all[static_cast<std::size_t>(i)];
-                return ExactClassLookupResult::ExactMatch;
-            }
-        }
-
-        if (repeatedTotal != total)
-            return ExactClassLookupResult::Unknown;
-
-        return ExactClassLookupResult::CompleteNoMatch;
-    }
-    catch (...)
-    {
-        return ExactClassLookupResult::Unknown;
-    }
-}
-static InitialAttachmentProbeResult ProbeInitialAttachment()
-{
-    if (g_gEngineStorageAddress == 0 ||
-        g_getGameWorldAddress == 0 ||
-        g_hasBegunPlayAddress == 0)
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe has an unresolved native dependency");
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    if (!IsReadableRange(
-            reinterpret_cast<const void*>(
-                g_gEngineStorageAddress),
-            sizeof(void*)))
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: GEngine storage is not readable; result=Unknown");
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    void* engine = nullptr;
-    if (!TryReadPointerStorage(
-            g_gEngineStorageAddress,
-            engine))
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: GEngine storage read faulted; result=Unknown");
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    if (engine == nullptr)
-    {
-        LOG_INFO(
-            "PersistentIdFix: startup attachment probe: engine=null result=NotActive");
-        return InitialAttachmentProbeResult::NotActiveGameplay;
-    }
-
-    PluginObjectInfo engineInfo{};
-    const ExactClassLookupResult engineLookup =
-        FindExactObjectByClass(
-            engine,
-            "GameEngine",
-            engineInfo);
-
-    if (engineLookup != ExactClassLookupResult::ExactMatch)
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=%s result=Unknown",
-            engine,
-            engineLookup == ExactClassLookupResult::CompleteNoMatch
-                ? "0"
-                : "unknown");
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-#ifdef MODLOADER_SERVER_BUILD
-    constexpr std::size_t RequiredEngineReadableSize = 0x11ACu;
-#else
-    constexpr std::size_t RequiredEngineReadableSize = 0x11D4u;
-#endif
-
-    if (!IsReadableRange(
-            engine,
-            RequiredEngineReadableSize))
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 readable=0 result=Unknown",
-            engine);
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    const auto getGameWorld =
-        reinterpret_cast<GetGameWorldFn>(
-            g_getGameWorldAddress);
-
-    SDK::UWorld* world = nullptr;
-    if (!TryGetGameWorld(
-            getGameWorld,
-            engine,
-            world))
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: GetGameWorld faulted; result=Unknown");
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    if (world == nullptr)
-    {
-        LOG_INFO(
-            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=null result=NotActive",
-            engine);
-        return InitialAttachmentProbeResult::NotActiveGameplay;
-    }
-
-    PluginObjectInfo worldInfo{};
-    const ExactClassLookupResult worldLookup =
-        FindExactObjectByClass(
-            world,
-            "World",
-            worldInfo);
-
-    if (worldLookup != ExactClassLookupResult::ExactMatch)
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: engine=%p world=%p WorldIdentity=%s result=Unknown",
-            engine,
-            static_cast<void*>(world),
-            worldLookup == ExactClassLookupResult::CompleteNoMatch
-                ? "0"
-                : "unknown");
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    const bool isChimeraMain =
-        std::strcmp(
-            worldInfo.objectName,
-            "ChimeraMain") == 0;
-
-    if (!isChimeraMain)
-    {
-        LOG_INFO(
-            "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 objectName=%s ChimeraMainIdentity=0 result=NotActive",
-            engine,
-            static_cast<void*>(world),
-            worldInfo.objectName);
-        return InitialAttachmentProbeResult::NotActiveGameplay;
-    }
-
-    constexpr std::size_t RequiredWorldReadableSize = 0x191u;
-    if (!IsReadableRange(
-            world,
-            RequiredWorldReadableSize))
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: engine=%p world=%p WorldIdentity=1 ChimeraMainIdentity=1 readable=0 result=Unknown",
-            engine,
-            static_cast<void*>(world));
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    bool tearingDown = false;
-    bool beingCleanedUp = false;
-
-    if (!TryReadWorldLifecycleFlags(
-            world,
-            tearingDown,
-            beingCleanedUp))
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: World lifecycle read faulted; result=Unknown");
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    if (tearingDown || beingCleanedUp)
-    {
-        LOG_INFO(
-            "PersistentIdFix: startup attachment probe: engine=%p world=%p GameEngineIdentity=1 WorldIdentity=1 ChimeraMainIdentity=1 tearingDown=%u beingCleanedUp=%u result=Unknown",
-            engine,
-            static_cast<void*>(world),
-            tearingDown ? 1u : 0u,
-            beingCleanedUp ? 1u : 0u);
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    const auto hasBegunPlay =
-        reinterpret_cast<HasBegunPlayFn>(
-            g_hasBegunPlayAddress);
-
-    bool begunPlay = false;
-    if (!TryHasBegunPlay(
-            hasBegunPlay,
-            world,
-            begunPlay))
-    {
-        LOG_WARN(
-            "PersistentIdFix: startup attachment probe: HasBegunPlay faulted; result=Unknown");
-        return InitialAttachmentProbeResult::Unknown;
-    }
-
-    const InitialAttachmentProbeResult result =
-        begunPlay
-            ? InitialAttachmentProbeResult::ActiveGameplay
-            : InitialAttachmentProbeResult::Unknown;
-
-    LOG_INFO(
-        "PersistentIdFix: startup attachment probe: engine=%p GameEngineIdentity=1 world=%p WorldIdentity=1 ChimeraMainIdentity=1 begunPlay=%u tearingDown=0 beingCleanedUp=0 result=%s",
-        engine,
-        static_cast<void*>(world),
-        begunPlay ? 1u : 0u,
-        result == InitialAttachmentProbeResult::ActiveGameplay
-            ? "Active"
-            : "Unknown");
-
-    return result;
-}
 
 static void OnTick(
     float delta)
 {
     (void)delta;
-
-
-#ifdef MODLOADER_CLIENT_BUILD
-    if (PersistentIdFixSystem::ConsumeLateAttachmentNotification())
-    {
-        LOG_WARN(
-            "PersistentIdFix: displaying late-attachment warning through ImGui");
-        PersistentIdFixUI::ShowAttachmentWarning(true);
-    }
-#endif
-
-    if (PersistentIdFixSystem::ConsumePreOwnershipNotification())
-    {
-#ifdef MODLOADER_CLIENT_BUILD
-        PersistentIdFixUI::ShowAttachmentWarning(PersistentIdFixSystem::IsLateAttachmentDetected());
-#endif
-        // Dedicated servers already received the allocator's log-only diagnostic.
-    }
 
     if (g_self == nullptr ||
         g_self->hooks == nullptr ||
@@ -1223,14 +713,6 @@ void OnPluginLoadHooks(
     g_onPreLoadMapAddress =
         addresses.onPreLoadMap;
 
-    g_gEngineStorageAddress =
-        addresses.gEngineStorage;
-
-    g_getGameWorldAddress =
-        addresses.getGameWorld;
-
-    g_hasBegunPlayAddress =
-        addresses.hasBegunPlay;
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,9 +952,6 @@ extern "C"
                 g_originalSetIDHandlePair,
                 g_originalGetOrAddIDForHandle);
 
-            const InitialAttachmentProbeResult initialAttachmentProbe =
-                ProbeInitialAttachment();
-
             //
             // World callbacks
             //
@@ -1524,7 +1003,6 @@ extern "C"
             g_gameWorldActive = false;
             g_gameWorld = nullptr;
             g_authoritativeWorldReadyObserved = false;
-            g_engineShutdownObserved = false;
             ResetProtectedIdPublication();
 
 #ifdef MODLOADER_CLIENT_BUILD
@@ -1557,38 +1035,8 @@ extern "C"
             g_self->hooks->Engine->RegisterOnTick(
                 &OnTick);
 
-            g_self->hooks->Engine->RegisterOnShutdown(
-                &OnEngineShutdown);
-
             LOG_INFO(
-                "PersistentIdFix: registered OnTick and OnShutdown callbacks");
-
-            if (initialAttachmentProbe ==
-                InitialAttachmentProbeResult::ActiveGameplay)
-            {
-                PersistentIdFixSystem::MarkLateAttachmentDetected();
-
-                LOG_WARN(
-                    "PersistentIdFix: startup attachment probe detected attachment to an already-active ChimeraMain world; local reuse requires independently established load certification and ownership");
-
-#ifdef MODLOADER_CLIENT_BUILD
-                PersistentIdFixUI::ShowAttachmentWarning(true);
-                (void)PersistentIdFixSystem::ConsumeLateAttachmentNotification();
-#else
-                LOG_WARN(
-                    "========== PersistentIdFix: LATE ATTACHMENT ==========");
-                LOG_WARN(
-                    "This gameplay world began before PersistentIdFix was loaded.");
-                LOG_WARN(
-                    "Complete persistent-ID provenance was not observed.");
-                LOG_WARN(
-                    "Local ID reuse requires independently established load certification and ownership.");
-                LOG_WARN(
-                    "Reload with PersistentIdFix active if certification cannot be established; a newly observed complete load can recover.");
-                LOG_WARN(
-                    "========================================================");
-#endif
-            }
+                "PersistentIdFix: registered OnTick callback");
 
             LOG_INFO(
                 "PersistentIdFix: initialization complete");
@@ -1717,36 +1165,6 @@ extern "C"
             LOG_INFO(
                 "PersistentIdFix: shutting down");
 
-            // Unresolved pre-ownership diagnostics never imply active-world ownership.
-            // Preserve the existing conservative treatment of positive startup evidence.
-            const bool activeWorldAtUnload =
-                g_gameWorldActive ||
-                PersistentIdFixSystem::IsLateAttachmentDetected();
-
-            if (activeWorldAtUnload && !g_engineShutdownObserved)
-            {
-#ifdef MODLOADER_CLIENT_BUILD
-                LOG_WARN(
-                    "PersistentIdFix: hot unload detected while a game world is active; displaying client warning");
-                ShowHotUnloadMessageBox();
-#else
-                LOG_WARN(
-                    "PersistentIdFix: hot unload detected while a game world is active");
-                LOG_WARN(
-                    "========== PersistentIdFix: ACTIVE-WORLD UNLOAD ==========");
-                LOG_WARN(
-                    "PersistentIdFix is being unloaded while gameplay is active.");
-                LOG_WARN(
-                    "Persistent ID reuse will stop for this running session.");
-                LOG_WARN(
-                    "Do not hot-load PersistentIdFix back into this same running world.");
-                LOG_WARN(
-                    "Restart or reload the world with PersistentIdFix active before relying on ID reuse again.");
-                LOG_WARN(
-                    "============================================================");
-#endif
-            }
-
             PersistentIdFixNetwork::Shutdown();
             g_networkSessionActive = false;
             g_gameWorldActive = false;
@@ -1765,9 +1183,6 @@ extern "C"
                 {
                     g_self->hooks->Engine->UnregisterOnTick(
                         &OnTick);
-
-                    g_self->hooks->Engine->UnregisterOnShutdown(
-                        &OnEngineShutdown);
                 }
 
                 if (g_self->hooks->World != nullptr)

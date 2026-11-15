@@ -130,13 +130,6 @@ namespace PersistentIdFixSystem
 
     bool IsSessionActive();
 
-    // Only positive startup evidence establishes confirmed late attachment.
-    // Pre-ownership allocator activity is a separate diagnostic, never authority.
-    void MarkLateAttachmentDetected();
-    bool ConsumeLateAttachmentNotification();
-    bool ConsumePreOwnershipNotification();
-    bool IsLateAttachmentDetected();
-
     bool SetIDHandlePairDetour(
         void* subsystem,
         SDK::FCrMassPersistentEntityID* persistentId,

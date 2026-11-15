@@ -18,9 +18,6 @@ namespace
 	WidgetHandle g_widget = nullptr;
 	std::atomic_bool g_visible{ false };
 	bool g_keybindRegistered = false;
-	std::atomic_bool g_lateAttachmentWarningPending{ false };
-	std::atomic_bool g_lateAttachmentPopupOpened{ false };
-	std::atomic_bool g_attachmentConfirmedLate{ false };
 
 	PluginWindowHints g_hints = {};
 
@@ -86,96 +83,6 @@ namespace
 		if (ui == nullptr)
 		{
 			return;
-		}
-
-		if (g_lateAttachmentWarningPending)
-		{
-			constexpr const char* popupName =
-				"PersistentIdFix - Attachment timing";
-
-			if (!g_lateAttachmentPopupOpened)
-			{
-				ui->OpenPopup(popupName, 0);
-				g_lateAttachmentPopupOpened = true;
-			}
-
-			bool popupOpen = true;
-
-			constexpr int popupFlags =
-				(1 << 6) | PluginWindowFlags_NoSavedSettings;
-
-			if (ui->BeginPopupModal(popupName, &popupOpen, popupFlags))
-			{
-				constexpr float warningContentWidth = 540.0f;
-
-				// AlwaysAutoResize follows measured content. Give wrapped text
-				// an explicit endpoint so measurement is independent of any
-				// stale/narrow popup work rectangle loaded by ImGui.
-				ui->Dummy(warningContentWidth, 0.0f);
-				ui->PushTextWrapPos(
-					ui->GetCursorPosX() + warningContentWidth);
-				ui->TextWrapped(
-					g_attachmentConfirmedLate ?
-					"PersistentIdFix detected an already-active gameplay world when attaching." :
-					"Allocator activity occurred before gameplay ownership was established. Attachment timing is unresolved. Local ID reuse requires independent load certification.");
-				ui->Spacing();
-				ui->TextWrapped(
-					"This diagnostic does not authorize or permanently disable reuse. Local ID reuse depends on independently established load certification and ownership.");
-				ui->Spacing();
-				ui->TextWrapped(
-					"Local allocations remain bounded and monotonic while certified reuse is unavailable.");
-				ui->Spacing();
-				ui->TextWrapped(
-					"If certification cannot be established, return to the main menu and reload with PersistentIdFix already active before relying on ID reuse.");
-				ui->Spacing();
-				ui->TextWrapped(
-					"Existing saves can normally be loaded again safely. PersistentIdFix cannot repair a save in which persistent-ID exhaustion or overflow had already occurred.");
-				ui->PopTextWrapPos();
-				ui->Spacing();
-
-				constexpr float okButtonWidth = 120.0f;
-				float availableWidth = 0.0f;
-				float availableHeight = 0.0f;
-				ui->GetContentRegionAvail(
-					&availableWidth,
-					&availableHeight);
-				(void)availableHeight;
-
-				const float currentCursorX =
-					ui->GetCursorPosX();
-
-				if (availableWidth > okButtonWidth)
-				{
-					ui->SetCursorPosX(
-						currentCursorX +
-						(availableWidth - okButtonWidth) * 0.5f);
-				}
-
-				if (ui->ButtonSized("OK", okButtonWidth, 0.0f))
-				{
-					ui->CloseCurrentPopup();
-					g_lateAttachmentWarningPending = false;
-					g_lateAttachmentPopupOpened = false;
-
-					if (!g_visible &&
-						g_self != nullptr &&
-						g_self->hooks != nullptr &&
-						g_self->hooks->UI != nullptr &&
-						g_widget != nullptr)
-					{
-						g_self->hooks->UI->SetWidgetVisible(
-							g_widget,
-							false);
-					}
-				}
-
-				ui->EndPopup();
-			}
-			else if (!popupOpen)
-			{
-				g_lateAttachmentWarningPending = false;
-				g_lateAttachmentPopupOpened = false;
-			}
 		}
 
 		if (!g_visible)
@@ -488,8 +395,6 @@ namespace PersistentIdFixUI
 			return true;
 
 		g_visible = false;
-		g_lateAttachmentWarningPending = false;
-		g_lateAttachmentPopupOpened = false;
 
 		UpdateHints();
 
@@ -550,8 +455,6 @@ namespace PersistentIdFixUI
 
 		g_widget = nullptr;
 		g_visible = false;
-		g_lateAttachmentWarningPending = false;
-		g_lateAttachmentPopupOpened = false;
 		g_hints = {};
 	}
 
@@ -653,34 +556,6 @@ namespace PersistentIdFixUI
 				"PersistentIdFix: Hide() cannot hide widget: "
 				"UI interface or widget is unavailable");
 		}
-	}
-
-	void ShowAttachmentWarning(bool confirmedLate)
-	{
-		if (g_self == nullptr ||
-			g_self->hooks == nullptr ||
-			g_self->hooks->UI == nullptr ||
-			g_widget == nullptr)
-		{
-			LOG_ERROR(
-				"PersistentIdFix: cannot display attachment-timing ImGui warning: UI is unavailable");
-			return;
-		}
-
-		// An unresolved notification must not replace pending positive evidence.
-		if (confirmedLate || !g_lateAttachmentWarningPending.load())
-			g_attachmentConfirmedLate = confirmedLate;
-		g_lateAttachmentWarningPending = true;
-		g_lateAttachmentPopupOpened = false;
-
-		// The render callback must run even when the statistics
-		// window itself is not logically visible.
-		g_self->hooks->UI->SetWidgetVisible(
-			g_widget,
-			true);
-
-		LOG_WARN(
-			"PersistentIdFix: queued in-game attachment warning: confirmedLate=%u", g_attachmentConfirmedLate.load() ? 1u : 0u);
 	}
 
 	bool IsVisible()

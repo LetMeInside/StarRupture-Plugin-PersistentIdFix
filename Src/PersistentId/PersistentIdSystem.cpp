@@ -27,9 +27,6 @@ namespace
     static SDK::UCrMassPersistentIDSubsystem* g_persistentIdSubsystem = nullptr;
     static SDK::UWorld* g_activeGameWorld = nullptr;
     static bool g_subsystemWorldVerified = false;
-    static std::atomic_bool g_lateAttachmentDetected{ false };
-    static std::atomic_bool g_lateAttachmentNotificationPending{ false };
-    static std::atomic_bool g_preOwnershipNotificationPending{ false };
 
     // Diagnostic evidence only. Addresses are opaque and never authorize reuse.
     struct PreOwnershipIdentity
@@ -53,7 +50,6 @@ namespace
         g_preOwnership = {}; g_preOwnershipConflict = {};
         g_preOwnershipPresent = g_preOwnershipConflicted = false;
         g_loadBoundaryObserved = false;
-        g_preOwnershipNotificationPending.store(false);
     }
 
     static void* ReadUObjectOuter(const void* object)
@@ -498,8 +494,7 @@ namespace
         {
             g_preOwnership = observed;
             g_preOwnershipPresent = true;
-            g_preOwnershipNotificationPending.store(true);
-            LOG_WARN("PersistentIdFix: UnresolvedPreOwnership: allocator activity occurred before gameplay ownership was established. Attachment timing is unresolved. Local ID reuse requires independent load certification. subsystem=%p outer=%p sourceGeneration=%llu ledgerGeneration=%llu boundaryObserved=%u; boundary is historical evidence, not proof of ongoing loading",
+            LOG_WARN("PersistentIdFix: UnresolvedPreOwnership: allocator activity occurred before gameplay ownership was established. Local ID reuse requires independent load certification. subsystem=%p outer=%p sourceGeneration=%llu ledgerGeneration=%llu boundaryObserved=%u; boundary is historical evidence, not proof of ongoing loading",
                 subsystem, reinterpret_cast<void*>(observed.outer),
                 static_cast<unsigned long long>(observed.sourceGeneration),
                 static_cast<unsigned long long>(observed.ledgerGeneration), observed.boundaryObserved ? 1u : 0u);
@@ -956,9 +951,6 @@ namespace PersistentIdFixSystem
             std::lock_guard<std::mutex> lock(g_preOwnershipMutex);
             g_observedSourceGeneration = 0;
         }
-        g_lateAttachmentDetected.store(false);
-        g_lateAttachmentNotificationPending.store(false);
-
         ResetAssignmentLedger(0);
         ResetSetPairObserver(0);
 
@@ -981,9 +973,6 @@ namespace PersistentIdFixSystem
 
         // A newly observed OnPreLoadMap boundary restores provenance.
         RetirePreOwnership("new observed load generation");
-        g_lateAttachmentDetected.store(false);
-        g_lateAttachmentNotificationPending.store(false);
-
         ResetAssignmentLedger(loadGeneration);
         ResetSetPairObserver(loadGeneration);
 
@@ -1805,27 +1794,6 @@ namespace PersistentIdFixSystem
     bool IsSessionActive()
     {
         return g_sessionActive;
-    }
-
-    void MarkLateAttachmentDetected()
-    {
-        g_lateAttachmentDetected.store(true);
-        g_lateAttachmentNotificationPending.store(true);
-    }
-
-    bool ConsumeLateAttachmentNotification()
-    {
-        return g_lateAttachmentNotificationPending.exchange(false);
-    }
-
-    bool ConsumePreOwnershipNotification()
-    {
-        return g_preOwnershipNotificationPending.exchange(false);
-    }
-
-    bool IsLateAttachmentDetected()
-    {
-        return g_lateAttachmentDetected.load();
     }
 
     // ---------------------------------------------------------------------------
