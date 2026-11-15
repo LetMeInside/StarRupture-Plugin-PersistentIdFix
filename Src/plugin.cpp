@@ -7,6 +7,7 @@
 #include "SourceData/SourceReadObserver.h"
 #include "SourceData/MassFragmentClassifier.h"
 #include "SourceData/IndependentSourceCollector.h"
+#include "resource.h"
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
@@ -18,7 +19,13 @@
 #include <vector>
 
 #ifndef MODLOADER_BUILD_TAG
-#define MODLOADER_BUILD_TAG "1.3.0"
+#define PERSISTENTIDFIX_STRINGIFY_INNER(value) #value
+#define PERSISTENTIDFIX_STRINGIFY(value) \
+    PERSISTENTIDFIX_STRINGIFY_INNER(value)
+#define MODLOADER_BUILD_TAG \
+    PERSISTENTIDFIX_STRINGIFY(VERSION_MAJOR) "." \
+    PERSISTENTIDFIX_STRINGIFY(VERSION_MINOR) "." \
+    PERSISTENTIDFIX_STRINGIFY(VERSION_PATCH)
 #endif
 
 IPluginSelf* g_self = nullptr;

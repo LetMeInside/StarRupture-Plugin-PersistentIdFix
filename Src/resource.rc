@@ -1,11 +1,6 @@
 #include "resource.h"
 #include <winver.h>
 
-#define STRINGIZE2(x) #x
-#define STRINGIZE(x) STRINGIZE2(x)
-
-#define VERSION_STRING STRINGIZE(VERSION_MAJOR) "." STRINGIZE(VERSION_MINOR) "." STRINGIZE(VERSION_PATCH) ".0"
-
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
  PRODUCTVERSION VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
@@ -21,11 +16,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Kian369 / LetMeInside\0"
             VALUE "FileDescription", "Persistent ID exhaustion prevention plugin for StarRupture\0"
-            VALUE "FileVersion", VERSION_STRING "\0"
+            VALUE "FileVersion", RESOURCE_VERSION_STRING "\0"
             VALUE "InternalName", "PersistentIdFix.dll\0"
             VALUE "OriginalFilename", "PersistentIdFix.dll\0"
             VALUE "ProductName", "PersistentIdFix\0"
-            VALUE "ProductVersion", VERSION_STRING "\0"
+            VALUE "ProductVersion", RESOURCE_VERSION_STRING "\0"
         END
     END
 
