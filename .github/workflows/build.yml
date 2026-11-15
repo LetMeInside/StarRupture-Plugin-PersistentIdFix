@@ -19,14 +19,12 @@ permissions:
 # these are the main values to change.
 #
 # The version itself is NOT configured here.
-# It comes from Src/resource.h and is checked against
-# MODLOADER_BUILD_TAG in Src/Plugin.cpp.
+# It comes from the numeric version definitions in Src/resource.h.
 # ============================================================
 env:
   PLUGIN_NAME: PersistentIdFix
   SOLUTION_FILE: PersistentIdFix.sln
   VERSION_HEADER: Src/resource.h
-  PLUGIN_SOURCE: Src/Plugin.cpp
 
   CLIENT_CONFIGURATION: Client Release
   SERVER_CONFIGURATION: Server Release
@@ -42,6 +40,15 @@ jobs:
       # --------------------------------------------------------
       - name: Checkout plugin
         uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Reject publication from every ref except the release branch
+      # --------------------------------------------------------
+      - name: Enforce main-only publishing
+        if: ${{ inputs.publish && github.ref != 'refs/heads/main' }}
+        shell: pwsh
+        run: |
+          throw "Publishing is restricted to refs/heads/main. Current ref: $env:GITHUB_REF"
 
       # --------------------------------------------------------
       # Show exactly what is being built
@@ -112,32 +119,26 @@ jobs:
         shell: pwsh
         run: |
           $resourcePath = Join-Path $env:GITHUB_WORKSPACE $env:VERSION_HEADER
-          $pluginPath   = Join-Path $env:GITHUB_WORKSPACE $env:PLUGIN_SOURCE
 
           if (-not (Test-Path $resourcePath)) {
             throw "Version header not found: $resourcePath"
           }
 
-          if (-not (Test-Path $pluginPath)) {
-            throw "Plugin source not found: $pluginPath"
-          }
-
           $resource = Get-Content $resourcePath -Raw
-          $plugin   = Get-Content $pluginPath -Raw
 
           $majorMatch = [regex]::Match(
             $resource,
-            '#define\s+VERSION_MAJOR\s+(\d+)'
+            '(?m)^[ \t]*#define[ \t]+VERSION_MAJOR[ \t]+([0-9]+)[ \t]*\r?$'
           )
 
           $minorMatch = [regex]::Match(
             $resource,
-            '#define\s+VERSION_MINOR\s+(\d+)'
+            '(?m)^[ \t]*#define[ \t]+VERSION_MINOR[ \t]+([0-9]+)[ \t]*\r?$'
           )
 
           $patchMatch = [regex]::Match(
             $resource,
-            '#define\s+VERSION_PATCH\s+(\d+)'
+            '(?m)^[ \t]*#define[ \t]+VERSION_PATCH[ \t]+([0-9]+)[ \t]*\r?$'
           )
 
           if (-not (
@@ -149,31 +150,17 @@ jobs:
           }
 
           $version = "$($majorMatch.Groups[1].Value).$($minorMatch.Groups[1].Value).$($patchMatch.Groups[1].Value)"
-
-          $tagMatch = [regex]::Match(
-            $plugin,
-            '#define\s+MODLOADER_BUILD_TAG\s+"([^"]+)"'
-          )
-
-          if (-not $tagMatch.Success) {
-            throw "Could not determine MODLOADER_BUILD_TAG from $pluginPath"
-          }
-
-          $buildTag = $tagMatch.Groups[1].Value
+          $versionTag = "v$version"
 
           Write-Host "resource.h version: $version"
-          Write-Host "Plugin.cpp build tag: $buildTag"
-
-          if ($version -ne $buildTag) {
-            throw "Version mismatch: resource.h reports $version but Plugin.cpp reports $buildTag"
-          }
+          Write-Host "Release tag: $versionTag"
 
           "VERSION=$version" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Append `
             -Encoding utf8
 
-          "VERSION_TAG=v$version" | Out-File `
+          "VERSION_TAG=$versionTag" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Append `
             -Encoding utf8
@@ -670,7 +657,7 @@ jobs:
       # Create GitHub Release
       # --------------------------------------------------------
       - name: Create GitHub Release
-        if: ${{ inputs.publish }}
+        if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -698,7 +685,7 @@ jobs:
       # Upload Client package to Nexus Mods
       # --------------------------------------------------------
       - name: Upload Client build to Nexus Mods
-        if: ${{ inputs.publish }}
+        if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
         uses: Nexus-Mods/upload-action@main
         with:
           api_key: ${{ secrets.NEXUS_APIKEY }}
@@ -714,7 +701,7 @@ jobs:
       # Upload Server package to Nexus Mods
       # --------------------------------------------------------
       - name: Upload Server build to Nexus Mods
-        if: ${{ inputs.publish }}
+        if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
         uses: Nexus-Mods/upload-action@main
         with:
           api_key: ${{ secrets.NEXUS_APIKEY }}
@@ -725,3 +712,4 @@ jobs:
           display_name: "${{ env.PLUGIN_NAME }} Server v${{ env.VERSION }}"
           description: "Changelog: https://github.com/${{ github.repository }}/releases/tag/v${{ env.VERSION }}"
           version: ${{ env.VERSION }}
+          update_mod_version: true
