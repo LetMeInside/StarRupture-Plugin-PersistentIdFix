@@ -41,7 +41,11 @@ namespace
     static_assert(sizeof(FCrBaseCoreSaveData) == 0x28);
     static_assert(sizeof(FGameStateSaveData) == 0x490);
     static_assert(sizeof(FCrCharacterPlayersBaseSaveData) == 0x50);
+#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+    static_assert(sizeof(FCrCharacterPlayerBaseSaveDataPerPlayer) == 0x700);
+#else
     static_assert(sizeof(FCrCharacterPlayerBaseSaveDataPerPlayer) == 0x6F0);
+#endif
     static_assert(sizeof(FCrPlayersMapMenuState) == 0x50);
 
     struct SectionState
@@ -84,6 +88,7 @@ namespace
 
     std::mutex g_registryMutex;
     std::array<const UScriptStruct*, 6> g_descriptors{};
+    std::size_t g_playerMapSlotStride = 0;
     bool g_registryReady = false;
 
     struct MulticardsNames
@@ -412,8 +417,27 @@ namespace
     bool CheckedSparseMap(
         Section section,
         const TMap<K, V>& values,
-        Visitor&& visitor)
+        Visitor&& visitor,
+        std::size_t slotStride = (std::numeric_limits<std::size_t>::max)())
     {
+        using PairType = typename TMap<K, V>::ElementType;
+        using SlotType = UC::ContainerImpl::SetElement<PairType>;
+        const bool hasRuntimeStride =
+            slotStride != (std::numeric_limits<std::size_t>::max)();
+
+        if (!hasRuntimeStride)
+            slotStride = sizeof(SlotType);
+
+        const std::size_t slotAlignment =
+            hasRuntimeStride ? 16u : alignof(SlotType);
+
+        if (slotStride < sizeof(SlotType) ||
+            slotStride % slotAlignment != 0)
+        {
+            ContainerFailure(section);
+            return false;
+        }
+
         const std::int32_t live = values.Num();
         const std::int32_t allocated = values.NumAllocated();
         const std::int32_t capacity = values.Max();
@@ -475,9 +499,6 @@ namespace
         };
         static_assert(sizeof(SparseDataHeader) == 0x10);
 
-        using PairType = typename TMap<K, V>::ElementType;
-        using SlotType = UC::ContainerImpl::SetElement<PairType>;
-
         const auto& sparseData =
             *reinterpret_cast<const SparseDataHeader*>(&values);
 
@@ -485,7 +506,7 @@ namespace
             sparseData.Max != capacity ||
             sparseData.Data == nullptr ||
             (reinterpret_cast<std::uintptr_t>(sparseData.Data) %
-                alignof(SlotType)) != 0)
+                slotAlignment) != 0)
         {
             ContainerFailure(section);
             return false;
@@ -495,20 +516,28 @@ namespace
             static_cast<std::size_t>(allocated);
 
         if (allocatedWide >
-            (std::numeric_limits<std::size_t>::max)() / sizeof(SlotType) ||
+            (std::numeric_limits<std::size_t>::max)() / slotStride ||
             !IsReadableRange(
                 sparseData.Data,
-                allocatedWide * sizeof(SlotType)))
+                allocatedWide * slotStride))
         {
             ContainerFailure(section);
             return false;
         }
 
         std::int32_t visited = 0;
-        for (auto it = begin(values); it != end(values); ++it)
+        for (std::int32_t index = 0; index < allocated; ++index)
         {
+            if (!values.IsValidIndex(index))
+                continue;
+
             ++visited;
-            if (!visitor(*it))
+
+            const auto* pair = reinterpret_cast<const PairType*>(
+                static_cast<const std::uint8_t*>(sparseData.Data) +
+                static_cast<std::size_t>(index) * slotStride);
+
+            if (!visitor(*pair))
                 return false;
         }
 
@@ -696,6 +725,7 @@ namespace PersistentIdFixIndependentSourceCollector
 
         g_registryReady = false;
         g_descriptors.fill(nullptr);
+        g_playerMapSlotStride = 0;
         g_multicardsResolver = nullptr;
         g_multicardsNames = {};
         g_multicardsNamesAttempted = false;
@@ -765,6 +795,30 @@ namespace PersistentIdFixIndependentSourceCollector
             g_descriptors[Index(profile.SectionId)] = descriptor;
         }
 
+        UObject* playerSaveDataObject =
+            findSafe(
+                scriptStructClass,
+                nullptr,
+                L"/Script/Chimera.CrCharacterPlayerBaseSaveDataPerPlayer",
+                true);
+
+        if (playerSaveDataObject != nullptr)
+        {
+            if (IsReadableRange(playerSaveDataObject, sizeof(UScriptStruct)))
+            {
+                const auto* descriptor =
+                    reinterpret_cast<const UScriptStruct*>(playerSaveDataObject);
+
+                // These reflected sizes select only the two natively verified map contracts.
+                if (descriptor->Class == scriptStructClass &&
+                    descriptor->Size == 0x6F0)
+                    g_playerMapSlotStride = 0x710;
+                else if (descriptor->Class == scriptStructClass &&
+                    descriptor->Size == 0x700)
+                    g_playerMapSlotStride = 0x720;
+            }
+        }
+
 #if PERSISTENTIDFIX_REFLECTION_TEST_MODE
         PersistentIdFixReflectionDiagnostics::InitializeDescriptorRegistry(findSafe, scriptStructClass);
 #endif
@@ -785,6 +839,7 @@ namespace PersistentIdFixIndependentSourceCollector
         std::lock_guard<std::mutex> lock(g_registryMutex);
         g_registryReady = false;
         g_descriptors.fill(nullptr);
+        g_playerMapSlotStride = 0;
         g_multicardsResolver = nullptr;
         g_multicardsNames = {};
         g_multicardsNamesAttempted = false;
@@ -1045,7 +1100,8 @@ namespace PersistentIdFixIndependentSourceCollector
                                 ++discoveredBuildingValues;
                                 return true;
                             });
-                    }))
+                    },
+                    g_playerMapSlotStride))
             {
                 state.Failures.fetch_add(1, std::memory_order_relaxed);
                 return false;

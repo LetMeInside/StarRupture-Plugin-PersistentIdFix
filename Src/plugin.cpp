@@ -11,6 +11,7 @@
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
+#include "plugin_map.h"
 #endif
 
 #include <algorithm>
@@ -738,6 +739,18 @@ extern "C"
     __declspec(dllexport)
         bool PluginInit(IPluginSelf* self)
     {
+#ifdef MODLOADER_CLIENT_BUILD
+        if (!PluginSdkRuntime::Init(self ? self->hooks : nullptr))
+        {
+            if (self && self->logger && self->logger->Error)
+            {
+                self->logger->Error(self,
+                    "PersistentIdFix: SDK runtime initialization failed");
+            }
+            return false;
+        }
+#endif
+
         g_self = self;
 
         if (g_self == nullptr || g_self->hooks == nullptr)

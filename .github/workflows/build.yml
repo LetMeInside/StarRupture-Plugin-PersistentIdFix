@@ -28,10 +28,13 @@ env:
 
   CLIENT_CONFIGURATION: Client Release
   SERVER_CONFIGURATION: Server Release
+  # Set true to restore Server CI build, packaging and publication.
+  SERVER_CI_ENABLED: 'false'
 
 jobs:
   build:
-    name: Build Client and Server
+    name: Build Client
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' }}
     runs-on: windows-latest
 
     steps:
@@ -242,6 +245,7 @@ jobs:
       # Build Server
       # --------------------------------------------------------
       - name: Build Server Release
+        if: ${{ env.SERVER_CI_ENABLED == 'true' }}
         shell: pwsh
         run: |
           $solution = Join-Path $env:GITHUB_WORKSPACE $env:SOLUTION_FILE
@@ -272,12 +276,13 @@ jobs:
           $serverPdb = Join-Path $env:GITHUB_WORKSPACE `
             "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb"
 
-          foreach ($file in @(
-            $clientDll,
-            $clientPdb,
-            $serverDll,
-            $serverPdb
-          )) {
+          $files = @($clientDll, $clientPdb)
+
+          if ($env:SERVER_CI_ENABLED -eq 'true') {
+            $files += @($serverDll, $serverPdb)
+          }
+
+          foreach ($file in $files) {
             if (-not (Test-Path $file)) {
               throw "Expected build output not found: $file"
             }
@@ -302,7 +307,13 @@ jobs:
           $serverDll = Join-Path $env:GITHUB_WORKSPACE `
             "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
 
-          foreach ($dll in @($clientDll, $serverDll)) {
+          $dlls = @($clientDll)
+
+          if ($env:SERVER_CI_ENABLED -eq 'true') {
+            $dlls += $serverDll
+          }
+
+          foreach ($dll in $dlls) {
             $versionInfo = (Get-Item $dll).VersionInfo
 
             Write-Host ""
@@ -339,11 +350,13 @@ jobs:
             -Path "$packageRoot\Client\Plugins" |
             Out-Null
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path "$packageRoot\Server\Plugins" |
-            Out-Null
+          if ($env:SERVER_CI_ENABLED -eq 'true') {
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path "$packageRoot\Server\Plugins" |
+              Out-Null
+          }
 
       # --------------------------------------------------------
       # Generate Client sidecar
@@ -370,6 +383,7 @@ jobs:
       # Generate Server sidecar
       # --------------------------------------------------------
       - name: Generate Server sidecar manifest
+        if: ${{ env.SERVER_CI_ENABLED == 'true' }}
         shell: pwsh
         run: |
           $path = Join-Path $env:GITHUB_WORKSPACE `
@@ -418,6 +432,7 @@ jobs:
       # Copy Server package files
       # --------------------------------------------------------
       - name: Stage Server package
+        if: ${{ env.SERVER_CI_ENABLED == 'true' }}
         shell: pwsh
         run: |
           $package = Join-Path $env:GITHUB_WORKSPACE `
@@ -473,6 +488,7 @@ jobs:
       # Generate remote Server manifest
       # --------------------------------------------------------
       - name: Generate Server release manifest
+        if: ${{ env.SERVER_CI_ENABLED == 'true' }}
         shell: pwsh
         run: |
           $path = Join-Path $env:GITHUB_WORKSPACE `
@@ -517,6 +533,7 @@ jobs:
       # Create Server ZIP
       # --------------------------------------------------------
       - name: Create Server ZIP
+        if: ${{ env.SERVER_CI_ENABLED == 'true' }}
         shell: pwsh
         run: |
           $package = Join-Path $env:GITHUB_WORKSPACE `
@@ -552,12 +569,13 @@ jobs:
           $serverManifest = Join-Path $root `
             "$env:PLUGIN_NAME-server-manifest.json"
 
-          foreach ($file in @(
-            $clientZip,
-            $serverZip,
-            $clientManifest,
-            $serverManifest
-          )) {
+          $files = @($clientZip, $clientManifest)
+
+          if ($env:SERVER_CI_ENABLED -eq 'true') {
+            $files += @($serverZip, $serverManifest)
+          }
+
+          foreach ($file in $files) {
             if (-not (Test-Path $file)) {
               throw "Expected release artifact not found: $file"
             }
@@ -577,10 +595,13 @@ jobs:
           $serverSidecar = Join-Path $root `
             "package\Server\Plugins\$env:PLUGIN_NAME.json"
 
-          foreach ($file in @(
-            $clientSidecar,
-            $serverSidecar
-          )) {
+          $sidecars = @($clientSidecar)
+
+          if ($env:SERVER_CI_ENABLED -eq 'true') {
+            $sidecars += $serverSidecar
+          }
+
+          foreach ($file in $sidecars) {
             if (-not (Test-Path $file)) {
               throw "Sidecar not found: $file"
             }
@@ -597,13 +618,15 @@ jobs:
           $clientManifestJson =
             Get-Content $clientManifest -Raw | ConvertFrom-Json
 
-          $serverManifestJson =
-            Get-Content $serverManifest -Raw | ConvertFrom-Json
+          $manifests = @($clientManifestJson)
 
-          foreach ($manifest in @(
-            $clientManifestJson,
-            $serverManifestJson
-          )) {
+          if ($env:SERVER_CI_ENABLED -eq 'true') {
+            $serverManifestJson =
+              Get-Content $serverManifest -Raw | ConvertFrom-Json
+            $manifests += $serverManifestJson
+          }
+
+          foreach ($manifest in $manifests) {
             if ($manifest.plugin_name -ne $env:PLUGIN_NAME) {
               throw "Manifest plugin_name mismatch"
             }
@@ -644,6 +667,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Server build artifact
+        if: ${{ env.SERVER_CI_ENABLED == 'true' }}
         uses: actions/upload-artifact@v6
         with:
           name: ${{ env.PLUGIN_NAME }}-Server-v${{ env.VERSION }}
@@ -667,11 +691,16 @@ jobs:
           $assets = @(
             (Join-Path $root "$env:PLUGIN_NAME-Client.dll"),
             (Join-Path $root "$env:PLUGIN_NAME-client-manifest.json"),
-            (Join-Path $root "$env:PLUGIN_NAME-Client-v$env:VERSION.zip"),
-            (Join-Path $root "$env:PLUGIN_NAME-Server.dll"),
-            (Join-Path $root "$env:PLUGIN_NAME-server-manifest.json"),
-            (Join-Path $root "$env:PLUGIN_NAME-Server-v$env:VERSION.zip")
+            (Join-Path $root "$env:PLUGIN_NAME-Client-v$env:VERSION.zip")
           )
+
+          if ($env:SERVER_CI_ENABLED -eq 'true') {
+            $assets += @(
+              (Join-Path $root "$env:PLUGIN_NAME-Server.dll"),
+              (Join-Path $root "$env:PLUGIN_NAME-server-manifest.json"),
+              (Join-Path $root "$env:PLUGIN_NAME-Server-v$env:VERSION.zip")
+            )
+          }
 
           Write-Host "Creating GitHub Release $env:VERSION_TAG"
           Write-Host "Uploading $($assets.Count) assets:"
@@ -701,7 +730,7 @@ jobs:
       # Upload Server package to Nexus Mods
       # --------------------------------------------------------
       - name: Upload Server build to Nexus Mods
-        if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+        if: ${{ env.SERVER_CI_ENABLED == 'true' && inputs.publish && github.ref == 'refs/heads/main' }}
         uses: Nexus-Mods/upload-action@main
         with:
           api_key: ${{ secrets.NEXUS_APIKEY }}
