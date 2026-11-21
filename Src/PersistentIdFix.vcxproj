@@ -13,6 +13,10 @@
       <Configuration>Client Debug</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="Client Debug Experimental|x64">
+      <Configuration>Client Debug Experimental</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
     <ProjectConfiguration Include="Client Release|x64">
       <Configuration>Client Release</Configuration>
       <Platform>x64</Platform>
@@ -34,7 +38,7 @@
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
-  <PropertyGroup Condition="'$(Configuration)'=='Debug' Or '$(Configuration)'=='Client Debug' Or '$(Configuration)'=='Server Debug'" Label="Configuration">
+  <PropertyGroup Condition="'$(Configuration)'=='Debug' Or '$(Configuration)'=='Client Debug' Or '$(Configuration)'=='Client Debug Experimental' Or '$(Configuration)'=='Server Debug'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
@@ -57,7 +61,7 @@
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
     <TargetExt>.dll</TargetExt>
   </PropertyGroup>
-  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug' Or '$(Configuration)'=='Client Debug' Or '$(Configuration)'=='Server Debug'">
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug' Or '$(Configuration)'=='Client Debug' Or '$(Configuration)'=='Client Debug Experimental' Or '$(Configuration)'=='Server Debug'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
@@ -77,6 +81,11 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
     </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Client Debug Experimental'">
+    <ClCompile>
+      <PreprocessorDefinitions>PERSISTENTIDFIX_EXPERIMENTAL=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release' Or '$(Configuration)'=='Client Release' Or '$(Configuration)'=='Server Release'">
     <ClCompile>

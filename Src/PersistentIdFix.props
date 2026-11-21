@@ -2,33 +2,42 @@
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
     <StarRupturePluginSDKRoot>$(SolutionDir)..\..\StarRupture-Plugin-SDK\</StarRupturePluginSDKRoot>
+    <GameSDKRoot Condition="'$(GameSDKRoot)' == ''">$(StarRupturePluginSDKRoot)StarRupture SDK</GameSDKRoot>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Debug' Or '$(Configuration)' == 'Release'">
-    <StarRuptureSDKSourceDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Server\SDK\</StarRuptureSDKSourceDir>
-    <StarRuptureSDKConfigDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Server\;$(StarRupturePluginSDKRoot)StarRupture SDK\Server\SDK\</StarRuptureSDKConfigDir>
+    <StarRuptureSDKSourceDir>$(GameSDKRoot)\Server\SDK\</StarRuptureSDKSourceDir>
+    <StarRuptureSDKConfigDir>$(GameSDKRoot)\Server\;$(GameSDKRoot)\Server\SDK\</StarRuptureSDKConfigDir>
   </PropertyGroup>
 
-  <PropertyGroup Condition="'$(Configuration)' == 'Client Debug' Or '$(Configuration)' == 'Client Release'">
-    <StarRuptureSDKSourceDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Client\SDK\</StarRuptureSDKSourceDir>
-    <StarRuptureSDKConfigDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Client\;$(StarRupturePluginSDKRoot)StarRupture SDK\Client\SDK\</StarRuptureSDKConfigDir>
+  <PropertyGroup Condition="'$(Configuration)' == 'Client Debug' Or '$(Configuration)' == 'Client Debug Experimental' Or '$(Configuration)' == 'Client Release'">
+    <StarRuptureSDKSourceDir>$(GameSDKRoot)\Client\SDK\</StarRuptureSDKSourceDir>
+    <StarRuptureSDKConfigDir>$(GameSDKRoot)\Client\;$(GameSDKRoot)\Client\SDK\</StarRuptureSDKConfigDir>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Server Debug' Or '$(Configuration)' == 'Server Release'">
-    <StarRuptureSDKSourceDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Server\SDK\</StarRuptureSDKSourceDir>
-    <StarRuptureSDKConfigDir>$(StarRupturePluginSDKRoot)StarRupture SDK\Server\;$(StarRupturePluginSDKRoot)StarRupture SDK\Server\SDK\</StarRuptureSDKConfigDir>
+    <StarRuptureSDKSourceDir>$(GameSDKRoot)\Server\SDK\</StarRuptureSDKSourceDir>
+    <StarRuptureSDKConfigDir>$(GameSDKRoot)\Server\;$(GameSDKRoot)\Server\SDK\</StarRuptureSDKConfigDir>
   </PropertyGroup>
 
-  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Client Debug' Or '$(Configuration)' == 'Client Release'">
+  <Import Project="$(StarRupturePluginSDKRoot)PluginGameBuild.props" />
+
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Client Debug' Or '$(Configuration)' == 'Client Debug Experimental' Or '$(Configuration)' == 'Client Release'">
     <ClCompile>
       <PreprocessorDefinitions>MODLOADER_CLIENT_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>MODLOADER_CLIENT_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ResourceCompile>
   </ItemDefinitionGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)' == 'Server Debug' Or '$(Configuration)' == 'Server Release'">
     <ClCompile>
       <PreprocessorDefinitions>MODLOADER_SERVER_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>MODLOADER_SERVER_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ResourceCompile>
   </ItemDefinitionGroup>
 </Project>
 

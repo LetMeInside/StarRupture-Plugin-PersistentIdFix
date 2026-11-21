@@ -14,6 +14,11 @@ namespace SDK
     struct FCrZiplineSaveData;
     struct FBaseCoreReplicationSaveData;
     struct FGameStateSaveData;
+#if defined(MODLOADER_CLIENT_BUILD)
+    struct FCrSenderConnectionsSaveData;
+    struct FCrStorageShareableSubsystemSaveData;
+    struct FBaseSiteAttackSubsystemSaveData;
+#endif
 }
 
 namespace PersistentIdFixIndependentSourceCollector
@@ -25,7 +30,11 @@ namespace PersistentIdFixIndependentSourceCollector
         ZiplineReplicator,
         ZiplineSubsystem,
         BaseCoreReplication,
-        GameStateData
+        GameStateData,
+        CrPackageTransportReplicator,
+        StorageShareableSubsystemData,
+        BaseSiteAttackData,
+        Count
     };
 
     struct SectionSnapshot
@@ -50,6 +59,11 @@ namespace PersistentIdFixIndependentSourceCollector
         SectionSnapshot ziplineSubsystem;
         SectionSnapshot baseCoreReplication;
         SectionSnapshot gameStateData;
+#if defined(MODLOADER_CLIENT_BUILD)
+        SectionSnapshot crPackageTransportReplicator;
+        SectionSnapshot storageShareableSubsystemData;
+        SectionSnapshot baseSiteAttackData;
+#endif
 
         std::uint64_t gameStatePlayers = 0;
         std::uint64_t gameStateFloorValues = 0;
@@ -77,6 +91,9 @@ namespace PersistentIdFixIndependentSourceCollector
 
     void RecordReadFailure(Section section);
 
+    // Keeps a successful native read that contradicts inventory absence sticky-failed.
+    void RecordConsistencyFailure(Section section);
+
     bool ObserveBuildingCustomNames(
         const SDK::UScriptStruct* structType,
         const SDK::FBuildingCustomNameSaveData* data);
@@ -101,10 +118,26 @@ namespace PersistentIdFixIndependentSourceCollector
         const SDK::UScriptStruct* structType,
         const SDK::FGameStateSaveData* data);
 
+#if defined(MODLOADER_CLIENT_BUILD)
+    // Collects sender and receiver persistent IDs from the validated transport map.
+    bool ObserveCrPackageTransportReplicator(
+        const SDK::UScriptStruct* structType,
+        const SDK::FCrSenderConnectionsSaveData* data);
+
+    // Collects each storage handle regardless of its unlock state.
+    bool ObserveStorageShareableSubsystemData(
+        const SDK::UScriptStruct* structType,
+        const SDK::FCrStorageShareableSubsystemSaveData* data);
+
+    // Collects the three persistent handles saved by the base attack subsystem.
+    bool ObserveBaseSiteAttackData(
+        const SDK::UScriptStruct* structType,
+        const SDK::FBaseSiteAttackSubsystemSaveData* data);
+#endif
+
     Snapshot GetSnapshot();
 
-    // Appends plugin-owned PID copies collected from all six
-    // independent protected sections.
+    // Appends plugin-owned PID copies collected from independent protected sections.
     bool AppendCollectedValues(std::vector<std::uint32_t>& destination);
 
     void LogSnapshot(const char* phase);

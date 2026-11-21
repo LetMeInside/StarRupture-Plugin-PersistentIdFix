@@ -1,4 +1,7 @@
-﻿#include "MassFragmentClassifier.h"
+﻿// Classifies saved Mass payloads against exact SDK profiles and stages semantic
+// persistent IDs transactionally. Both SDK profiles retain exact descriptor
+// validation and fail-closed handling of unsupported or malformed payloads.
+#include "MassFragmentClassifier.h"
 
 #include "plugin_helpers.h"
 #include "IndependentSourceCollector.h"
@@ -61,22 +64,46 @@ namespace
     static_assert(sizeof(FCrBuildingInfectionAlarmFragment) == 8);
     static_assert(sizeof(FCrBuildingInfectionFragment) == 48);
     static_assert(sizeof(FCrBuildingStateFragment) == 4);
+#if defined(MODLOADER_CLIENT_BUILD)
+    static_assert(sizeof(FCrCraftingFragment) == 0xA0);
+#else
     static_assert(sizeof(FCrCraftingFragment) == 128);
+#endif
     static_assert(sizeof(FCrElectricityFragment) == 20);
     static_assert(sizeof(FCrHeaterCoolerFragment) == 40);
     static_assert(sizeof(FCrInventoryFragment) == 592);
+#if defined(MODLOADER_CLIENT_BUILD)
+    static_assert(sizeof(FCrLogisticsAgentFragment) == 0xF0);
+#else
     static_assert(sizeof(FCrLogisticsAgentFragment) == 216);
+#endif
+#if defined(MODLOADER_CLIENT_BUILD)
+    static_assert(sizeof(FCrLogisticsIntersectionFragment) == 0x50);
+#else
     static_assert(sizeof(FCrLogisticsIntersectionFragment) == 48);
+#endif
+#if defined(MODLOADER_CLIENT_BUILD)
+    static_assert(sizeof(FCrLogisticsLineFragment) == 0x58);
+#else
     static_assert(sizeof(FCrLogisticsLineFragment) == 56);
+#endif
     static_assert(sizeof(FCrLogisticsRequestContainerFragment) == 40);
     static_assert(sizeof(FCrLogisticsRequestOptionsFragment) == 1);
+#if defined(MODLOADER_CLIENT_BUILD)
+    static_assert(sizeof(FCrLogisticsRoundaboutFragment) == 0x40);
+#else
     static_assert(sizeof(FCrLogisticsRoundaboutFragment) == 32);
+#endif
     static_assert(sizeof(FCrLogisticsSocketsFragment) == 16);
     // Native/PDB/reflected Hotfix 0.3.5 size is 0x4 in both modes.
     // Do not sizeof-assert this generated wrapper: the Client SDK injects a
     // synthetic byte into its empty CustomOnRep base and can inflate the
     // compiler layout of this derived type without changing native storage.
+#if defined(MODLOADER_CLIENT_BUILD)
+    static_assert(sizeof(FCrLogisticsVerticalConnectorFragment) == 0x28);
+#else
     static_assert(sizeof(FCrLogisticsVerticalConnectorFragment) == 48);
+#endif
     static_assert(sizeof(FCrMassBuildingBaseCoreFragment) == 104);
     static_assert(sizeof(FCrMassBuildingStabilityData) == 12);
     static_assert(sizeof(FCrMassDynamicPillarFragment) == 8);
@@ -84,6 +111,28 @@ namespace
     static_assert(sizeof(FCrMassTemperatureFragment) == 128);
     static_assert(sizeof(FCrPackageReceiverFragment) == 56);
     static_assert(sizeof(FCrStandaloneInfectionFragment) == 40);
+
+#if defined(MODLOADER_CLIENT_BUILD)
+    // CL-130045 generated offsets, including nested array element strides.
+    static_assert(offsetof(FCrCraftingFragment, LastStartTime) == 0x58);
+    static_assert(offsetof(FCrLogisticsAgentFragment, CurrentPath) == 0xC0);
+    static_assert(offsetof(FCrLogisticsIntersectionFragment, PushOffState) == 0x30);
+    static_assert(offsetof(FCrLogisticsLineFragment, PushOffState) == 0x38);
+    static_assert(offsetof(FCrLogisticsRoundaboutFragment, PushOffState) == 0x20);
+    static_assert(sizeof(FCrLogisticsRoundaboutItem) == 0x38);
+    static_assert(offsetof(FCrLogisticsRoundaboutItem, EnterTime) == 0x30);
+    static_assert(sizeof(FCrLogisticsVerticalConnSimulationState) == 0x50);
+    static_assert(offsetof(FCrLogisticsVerticalConnSimulationState, OrderedItems) == 0x00);
+    static_assert(offsetof(FCrLogisticsVerticalConnSimulationState, WaitingItem) == 0x18);
+    static_assert(offsetof(FCrLogisticsVerticalConnSimulationState, PushOffState) == 0x30);
+    static_assert(offsetof(FCrLogisticsVerticalConnectorFragment, LaneStates) == 0x00);
+    static_assert(offsetof(FCrLogisticsVerticalConnectorFragment, FixedLength) == 0x10);
+    static_assert(offsetof(FCrLogisticsVerticalConnectorFragment, CachedMoveSpeedPerLine) == 0x18);
+    static_assert(sizeof(FCrLostDronePushOffState) == 0x20);
+    static_assert(offsetof(FCrLostDronePushOffState, TargetAgent) == 0x00);
+    static_assert(sizeof(FCrMassEntityReplicationHelper) == 0x18);
+    static_assert(offsetof(FCrMassEntityReplicationHelper, Entity) == 0x08);
+#endif
 
     // The empty marker base has a generated C++ size annotation discrepancy
     // between Client and Server, so it is intentionally identified by exact
@@ -158,19 +207,43 @@ namespace
             { "ScriptStruct Chimera.CrBuildingInfectionAlarmFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 8, 4, false, FragmentClass::PidFree },
             { "ScriptStruct Chimera.CrBuildingInfectionFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 48, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrBuildingStateFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 4, 2, false, FragmentClass::PidFree },
+#if defined(MODLOADER_CLIENT_BUILD)
+            { "ScriptStruct Chimera.CrCraftingFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0xA0, 8, false, FragmentClass::PidFree },
+#else
             { "ScriptStruct Chimera.CrCraftingFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 128, 8, false, FragmentClass::PidFree },
+#endif
             { "ScriptStruct Chimera.CrElectricityFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 20, 4, false, FragmentClass::PidFree },
             { "ScriptStruct Chimera.CrHeaterCoolerFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 40, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrInventoryFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 592, 8, false, FragmentClass::PidFree },
+#if defined(MODLOADER_CLIENT_BUILD)
+            { "ScriptStruct Chimera.CrLogisticsAgentFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0xF0, 8, false, FragmentClass::PidBearing },
+#else
             { "ScriptStruct Chimera.CrLogisticsAgentFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 216, 8, false, FragmentClass::PidBearing },
+#endif
+#if defined(MODLOADER_CLIENT_BUILD)
+            { "ScriptStruct Chimera.CrLogisticsIntersectionFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0x50, 8, false, FragmentClass::PidBearing },
+#else
             { "ScriptStruct Chimera.CrLogisticsIntersectionFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 48, 8, false, FragmentClass::PidBearing },
+#endif
+#if defined(MODLOADER_CLIENT_BUILD)
+            { "ScriptStruct Chimera.CrLogisticsLineFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0x58, 8, false, FragmentClass::PidBearing },
+#else
             { "ScriptStruct Chimera.CrLogisticsLineFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 56, 8, false, FragmentClass::PidBearing },
+#endif
             { "ScriptStruct Chimera.CrLogisticsRequestContainerFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 40, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrLogisticsRequestOptionsFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 1, 1, false, FragmentClass::PidFree },
+#if defined(MODLOADER_CLIENT_BUILD)
+            { "ScriptStruct Chimera.CrLogisticsRoundaboutFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0x40, 8, false, FragmentClass::PidBearing },
+#else
             { "ScriptStruct Chimera.CrLogisticsRoundaboutFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 32, 8, false, FragmentClass::PidBearing },
+#endif
             { "ScriptStruct Chimera.CrLogisticsSocketsFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 16, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrLogisticsTierFragment", "ScriptStruct Chimera.CrMassSavableFragmentWithCustomOnRepCallActor", 4, 4, false, FragmentClass::PidFree },
+#if defined(MODLOADER_CLIENT_BUILD)
+            { "ScriptStruct Chimera.CrLogisticsVerticalConnectorFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0x28, 8, false, FragmentClass::PidBearing },
+#else
             { "ScriptStruct Chimera.CrLogisticsVerticalConnectorFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 48, 8, false, FragmentClass::PidBearing },
+#endif
             { "ScriptStruct Chimera.CrMassBuildingBaseCoreFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 104, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrMassBuildingStabilityData", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 12, 4, false, FragmentClass::PidFree },
             { "ScriptStruct Chimera.CrMassDynamicPillarFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 8, 4, false, FragmentClass::PidFree },
@@ -565,6 +638,14 @@ namespace
         }
     }
 
+    // CL-130045 native save callback (RVA 0x0763D090) exports instanced payloads
+    // through UScriptStruct::ExportText with PortFlags=0. ShouldPort (0x0170B710)
+    // excludes Transient fields unless 0x30000 overrides are enabled; nested lane
+    // export does not enable them. The affected types have no custom text ops.
+    // PushOffState is therefore omitted in all four owners, without PID conversion.
+    // Reads the exact profile's declared PID fields into caller-owned staging.
+    // Returns false on traversal failure or an unsupported PID-bearing profile;
+    // this method never commits values to the shared source collection.
     bool CollectSemanticValues(
         const RegistryEntry& profile,
         const std::uint8_t* memory,
@@ -758,6 +839,19 @@ namespace
             const auto& f =
                 *reinterpret_cast<const FCrLogisticsVerticalConnectorFragment*>(memory);
 
+#if defined(MODLOADER_CLIENT_BUILD)
+            if (!CheckedEach(f.LaneStates, [&](const FCrLogisticsVerticalConnSimulationState& lane)
+                {
+                    // WaitingItem is transient, but its helper contains a SaveGame PID.
+                    // Collect conservatively; flags alone do not prove native omission.
+                    return EmitNumeric(staged, lane.WaitingItem.Entity.ID) &&
+                        CheckedEach(lane.OrderedItems, [&](const FCrLogisticsIntersectionItem& item)
+                        {
+                            return EmitNumeric(staged, item.Entity.Entity.ID) &&
+                                EmitNumeric(staged, item.TargetLine.Entity.ID);
+                        });
+                }))
+#else
             if (!CheckedEach(
                     f.State.OrderedItems,
                     [&](const FCrLogisticsIntersectionItem& value)
@@ -765,6 +859,7 @@ namespace
                         return EmitNumeric(staged, value.Entity.Entity.ID) &&
                             EmitNumeric(staged, value.TargetLine.Entity.ID);
                     }))
+#endif
             {
                 return false;
             }

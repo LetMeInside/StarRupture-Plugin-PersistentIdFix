@@ -15,7 +15,10 @@ namespace PersistentIdFixSourceReadObserver
         AntennasData,
         ZiplineReplicator,
         ZiplineSubsystem,
-        BaseCoreReplicationHelper
+        BaseCoreReplicationHelper,
+        CrPackageTransportReplicator,
+        StorageShareableSubsystemData,
+        BaseSiteAttackData
     };
 
     enum class CertificationState : std::uint8_t
@@ -24,7 +27,8 @@ namespace PersistentIdFixSourceReadObserver
         AbsentUnsupported,
         Pending,
         Certified,
-        Failed
+        Failed,
+        SafelyAbsent
     };
 
     struct ObserverActivitySnapshot
@@ -36,6 +40,7 @@ namespace PersistentIdFixSourceReadObserver
     struct CoverageSnapshot
     {
         std::uint64_t loadGeneration = 0;
+        std::uint64_t inventoryGeneration = 0;
 
         // Original serialized FCrMassSaveData::MaxPersistentID
         // captured synchronously from the successful Mass
@@ -58,6 +63,11 @@ namespace PersistentIdFixSourceReadObserver
         bool inventoryZiplineReplicator = false;
         bool inventoryZiplineSubsystem = false;
         bool inventoryBaseCoreReplicationHelper = false;
+#if defined(MODLOADER_CLIENT_BUILD)
+        bool inventoryCrPackageTransportReplicator = false;
+        bool inventoryStorageShareableSubsystemData = false;
+        bool inventoryBaseSiteAttackData = false;
+#endif
 
         CertificationState massCertification =
             CertificationState::InventoryUnavailable;
@@ -73,6 +83,14 @@ namespace PersistentIdFixSourceReadObserver
             CertificationState::InventoryUnavailable;
         CertificationState baseCoreReplicationCertification =
             CertificationState::InventoryUnavailable;
+#if defined(MODLOADER_CLIENT_BUILD)
+        CertificationState crPackageTransportReplicatorCertification =
+            CertificationState::InventoryUnavailable;
+        CertificationState storageShareableSubsystemDataCertification =
+            CertificationState::InventoryUnavailable;
+        CertificationState baseSiteAttackDataCertification =
+            CertificationState::InventoryUnavailable;
+#endif
 
         // Aggregate coverage applies only to the retained load generation.
         // It does not prove that this generation belongs to the currently
@@ -88,6 +106,7 @@ namespace PersistentIdFixSourceReadObserver
         bool coverageAttachedToCurrentGeneration = false;
 
         std::uint64_t certifiedSections = 0;
+        std::uint64_t safelyAbsentSections = 0;
         std::uint64_t pendingSections = 0;
         std::uint64_t failedSections = 0;
         std::uint64_t absentUnsupportedSections = 0;
@@ -104,6 +123,14 @@ namespace PersistentIdFixSourceReadObserver
         std::uint64_t ziplineReplicatorReads = 0;
         std::uint64_t ziplineSubsystemReads = 0;
         std::uint64_t baseCoreReplicationHelperReads = 0;
+#if defined(MODLOADER_CLIENT_BUILD)
+        std::uint64_t crPackageTransportReplicatorReads = 0;
+        std::uint64_t crPackageTransportReplicatorFailedReads = 0;
+        std::uint64_t storageShareableSubsystemDataReads = 0;
+        std::uint64_t storageShareableSubsystemDataFailedReads = 0;
+        std::uint64_t baseSiteAttackDataReads = 0;
+        std::uint64_t baseSiteAttackDataFailedReads = 0;
+#endif
     };
 
     // Observe one native GetSaveData call.

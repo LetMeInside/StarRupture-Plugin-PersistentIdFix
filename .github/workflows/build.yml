@@ -3,6 +3,14 @@ name: Build PersistentIdFix
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: "Build target (Server is the final legacy release)"
+        required: true
+        type: choice
+        default: Client
+        options:
+          - Client
+          - Server
       publish:
         description: "Publish GitHub Release and Nexus packages"
         required: true
@@ -25,13 +33,16 @@ env:
   PLUGIN_NAME: PersistentIdFix
   SOLUTION_FILE: PersistentIdFix.sln
   VERSION_HEADER: Src/resource.h
-
   CLIENT_CONFIGURATION: Client Release
   SERVER_CONFIGURATION: Server Release
+  BUILD_TARGET: ${{ inputs.target }}
+  BUILD_CONFIGURATION: ${{ inputs.target }} Release
+  MANIFEST_TARGET: ${{ inputs.target == 'Client' && 'client' || 'server' }}
 
 jobs:
   build:
-    name: Build Client and Server
+    name: Build ${{ inputs.target }}
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' }}
     runs-on: windows-latest
 
     steps:
@@ -61,30 +72,12 @@ jobs:
           Write-Host "Commit     : $env:GITHUB_SHA"
           Write-Host "Workspace  : $env:GITHUB_WORKSPACE"
 
-      # --------------------------------------------------------
-      # Checkout SDK at the exact location expected by
-      # PersistentIdFix.props:
-      #
-      # $(SolutionDir)..\..\StarRupture-Plugin-SDK\
-      #
-      # The GitHub repository contents are checked out directly
-      # into GITHUB_WORKSPACE.
-      #
-      # Therefore:
-      #
-      #   SolutionDir
-      #       = <workspace>
-      #
-      # and the SDK must be:
-      #
-      #   <workspace>\..\..\StarRupture-Plugin-SDK\
-      #
-      # This mirrors the directory relationship used locally.
-      # --------------------------------------------------------
+      # Official SDK checkout; its root is passed explicitly to MSBuild below.
       - name: Checkout StarRupture Plugin SDK
         uses: actions/checkout@v4
         with:
           repository: AlienXAXS/StarRupture-Plugin-SDK
+          ref: c00caebf3af1242bee5cfc1a66af8302096a369b
           path: plugin-sdk
           submodules: recursive
 
@@ -125,20 +118,21 @@ jobs:
           }
 
           $resource = Get-Content $resourcePath -Raw
+          $versionPrefix = $env:BUILD_TARGET.ToUpperInvariant()
 
           $majorMatch = [regex]::Match(
             $resource,
-            '(?m)^[ \t]*#define[ \t]+VERSION_MAJOR[ \t]+([0-9]+)[ \t]*\r?$'
+            ('(?m)^[ \t]*#define[ \t]+{0}_VERSION_MAJOR[ \t]+([0-9]+)[ \t]*\r?$' -f $versionPrefix)
           )
 
           $minorMatch = [regex]::Match(
             $resource,
-            '(?m)^[ \t]*#define[ \t]+VERSION_MINOR[ \t]+([0-9]+)[ \t]*\r?$'
+            ('(?m)^[ \t]*#define[ \t]+{0}_VERSION_MINOR[ \t]+([0-9]+)[ \t]*\r?$' -f $versionPrefix)
           )
 
           $patchMatch = [regex]::Match(
             $resource,
-            '(?m)^[ \t]*#define[ \t]+VERSION_PATCH[ \t]+([0-9]+)[ \t]*\r?$'
+            ('(?m)^[ \t]*#define[ \t]+{0}_VERSION_PATCH[ \t]+([0-9]+)[ \t]*\r?$' -f $versionPrefix)
           )
 
           if (-not (
@@ -160,10 +154,44 @@ jobs:
             -Append `
             -Encoding utf8
 
+          $serverVersionParts = foreach ($part in @('MAJOR', 'MINOR', 'PATCH')) {
+            $match = [regex]::Match($resource,
+              ('(?m)^[ \t]*#define[ \t]+SERVER_VERSION_{0}[ \t]+([0-9]+)[ \t]*\r?$' -f $part))
+            if (-not $match.Success) { throw "Could not determine legacy Server version" }
+            $match.Groups[1].Value
+          }
+          "LEGACY_SERVER_VERSION=$($serverVersionParts -join '.')" | Out-File `
+            -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
           "VERSION_TAG=$versionTag" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Append `
             -Encoding utf8
+
+      - name: Check publication destination
+        if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $destinationFilter = '.[] | select(.tag_name == "' + $env:VERSION_TAG + '")'
+          $destinationJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" `
+            --paginate --jq $destinationFilter
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not determine destination release state; publication refused"
+          }
+          if ([string]::IsNullOrWhiteSpace(($destinationJson -join "`n"))) {
+            $releaseState = 'missing'
+          } else {
+            $destination = $destinationJson | ConvertFrom-Json
+            if (-not $destination.draft -or $destination.published_at) {
+              throw "Version $env:VERSION_TAG is already published and must not be modified"
+            }
+            $releaseState = 'draft'
+            "RELEASE_ID=$($destination.id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          "RELEASE_STATE=$releaseState" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Destination $env:VERSION_TAG state: $releaseState"
 
       # --------------------------------------------------------
       # Read supported ModLoader interface range directly from
@@ -226,6 +254,7 @@ jobs:
       # Build Client
       # --------------------------------------------------------
       - name: Build Client Release
+        if: ${{ inputs.target == 'Client' }}
         shell: pwsh
         run: |
           $solution = Join-Path $env:GITHUB_WORKSPACE $env:SOLUTION_FILE
@@ -233,7 +262,6 @@ jobs:
           msbuild $solution `
             /p:Configuration="$env:CLIENT_CONFIGURATION" `
             /p:Platform=x64 `
-            /p:ModLoaderBuildTag="$env:VERSION" `
             /p:StarRupturePluginSDKRoot="$env:GITHUB_WORKSPACE\plugin-sdk\" `
             /m `
             /v:minimal
@@ -242,6 +270,7 @@ jobs:
       # Build Server
       # --------------------------------------------------------
       - name: Build Server Release
+        if: ${{ inputs.target == 'Server' }}
         shell: pwsh
         run: |
           $solution = Join-Path $env:GITHUB_WORKSPACE $env:SOLUTION_FILE
@@ -249,7 +278,6 @@ jobs:
           msbuild $solution `
             /p:Configuration="$env:SERVER_CONFIGURATION" `
             /p:Platform=x64 `
-            /p:ModLoaderBuildTag="$env:VERSION" `
             /p:StarRupturePluginSDKRoot="$env:GITHUB_WORKSPACE\plugin-sdk\" `
             /m `
             /v:minimal
@@ -260,28 +288,12 @@ jobs:
       - name: Verify build outputs
         shell: pwsh
         run: |
-          $clientDll = Join-Path $env:GITHUB_WORKSPACE `
-            "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
-
-          $clientPdb = Join-Path $env:GITHUB_WORKSPACE `
-            "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb"
-
-          $serverDll = Join-Path $env:GITHUB_WORKSPACE `
-            "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
-
-          $serverPdb = Join-Path $env:GITHUB_WORKSPACE `
-            "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.pdb"
-
-          foreach ($file in @(
-            $clientDll,
-            $clientPdb,
-            $serverDll,
-            $serverPdb
-          )) {
+          $output = Join-Path $env:GITHUB_WORKSPACE "bin/x64/$env:BUILD_CONFIGURATION/plugins"
+          foreach ($extension in @('dll', 'pdb')) {
+            $file = Join-Path $output "$env:PLUGIN_NAME.$extension"
             if (-not (Test-Path $file)) {
               throw "Expected build output not found: $file"
             }
-
             $info = Get-Item $file
             Write-Host "$($info.FullName) - $($info.Length) bytes"
           }
@@ -296,13 +308,10 @@ jobs:
       - name: Verify DLL version resources
         shell: pwsh
         run: |
-          $clientDll = Join-Path $env:GITHUB_WORKSPACE `
-            "bin/x64/$env:CLIENT_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
+          $dlls = @(Join-Path $env:GITHUB_WORKSPACE `
+            "bin/x64/$env:BUILD_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll")
 
-          $serverDll = Join-Path $env:GITHUB_WORKSPACE `
-            "bin/x64/$env:SERVER_CONFIGURATION/plugins/$env:PLUGIN_NAME.dll"
-
-          foreach ($dll in @($clientDll, $serverDll)) {
+          foreach ($dll in $dlls) {
             $versionInfo = (Get-Item $dll).VersionInfo
 
             Write-Host ""
@@ -332,23 +341,17 @@ jobs:
         shell: pwsh
         run: |
           $packageRoot = Join-Path $env:GITHUB_WORKSPACE "package"
-
           New-Item `
             -ItemType Directory `
             -Force `
-            -Path "$packageRoot\Client\Plugins" |
-            Out-Null
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path "$packageRoot\Server\Plugins" |
+            -Path "$packageRoot\$env:BUILD_TARGET\Plugins" |
             Out-Null
 
       # --------------------------------------------------------
       # Generate Client sidecar
       # --------------------------------------------------------
       - name: Generate Client sidecar manifest
+        if: ${{ inputs.target == 'Client' }}
         shell: pwsh
         run: |
           $path = Join-Path $env:GITHUB_WORKSPACE `
@@ -370,6 +373,7 @@ jobs:
       # Generate Server sidecar
       # --------------------------------------------------------
       - name: Generate Server sidecar manifest
+        if: ${{ inputs.target == 'Server' }}
         shell: pwsh
         run: |
           $path = Join-Path $env:GITHUB_WORKSPACE `
@@ -391,6 +395,7 @@ jobs:
       # Copy Client package files
       # --------------------------------------------------------
       - name: Stage Client package
+        if: ${{ inputs.target == 'Client' }}
         shell: pwsh
         run: |
           $package = Join-Path $env:GITHUB_WORKSPACE `
@@ -418,6 +423,7 @@ jobs:
       # Copy Server package files
       # --------------------------------------------------------
       - name: Stage Server package
+        if: ${{ inputs.target == 'Server' }}
         shell: pwsh
         run: |
           $package = Join-Path $env:GITHUB_WORKSPACE `
@@ -448,6 +454,7 @@ jobs:
       # It will later become a GitHub Release asset.
       # --------------------------------------------------------
       - name: Generate Client release manifest
+        if: ${{ inputs.target == 'Client' }}
         shell: pwsh
         run: |
           $path = Join-Path $env:GITHUB_WORKSPACE `
@@ -473,6 +480,7 @@ jobs:
       # Generate remote Server manifest
       # --------------------------------------------------------
       - name: Generate Server release manifest
+        if: ${{ inputs.target == 'Server' }}
         shell: pwsh
         run: |
           $path = Join-Path $env:GITHUB_WORKSPACE `
@@ -498,6 +506,7 @@ jobs:
       # Create Client ZIP
       # --------------------------------------------------------
       - name: Create Client ZIP
+        if: ${{ inputs.target == 'Client' }}
         shell: pwsh
         run: |
           $package = Join-Path $env:GITHUB_WORKSPACE `
@@ -517,6 +526,7 @@ jobs:
       # Create Server ZIP
       # --------------------------------------------------------
       - name: Create Server ZIP
+        if: ${{ inputs.target == 'Server' }}
         shell: pwsh
         run: |
           $package = Join-Path $env:GITHUB_WORKSPACE `
@@ -539,93 +549,44 @@ jobs:
         shell: pwsh
         run: |
           $root = $env:GITHUB_WORKSPACE
-
-          $clientZip = Join-Path $root `
-            "$env:PLUGIN_NAME-Client-v$env:VERSION.zip"
-
-          $serverZip = Join-Path $root `
-            "$env:PLUGIN_NAME-Server-v$env:VERSION.zip"
-
-          $clientManifest = Join-Path $root `
-            "$env:PLUGIN_NAME-client-manifest.json"
-
-          $serverManifest = Join-Path $root `
-            "$env:PLUGIN_NAME-server-manifest.json"
-
-          foreach ($file in @(
-            $clientZip,
-            $serverZip,
-            $clientManifest,
-            $serverManifest
-          )) {
+          $zip = Join-Path $root "$env:PLUGIN_NAME-$env:BUILD_TARGET-v$env:VERSION.zip"
+          $manifestPath = Join-Path $root "$env:PLUGIN_NAME-$env:MANIFEST_TARGET-manifest.json"
+          foreach ($file in @($zip, $manifestPath)) {
             if (-not (Test-Path $file)) {
               throw "Expected release artifact not found: $file"
             }
-
             $info = Get-Item $file
-
             if ($info.Length -eq 0) {
               throw "Artifact is empty: $file"
             }
-
             Write-Host "$($info.Name) - $($info.Length) bytes"
           }
 
-          $clientSidecar = Join-Path $root `
-            "package\Client\Plugins\$env:PLUGIN_NAME.json"
-
-          $serverSidecar = Join-Path $root `
-            "package\Server\Plugins\$env:PLUGIN_NAME.json"
-
-          foreach ($file in @(
-            $clientSidecar,
-            $serverSidecar
-          )) {
-            if (-not (Test-Path $file)) {
-              throw "Sidecar not found: $file"
-            }
-
-            $json = Get-Content $file -Raw | ConvertFrom-Json
-
-            if (-not $json.manifest_url) {
-              throw "Sidecar has no manifest_url: $file"
-            }
-
-            Write-Host "$($file): $($json.manifest_url)"
+          $sidecarPath = Join-Path $root "package\$env:BUILD_TARGET\Plugins\$env:PLUGIN_NAME.json"
+          $sidecar = Get-Content $sidecarPath -Raw | ConvertFrom-Json
+          $expectedManifestUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/$($env:PLUGIN_NAME)-$env:MANIFEST_TARGET-manifest.json"
+          if ($sidecar.manifest_url -ne $expectedManifestUrl) {
+            throw "Sidecar manifest_url mismatch"
           }
 
-          $clientManifestJson =
-            Get-Content $clientManifest -Raw | ConvertFrom-Json
-
-          $serverManifestJson =
-            Get-Content $serverManifest -Raw | ConvertFrom-Json
-
-          foreach ($manifest in @(
-            $clientManifestJson,
-            $serverManifestJson
-          )) {
-            if ($manifest.plugin_name -ne $env:PLUGIN_NAME) {
-              throw "Manifest plugin_name mismatch"
-            }
-
-            if ($manifest.version -ne $env:VERSION) {
-              throw "Manifest version mismatch"
-            }
-
-            if ($manifest.interface_version_min -ne [int]$env:INTERFACE_VERSION_MIN) {
-              throw "Manifest interface_version_min mismatch"
-            }
-
-            if ($manifest.interface_version_max -ne [int]$env:INTERFACE_VERSION_MAX) {
-              throw "Manifest interface_version_max mismatch"
-            }
-
-            if (-not $manifest.download_url) {
-              throw "Manifest has no download_url"
-            }
-
-            Write-Host "Verified release manifest for $($manifest.plugin_name) $($manifest.version)"
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.plugin_name -ne $env:PLUGIN_NAME) {
+            throw "Manifest plugin_name mismatch"
           }
+          if ($manifest.version -ne $env:VERSION) {
+            throw "Manifest version mismatch"
+          }
+          if ($manifest.interface_version_min -ne [int]$env:INTERFACE_VERSION_MIN) {
+            throw "Manifest interface_version_min mismatch"
+          }
+          if ($manifest.interface_version_max -ne [int]$env:INTERFACE_VERSION_MAX) {
+            throw "Manifest interface_version_max mismatch"
+          }
+          $expectedDownloadUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:VERSION_TAG/$($env:PLUGIN_NAME)-$env:BUILD_TARGET.dll"
+          if ($manifest.download_url -ne $expectedDownloadUrl) {
+            throw "Manifest download_url mismatch"
+          }
+          Write-Host "Verified $env:BUILD_TARGET release manifest for $($manifest.plugin_name) $($manifest.version)"
 
       # --------------------------------------------------------
       # Upload temporary GitHub Actions artifacts.
@@ -634,6 +595,7 @@ jobs:
       # These are NOT GitHub Releases and are NOT Nexus uploads.
       # --------------------------------------------------------
       - name: Upload Client build artifact
+        if: ${{ inputs.target == 'Client' }}
         uses: actions/upload-artifact@v6
         with:
           name: ${{ env.PLUGIN_NAME }}-Client-v${{ env.VERSION }}
@@ -644,6 +606,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Server build artifact
+        if: ${{ inputs.target == 'Server' }}
         uses: actions/upload-artifact@v6
         with:
           name: ${{ env.PLUGIN_NAME }}-Server-v${{ env.VERSION }}
@@ -656,36 +619,181 @@ jobs:
       # --------------------------------------------------------
       # Create GitHub Release
       # --------------------------------------------------------
-      - name: Create GitHub Release
+      - name: Verify and carry forward the other target's release assets
+        if: ${{ (inputs.publish && github.ref == 'refs/heads/main') || (inputs.target == 'Client' && !inputs.publish && github.ref == 'refs/heads/develop') }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repository = $env:GITHUB_REPOSITORY
+          $otherTarget = if ($env:BUILD_TARGET -eq 'Client') { 'Server' } else { 'Client' }
+          $otherManifestTarget = $otherTarget.ToLowerInvariant()
+          $carryDirectory = Join-Path $env:RUNNER_TEMP 'PersistentIdFix-carried-assets'
+          New-Item -ItemType Directory -Path $carryDirectory | Out-Null
+
+          # Carry only verified assets from the current published release.
+          $sourceJson = gh api "repos/$repository/releases/latest"
+          if ($LASTEXITCODE -ne 0) { throw "No published assets available to carry forward" }
+          $source = $sourceJson | ConvertFrom-Json
+
+          $manifestName = "$env:PLUGIN_NAME-$otherManifestTarget-manifest.json"
+          gh release download $source.tag_name --repo $repository `
+            --pattern $manifestName --dir $carryDirectory
+          if ($LASTEXITCODE -ne 0) { throw "Existing opposite-target manifest unavailable" }
+          $manifestPath = Join-Path $carryDirectory $manifestName
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.plugin_name -ne $env:PLUGIN_NAME -or -not $manifest.version) {
+            throw "Invalid carried manifest identity or version"
+          }
+          if ($otherTarget -eq 'Server' -and $manifest.version -ne $env:LEGACY_SERVER_VERSION) {
+            throw "Carried Server version must remain $env:LEGACY_SERVER_VERSION"
+          }
+
+          $dllName = "$env:PLUGIN_NAME-$otherTarget.dll"
+          $zipName = "$env:PLUGIN_NAME-$otherTarget-v$($manifest.version).zip"
+          gh release download $source.tag_name --repo $repository `
+            --pattern $dllName --pattern $zipName --dir $carryDirectory
+          if ($LASTEXITCODE -ne 0) { throw "Existing opposite-target DLL or ZIP unavailable" }
+
+          # Preserve the original bytes of all three files, including the manifest.
+          foreach ($name in @($manifestName, $dllName, $zipName)) {
+            $asset = @($source.assets | Where-Object name -eq $name)
+            if ($asset.Count -ne 1 -or $asset[0].digest -notmatch '^sha256:[0-9a-fA-F]{64}$') {
+              throw "Missing or unverifiable carried asset: $name"
+            }
+            $file = Join-Path $carryDirectory $name
+            $digest = 'sha256:' + (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($digest -ne $asset[0].digest -or (Get-Item $file).Length -ne $asset[0].size) {
+              throw "Carried asset digest or size mismatch: $name"
+            }
+          }
+
+          # The unchanged manifest must still point to an existing identical DLL.
+          $urlPattern = '^https://github\.com/' + [regex]::Escape($repository) +
+            '/releases/download/([^/]+)/' + [regex]::Escape($dllName) + '$'
+          $urlMatch = [regex]::Match($manifest.download_url, $urlPattern)
+          if (-not $urlMatch.Success) { throw "Unexpected carried DLL download URL" }
+          $originalTag = [uri]::UnescapeDataString($urlMatch.Groups[1].Value)
+          $originalJson = gh api "repos/$repository/releases/tags/$originalTag"
+          if ($LASTEXITCODE -ne 0) { throw "Carried manifest's original release is unavailable" }
+          $original = $originalJson | ConvertFrom-Json
+          $originalDll = @($original.assets | Where-Object browser_download_url -eq $manifest.download_url)
+          $carriedDll = @($source.assets | Where-Object name -eq $dllName)
+          if ($original.draft -or $originalDll.Count -ne 1 -or
+              $originalDll[0].digest -ne $carriedDll[0].digest -or
+              $originalDll[0].size -ne $carriedDll[0].size) {
+            throw "Carried manifest does not point to an identical published DLL"
+          }
+
+          "CARRY_DIRECTORY=$carryDirectory" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARRY_DLL_NAME=$dllName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARRY_MANIFEST_NAME=$manifestName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARRY_ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Carrying $otherTarget $($manifest.version) unchanged from $($source.tag_name)"
+
+      - name: Upload carried Server assets artifact
+        if: ${{ inputs.target == 'Client' && !inputs.publish && github.ref == 'refs/heads/develop' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PersistentIdFix-Server-v1.3.1-Carried
+          path: |
+            ${{ runner.temp }}/PersistentIdFix-carried-assets/PersistentIdFix-server-manifest.json
+            ${{ runner.temp }}/PersistentIdFix-carried-assets/PersistentIdFix-Server.dll
+            ${{ runner.temp }}/PersistentIdFix-carried-assets/PersistentIdFix-Server-v1.3.1.zip
+          if-no-files-found: error
+
+      - name: Publish complete GitHub Release assets
+        id: publish_release
         if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $root = $env:GITHUB_WORKSPACE
-
-          $assets = @(
-            (Join-Path $root "$env:PLUGIN_NAME-Client.dll"),
-            (Join-Path $root "$env:PLUGIN_NAME-client-manifest.json"),
-            (Join-Path $root "$env:PLUGIN_NAME-Client-v$env:VERSION.zip"),
-            (Join-Path $root "$env:PLUGIN_NAME-Server.dll"),
-            (Join-Path $root "$env:PLUGIN_NAME-server-manifest.json"),
-            (Join-Path $root "$env:PLUGIN_NAME-Server-v$env:VERSION.zip")
+          $selectedAssets = @(
+            (Join-Path $root "$env:PLUGIN_NAME-$env:BUILD_TARGET.dll"),
+            (Join-Path $root "$env:PLUGIN_NAME-$env:MANIFEST_TARGET-manifest.json"),
+            (Join-Path $root "$env:PLUGIN_NAME-$env:BUILD_TARGET-v$env:VERSION.zip")
           )
+          $carriedAssets = @(
+            (Join-Path $env:CARRY_DIRECTORY $env:CARRY_DLL_NAME),
+            (Join-Path $env:CARRY_DIRECTORY $env:CARRY_MANIFEST_NAME),
+            (Join-Path $env:CARRY_DIRECTORY $env:CARRY_ZIP_NAME)
+          )
+          $assets = $selectedAssets + $carriedAssets
 
-          Write-Host "Creating GitHub Release $env:VERSION_TAG"
-          Write-Host "Uploading $($assets.Count) assets:"
-          $assets | ForEach-Object { Write-Host "  $_" }
+          if ($env:RELEASE_STATE -eq 'draft') {
+            # Recheck before mutation, then validate every existing asset before uploading any.
+            $draftJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID"
+            if ($LASTEXITCODE -ne 0) { throw "Could not recheck destination draft" }
+            $draft = $draftJson | ConvertFrom-Json
+            if (-not $draft.draft -or $draft.published_at) {
+              throw "Version $env:VERSION_TAG is already published and must not be modified"
+            }
+            $expectedNames = @($assets | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+            foreach ($asset in $draft.assets) {
+              if ($asset.name -notin $expectedNames) {
+                throw "Unexpected draft asset '$($asset.name)'; consistency cannot be established"
+              }
+            }
+            $missingAssets = @()
+            foreach ($file in $assets) {
+              $name = [System.IO.Path]::GetFileName($file)
+              $existing = @($draft.assets | Where-Object name -eq $name)
+              if ($existing.Count -eq 0) {
+                $missingAssets += $file
+                continue
+              }
+              $digest = 'sha256:' + (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($existing.Count -ne 1 -or $existing[0].digest -ne $digest -or
+                  $existing[0].size -ne (Get-Item $file).Length) {
+                throw "Conflicting draft asset '$name'; existing assets will not be overwritten"
+              }
+            }
+            if ($missingAssets.Count -gt 0) {
+              gh release upload $env:VERSION_TAG @missingAssets
+              if ($LASTEXITCODE -ne 0) { throw "GitHub draft asset upload failed" }
+            }
+          } elseif ($env:RELEASE_STATE -eq 'missing') {
+            # Keep the new release unpublished until both targets' assets are attached.
+            gh release create $env:VERSION_TAG @assets `
+              --title "$env:PLUGIN_NAME $env:VERSION_TAG" `
+              --generate-notes --draft
+            if ($LASTEXITCODE -ne 0) { throw "GitHub draft release creation failed" }
+          } else {
+            throw "Unknown destination release state; publication refused"
+          }
 
-          gh release create $env:VERSION_TAG @assets `
-            --title "$env:PLUGIN_NAME $env:VERSION_TAG" `
-            --generate-notes
+          # Require a complete, matching draft immediately before publishing it.
+          $destinationFilter = '.[] | select(.tag_name == "' + $env:VERSION_TAG + '")'
+          $completeJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" `
+            --paginate --jq $destinationFilter
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($completeJson -join "`n"))) {
+            throw "Could not verify complete destination draft"
+          }
+          $complete = $completeJson | ConvertFrom-Json
+          if (-not $complete.draft -or $complete.published_at) {
+            throw "Version $env:VERSION_TAG is already published and must not be modified"
+          }
+          foreach ($file in $assets) {
+            $name = [System.IO.Path]::GetFileName($file)
+            $remote = @($complete.assets | Where-Object name -eq $name)
+            $digest = 'sha256:' + (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($remote.Count -ne 1 -or $remote[0].digest -ne $digest -or
+                $remote[0].size -ne (Get-Item $file).Length) {
+              throw "Draft asset '$name' is missing or inconsistent; publication refused"
+            }
+          }
+          $latest = if ($env:BUILD_TARGET -eq 'Client') { '--latest' } else { '--latest=false' }
+          gh release edit $env:VERSION_TAG --draft=false $latest
+          if ($LASTEXITCODE -ne 0) { throw "GitHub release publication failed" }
+          "published=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       # --------------------------------------------------------
       # Upload Client package to Nexus Mods
       # --------------------------------------------------------
       - name: Upload Client build to Nexus Mods
-        if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+        if: ${{ steps.publish_release.outputs.published == 'true' && inputs.target == 'Client' && inputs.publish && github.ref == 'refs/heads/main' }}
         uses: Nexus-Mods/upload-action@main
         with:
           api_key: ${{ secrets.NEXUS_APIKEY }}
@@ -701,7 +809,7 @@ jobs:
       # Upload Server package to Nexus Mods
       # --------------------------------------------------------
       - name: Upload Server build to Nexus Mods
-        if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+        if: ${{ steps.publish_release.outputs.published == 'true' && inputs.target == 'Server' && inputs.publish && github.ref == 'refs/heads/main' }}
         uses: Nexus-Mods/upload-action@main
         with:
           api_key: ${{ secrets.NEXUS_APIKEY }}

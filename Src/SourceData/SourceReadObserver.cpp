@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cwchar>
 #include <mutex>
 #include <shared_mutex>
@@ -26,7 +27,19 @@ namespace
 
     static_assert(sizeof(FStringView) == 0x10);
 
+    constexpr std::size_t kDiagnosticSectionNameCapacity = 96;
+
+    // Holds a bounded stack copy of an FString section name for classification
+    // and failure diagnostics after the native callee destroys its argument.
+    struct CapturedSectionName
+    {
+        wchar_t Text[kDiagnosticSectionNameCapacity]{};
+        std::int32_t Length = 0;
+        bool Valid = false;
+    };
+
     std::atomic<std::uint64_t> g_loadGeneration{ 0 };
+    std::atomic<std::uint64_t> g_inventoryGeneration{ 0 };
     std::atomic<bool> g_gameWorldAttached{ false };
     std::atomic<std::uint64_t> g_attachedLoadGeneration{ 0 };
 
@@ -53,6 +66,11 @@ namespace
     std::atomic<bool> g_inventoryZiplineReplicator{ false };
     std::atomic<bool> g_inventoryZiplineSubsystem{ false };
     std::atomic<bool> g_inventoryBaseCoreReplicationHelper{ false };
+#if defined(MODLOADER_CLIENT_BUILD)
+    std::atomic<bool> g_inventoryCrPackageTransportReplicator{ false };
+    std::atomic<bool> g_inventoryStorageShareableSubsystemData{ false };
+    std::atomic<bool> g_inventoryBaseSiteAttackData{ false };
+#endif
 
     std::atomic<std::uint64_t> g_successfulReads{ 0 };
     std::atomic<std::uint64_t> g_recognizedSuccessfulReads{ 0 };
@@ -66,6 +84,14 @@ namespace
     std::atomic<std::uint64_t> g_ziplineReplicatorReads{ 0 };
     std::atomic<std::uint64_t> g_ziplineSubsystemReads{ 0 };
     std::atomic<std::uint64_t> g_baseCoreReplicationHelperReads{ 0 };
+#if defined(MODLOADER_CLIENT_BUILD)
+    std::atomic<std::uint64_t> g_crPackageTransportReplicatorReads{ 0 };
+    std::atomic<std::uint64_t> g_crPackageTransportReplicatorFailedReads{ 0 };
+    std::atomic<std::uint64_t> g_storageShareableSubsystemDataReads{ 0 };
+    std::atomic<std::uint64_t> g_storageShareableSubsystemDataFailedReads{ 0 };
+    std::atomic<std::uint64_t> g_baseSiteAttackDataReads{ 0 };
+    std::atomic<std::uint64_t> g_baseSiteAttackDataFailedReads{ 0 };
+#endif
 
     // Monotonic activity counters allow publication to prove that no
     // GetSaveData observer frame was active or entered/exited while
@@ -118,6 +144,7 @@ namespace
 
         g_inventoryCaptured.store(false, std::memory_order_relaxed);
         g_inventoryValid.store(false, std::memory_order_relaxed);
+        g_inventoryGeneration.store(0, std::memory_order_relaxed);
         g_inventoryEntries.store(0, std::memory_order_relaxed);
         g_inventoryRecognized.store(0, std::memory_order_relaxed);
         g_inventoryMass.store(false, std::memory_order_relaxed);
@@ -127,6 +154,11 @@ namespace
         g_inventoryZiplineReplicator.store(false, std::memory_order_relaxed);
         g_inventoryZiplineSubsystem.store(false, std::memory_order_relaxed);
         g_inventoryBaseCoreReplicationHelper.store(false, std::memory_order_relaxed);
+#if defined(MODLOADER_CLIENT_BUILD)
+        g_inventoryCrPackageTransportReplicator.store(false, std::memory_order_relaxed);
+        g_inventoryStorageShareableSubsystemData.store(false, std::memory_order_relaxed);
+        g_inventoryBaseSiteAttackData.store(false, std::memory_order_relaxed);
+#endif
 
         g_successfulReads.store(0, std::memory_order_relaxed);
         g_recognizedSuccessfulReads.store(0, std::memory_order_relaxed);
@@ -140,6 +172,14 @@ namespace
         g_ziplineReplicatorReads.store(0, std::memory_order_relaxed);
         g_ziplineSubsystemReads.store(0, std::memory_order_relaxed);
         g_baseCoreReplicationHelperReads.store(0, std::memory_order_relaxed);
+#if defined(MODLOADER_CLIENT_BUILD)
+        g_crPackageTransportReplicatorReads.store(0, std::memory_order_relaxed);
+        g_crPackageTransportReplicatorFailedReads.store(0, std::memory_order_relaxed);
+        g_storageShareableSubsystemDataReads.store(0, std::memory_order_relaxed);
+        g_storageShareableSubsystemDataFailedReads.store(0, std::memory_order_relaxed);
+        g_baseSiteAttackDataReads.store(0, std::memory_order_relaxed);
+        g_baseSiteAttackDataFailedReads.store(0, std::memory_order_relaxed);
+#endif
 
         PersistentIdFixMassFragmentClassifier::Reset();
         PersistentIdFixIndependentSourceCollector::Reset();
@@ -266,6 +306,11 @@ namespace
         bool ziplineReplicator = false;
         bool ziplineSubsystem = false;
         bool baseCore = false;
+#if defined(MODLOADER_CLIENT_BUILD)
+        bool crPackageTransportReplicator = false;
+        bool storageShareableSubsystemData = false;
+        bool baseSiteAttackData = false;
+#endif
 
         std::uint64_t recognized = 0;
         std::int32_t visited = 0;
@@ -331,6 +376,23 @@ namespace
                 if (!mark(baseCore))
                     return false;
             }
+#if defined(MODLOADER_CLIENT_BUILD)
+            else if (EqualsSection(view, L"CrPackageTransportReplicator"))
+            {
+                if (!mark(crPackageTransportReplicator))
+                    return false;
+            }
+            else if (EqualsSection(view, L"StorageShareableSubsystemData"))
+            {
+                if (!mark(storageShareableSubsystemData))
+                    return false;
+            }
+            else if (EqualsSection(view, L"BaseSiteAttackData"))
+            {
+                if (!mark(baseSiteAttackData))
+                    return false;
+            }
+#endif
         }
 
         if (visited != live)
@@ -347,20 +409,86 @@ namespace
         g_inventoryZiplineReplicator.store(ziplineReplicator, std::memory_order_relaxed);
         g_inventoryZiplineSubsystem.store(ziplineSubsystem, std::memory_order_relaxed);
         g_inventoryBaseCoreReplicationHelper.store(baseCore, std::memory_order_relaxed);
+#if defined(MODLOADER_CLIENT_BUILD)
+        g_inventoryCrPackageTransportReplicator.store(
+            crPackageTransportReplicator,
+            std::memory_order_relaxed);
+        g_inventoryStorageShareableSubsystemData.store(
+            storageShareableSubsystemData,
+            std::memory_order_relaxed);
+        g_inventoryBaseSiteAttackData.store(
+            baseSiteAttackData,
+            std::memory_order_relaxed);
+#endif
 
         return true;
     }
 
+    // Copies the bounded by-value FString from sectionName into caller-owned
+    // storage and returns its source classification, or Unknown if invalid.
     PersistentIdFixSourceReadObserver::SourceSection CaptureSection(
-        const void* sectionName)
+        const void* sectionName,
+        CapturedSectionName* capturedName)
     {
         using PersistentIdFixSourceReadObserver::SourceSection;
 
-        if (sectionName == nullptr)
+        if (sectionName == nullptr || capturedName == nullptr)
             return SourceSection::Unknown;
 
-        const auto& value =
-            *static_cast<const FStringView*>(sectionName);
+        capturedName->Text[0] = L'\0';
+        capturedName->Length = 0;
+        capturedName->Valid = false;
+
+        // The native ABI passes FString by value, so validate and copy its
+        // bounded contents before the callee can destroy its storage.
+        __try
+        {
+            const auto& sourceName =
+                *static_cast<const FStringView*>(sectionName);
+
+            if (sourceName.Data == nullptr ||
+                sourceName.Num <= 0 ||
+                sourceName.Max < sourceName.Num ||
+                static_cast<std::size_t>(sourceName.Num) >
+                    kDiagnosticSectionNameCapacity)
+            {
+                return SourceSection::Unknown;
+            }
+
+            const std::int32_t length = sourceName.Num - 1;
+
+            if (sourceName.Data[length] != L'\0')
+                return SourceSection::Unknown;
+
+            for (std::int32_t index = 0; index < length; ++index)
+            {
+                const wchar_t character = sourceName.Data[index];
+
+                if (character == L'\0')
+                    return SourceSection::Unknown;
+
+                capturedName->Text[index] = character;
+            }
+
+            capturedName->Text[length] = L'\0';
+            capturedName->Length = length;
+            capturedName->Valid = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            capturedName->Valid = false;
+            capturedName->Length = 0;
+            capturedName->Text[0] = L'\0';
+            return SourceSection::Unknown;
+        }
+
+        if (!capturedName->Valid)
+            return SourceSection::Unknown;
+
+        const FStringView value{
+            capturedName->Text,
+            capturedName->Length + 1,
+            capturedName->Length + 1 };
 
         if (EqualsSection(value, L"Mass"))
             return SourceSection::Mass;
@@ -390,6 +518,17 @@ namespace
         {
             return SourceSection::BaseCoreReplicationHelper;
         }
+
+#if defined(MODLOADER_CLIENT_BUILD)
+        if (EqualsSection(value, L"CrPackageTransportReplicator"))
+            return SourceSection::CrPackageTransportReplicator;
+
+        if (EqualsSection(value, L"StorageShareableSubsystemData"))
+            return SourceSection::StorageShareableSubsystemData;
+
+        if (EqualsSection(value, L"BaseSiteAttackData"))
+            return SourceSection::BaseSiteAttackData;
+#endif
 
         return SourceSection::Unknown;
     }
@@ -468,6 +607,63 @@ namespace
             : CertificationState::Failed;
     }
 
+#if defined(MODLOADER_CLIENT_BUILD)
+    PersistentIdFixSourceReadObserver::CertificationState CertifyExperimentalIndependent(
+        bool inventoryCaptured,
+        bool inventoryValid,
+        std::uint64_t inventoryGeneration,
+        std::uint64_t loadGeneration,
+        bool inventoryPresent,
+        std::uint64_t successfulReads,
+        std::uint64_t failedReads,
+        bool descriptorRegistryReady,
+        const PersistentIdFixIndependentSourceCollector::SectionSnapshot& section)
+    {
+        using PersistentIdFixSourceReadObserver::CertificationState;
+
+        if (!inventoryCaptured || !inventoryValid || inventoryGeneration == 0 ||
+            inventoryGeneration != loadGeneration)
+        {
+            return CertificationState::InventoryUnavailable;
+        }
+
+        if (!inventoryPresent)
+        {
+            if (successfulReads != 0 || section.attempts != 0 ||
+                section.readFailures != 0 || section.failures != 0 ||
+                section.schemaMismatches != 0 ||
+                section.containerFailures != 0 || section.incompleteCoverage != 0)
+            {
+                return CertificationState::Failed;
+            }
+
+            return descriptorRegistryReady
+                ? CertificationState::SafelyAbsent
+                : CertificationState::Failed;
+        }
+
+        if (failedReads != 0 ||
+            section.readFailures != 0 ||
+            section.failures != 0 ||
+            section.schemaMismatches != 0 ||
+            section.containerFailures != 0 ||
+            section.incompleteCoverage != 0)
+        {
+            return CertificationState::Failed;
+        }
+
+        if (successfulReads == 0 || section.attempts == 0)
+            return CertificationState::Pending;
+
+        if (successfulReads != section.attempts)
+            return CertificationState::Failed;
+
+        return IndependentSectionComplete(section)
+            ? CertificationState::Certified
+            : CertificationState::Failed;
+    }
+#endif
+
     const char* CertificationStateName(
         PersistentIdFixSourceReadObserver::CertificationState state)
     {
@@ -485,6 +681,8 @@ namespace
             return "Certified";
         case CertificationState::Failed:
             return "Failed";
+        case CertificationState::SafelyAbsent:
+            return "SafelyAbsent";
         default:
             return "<invalid>";
         }
@@ -500,6 +698,9 @@ namespace
         {
         case CertificationState::Certified:
             ++snapshot.certifiedSections;
+            break;
+        case CertificationState::SafelyAbsent:
+            ++snapshot.safelyAbsentSections;
             break;
         case CertificationState::Pending:
             ++snapshot.pendingSections;
@@ -537,11 +738,11 @@ namespace PersistentIdFixSourceReadObserver
 
         ObserverFrameGuard observerFrame;
 
-        // This is the only information Step 3A reads before the native call.
-        // Do not retain the FString pointer: native GetSaveData owns the
-        // by-value argument lifetime and destroys it before returning.
+        CapturedSectionName capturedName;
         const SourceSection section =
-            CaptureSection(sectionName);
+            CaptureSection(sectionName, &capturedName);
+        const std::uint64_t loadGeneration =
+            g_loadGeneration.load(std::memory_order_relaxed);
 
         const bool result =
             original(
@@ -552,6 +753,181 @@ namespace PersistentIdFixSourceReadObserver
 
         if (!result)
         {
+            const auto classificationName =
+                [](SourceSection value) -> const char*
+                {
+                    switch (value)
+                    {
+                    case SourceSection::Mass:
+                        return "Mass";
+                    case SourceSection::BuildingCustomNames:
+                        return "BuildingCustomNames";
+                    case SourceSection::GameStateData:
+                        return "GameStateData";
+                    case SourceSection::AntennasData:
+                        return "AntennasData";
+                    case SourceSection::ZiplineReplicator:
+                        return "ZiplineReplicator";
+                    case SourceSection::ZiplineSubsystem:
+                        return "ZiplineSubsystem";
+                    case SourceSection::BaseCoreReplicationHelper:
+                        return "BaseCoreReplicationHelper";
+#if defined(MODLOADER_CLIENT_BUILD)
+                    case SourceSection::CrPackageTransportReplicator:
+                        return "CrPackageTransportReplicator";
+                    case SourceSection::StorageShareableSubsystemData:
+                        return "StorageShareableSubsystemData";
+                    case SourceSection::BaseSiteAttackData:
+                        return "BaseSiteAttackData";
+#endif
+                    case SourceSection::Unknown:
+                    default:
+                        return "Unknown";
+                    }
+                };
+
+            const auto formatSectionName =
+                [&capturedName](char* output, std::size_t outputCapacity)
+                {
+                    if (!capturedName.Valid)
+                    {
+                        std::snprintf(
+                            output,
+                            outputCapacity,
+                            "<unavailable:invalid-name>");
+                        return;
+                    }
+
+                    std::size_t outputIndex = 0;
+
+                    for (std::int32_t index = 0;
+                        index < capturedName.Length;
+                        ++index)
+                    {
+                        const std::uint32_t character =
+                            static_cast<std::uint32_t>(capturedName.Text[index]);
+                        const bool escaped =
+                            character < 0x20 ||
+                            character > 0x7e ||
+                            character == '"' ||
+                            character == '\\';
+                        const std::size_t required = escaped ? 6 : 1;
+
+                        if (outputIndex + required >= outputCapacity)
+                            break;
+
+                        if (escaped)
+                        {
+                            std::snprintf(
+                                output + outputIndex,
+                                outputCapacity - outputIndex,
+                                "\\u%04X",
+                                static_cast<unsigned int>(character & 0xffff));
+                            outputIndex += 6;
+                        }
+                        else
+                        {
+                            output[outputIndex] = static_cast<char>(character);
+                            ++outputIndex;
+                            output[outputIndex] = '\0';
+                        }
+                    }
+
+                    output[outputIndex] = '\0';
+                };
+
+            char diagnosticSectionName[
+                kDiagnosticSectionNameCapacity * 6 + 1]{};
+            formatSectionName(
+                diagnosticSectionName,
+                sizeof(diagnosticSectionName));
+
+            const FStringView capturedNameView{
+                capturedName.Text,
+                capturedName.Length + 1,
+                capturedName.Length + 1 };
+            const bool isFlowSaveData =
+                capturedName.Valid &&
+                EqualsSection(capturedNameView, L"FlowSaveData");
+
+            bool safelyAbsent = false;
+
+#if defined(MODLOADER_CLIENT_BUILD)
+            if (section == SourceSection::CrPackageTransportReplicator ||
+                section == SourceSection::StorageShareableSubsystemData ||
+                section == SourceSection::BaseSiteAttackData)
+            {
+                const CoverageSnapshot coverage =
+                    GetCoverageSnapshot();
+                const bool inventoryCurrent =
+                    coverage.inventoryCaptured &&
+                    coverage.inventoryValid &&
+                    coverage.loadGeneration == loadGeneration &&
+                    coverage.inventoryGeneration == loadGeneration;
+
+                if (inventoryCurrent)
+                {
+                    switch (section)
+                    {
+                    case SourceSection::CrPackageTransportReplicator:
+                        safelyAbsent =
+                            coverage.crPackageTransportReplicatorCertification ==
+                            CertificationState::SafelyAbsent;
+                        break;
+                    case SourceSection::StorageShareableSubsystemData:
+                        safelyAbsent =
+                            coverage.storageShareableSubsystemDataCertification ==
+                            CertificationState::SafelyAbsent;
+                        break;
+                    case SourceSection::BaseSiteAttackData:
+                        safelyAbsent =
+                            coverage.baseSiteAttackDataCertification ==
+                            CertificationState::SafelyAbsent;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+#endif
+
+            if (isFlowSaveData)
+            {
+                LOG_INFO(
+                    "PersistentIdFix: optional save section unavailable: generation=%llu section=\"%s\" classification=%s protected=%u",
+                    static_cast<unsigned long long>(loadGeneration),
+                    diagnosticSectionName,
+                    classificationName(section),
+                    section != SourceSection::Unknown ? 1u : 0u);
+            }
+            else if (safelyAbsent)
+            {
+                LOG_INFO(
+                    "PersistentIdFix: optional save section absent (SafelyAbsent): generation=%llu section=\"%s\" classification=%s protected=%u",
+                    static_cast<unsigned long long>(loadGeneration),
+                    diagnosticSectionName,
+                    classificationName(section),
+                    section != SourceSection::Unknown ? 1u : 0u);
+            }
+            else if (section == SourceSection::Unknown)
+            {
+                LOG_WARN(
+                    "PersistentIdFix: native GetSaveData returned false: generation=%llu section=\"%s\" classification=%s protected=%u",
+                    static_cast<unsigned long long>(loadGeneration),
+                    diagnosticSectionName,
+                    classificationName(section),
+                    section != SourceSection::Unknown ? 1u : 0u);
+            }
+            else
+            {
+                LOG_ERROR(
+                    "PersistentIdFix: native GetSaveData failed: generation=%llu section=\"%s\" classification=%s protected=%u",
+                    static_cast<unsigned long long>(loadGeneration),
+                    diagnosticSectionName,
+                    classificationName(section),
+                    section != SourceSection::Unknown ? 1u : 0u);
+            }
+
             g_failedReads.fetch_add(
                 1,
                 std::memory_order_relaxed);
@@ -588,11 +964,51 @@ namespace PersistentIdFixSourceReadObserver
                 PersistentIdFixIndependentSourceCollector::RecordReadFailure(
                     PersistentIdFixIndependentSourceCollector::Section::BaseCoreReplication);
                 break;
+#if defined(MODLOADER_CLIENT_BUILD)
+            case SourceSection::CrPackageTransportReplicator:
+                g_crPackageTransportReplicatorFailedReads.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                if (!g_inventoryCaptured.load(std::memory_order_relaxed) ||
+                    !g_inventoryValid.load(std::memory_order_relaxed) ||
+                    g_inventoryCrPackageTransportReplicator.load(std::memory_order_relaxed))
+                {
+                    PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                        PersistentIdFixIndependentSourceCollector::Section::CrPackageTransportReplicator);
+                }
+                break;
+
+            case SourceSection::StorageShareableSubsystemData:
+                g_storageShareableSubsystemDataFailedReads.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                if (!g_inventoryCaptured.load(std::memory_order_relaxed) ||
+                    !g_inventoryValid.load(std::memory_order_relaxed) ||
+                    g_inventoryStorageShareableSubsystemData.load(std::memory_order_relaxed))
+                {
+                    PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                        PersistentIdFixIndependentSourceCollector::Section::StorageShareableSubsystemData);
+                }
+                break;
+
+            case SourceSection::BaseSiteAttackData:
+                g_baseSiteAttackDataFailedReads.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+                if (!g_inventoryCaptured.load(std::memory_order_relaxed) ||
+                    !g_inventoryValid.load(std::memory_order_relaxed) ||
+                    g_inventoryBaseSiteAttackData.load(std::memory_order_relaxed))
+                {
+                    PersistentIdFixIndependentSourceCollector::RecordReadFailure(
+                        PersistentIdFixIndependentSourceCollector::Section::BaseSiteAttackData);
+                }
+                break;
+#endif
             default:
                 break;
             }
 
-            return false;
+            return result;
         }
 
         g_successfulReads.fetch_add(
@@ -674,6 +1090,47 @@ namespace PersistentIdFixSourceReadObserver
                     static_cast<const SDK::FBaseCoreReplicationSaveData*>(destination));
                 break;
 
+#if defined(MODLOADER_CLIENT_BUILD)
+            case SourceSection::CrPackageTransportReplicator:
+                PersistentIdFixIndependentSourceCollector::ObserveCrPackageTransportReplicator(
+                    descriptor,
+                    static_cast<const SDK::FCrSenderConnectionsSaveData*>(destination));
+                if (g_inventoryCaptured.load(std::memory_order_relaxed) &&
+                    g_inventoryValid.load(std::memory_order_relaxed) &&
+                    !g_inventoryCrPackageTransportReplicator.load(std::memory_order_relaxed))
+                {
+                    PersistentIdFixIndependentSourceCollector::RecordConsistencyFailure(
+                        PersistentIdFixIndependentSourceCollector::Section::CrPackageTransportReplicator);
+                }
+                break;
+
+            case SourceSection::StorageShareableSubsystemData:
+                PersistentIdFixIndependentSourceCollector::ObserveStorageShareableSubsystemData(
+                    descriptor,
+                    static_cast<const SDK::FCrStorageShareableSubsystemSaveData*>(destination));
+                if (g_inventoryCaptured.load(std::memory_order_relaxed) &&
+                    g_inventoryValid.load(std::memory_order_relaxed) &&
+                    !g_inventoryStorageShareableSubsystemData.load(std::memory_order_relaxed))
+                {
+                    PersistentIdFixIndependentSourceCollector::RecordConsistencyFailure(
+                        PersistentIdFixIndependentSourceCollector::Section::StorageShareableSubsystemData);
+                }
+                break;
+
+            case SourceSection::BaseSiteAttackData:
+                PersistentIdFixIndependentSourceCollector::ObserveBaseSiteAttackData(
+                    descriptor,
+                    static_cast<const SDK::FBaseSiteAttackSubsystemSaveData*>(destination));
+                if (g_inventoryCaptured.load(std::memory_order_relaxed) &&
+                    g_inventoryValid.load(std::memory_order_relaxed) &&
+                    !g_inventoryBaseSiteAttackData.load(std::memory_order_relaxed))
+                {
+                    PersistentIdFixIndependentSourceCollector::RecordConsistencyFailure(
+                        PersistentIdFixIndependentSourceCollector::Section::BaseSiteAttackData);
+                }
+                break;
+#endif
+
             default:
                 break;
             }
@@ -717,6 +1174,20 @@ namespace PersistentIdFixSourceReadObserver
                 sectionCounter = &g_baseCoreReplicationHelperReads;
                 break;
 
+#if defined(MODLOADER_CLIENT_BUILD)
+            case SourceSection::CrPackageTransportReplicator:
+                sectionCounter = &g_crPackageTransportReplicatorReads;
+                break;
+
+            case SourceSection::StorageShareableSubsystemData:
+                sectionCounter = &g_storageShareableSubsystemDataReads;
+                break;
+
+            case SourceSection::BaseSiteAttackData:
+                sectionCounter = &g_baseSiteAttackDataReads;
+                break;
+#endif
+
             default:
                 break;
             }
@@ -729,7 +1200,7 @@ namespace PersistentIdFixSourceReadObserver
             }
         }
 
-        return true;
+        return result;
     }
 
     CoverageSnapshot GetCoverageSnapshot()
@@ -738,6 +1209,9 @@ namespace PersistentIdFixSourceReadObserver
 
         snapshot.loadGeneration =
             g_loadGeneration.load(
+                std::memory_order_relaxed);
+        snapshot.inventoryGeneration =
+            g_inventoryGeneration.load(
                 std::memory_order_relaxed);
 
         {
@@ -780,6 +1254,14 @@ namespace PersistentIdFixSourceReadObserver
             g_inventoryZiplineSubsystem.load(std::memory_order_relaxed);
         snapshot.inventoryBaseCoreReplicationHelper =
             g_inventoryBaseCoreReplicationHelper.load(std::memory_order_relaxed);
+#if defined(MODLOADER_CLIENT_BUILD)
+        snapshot.inventoryCrPackageTransportReplicator =
+            g_inventoryCrPackageTransportReplicator.load(std::memory_order_relaxed);
+        snapshot.inventoryStorageShareableSubsystemData =
+            g_inventoryStorageShareableSubsystemData.load(std::memory_order_relaxed);
+        snapshot.inventoryBaseSiteAttackData =
+            g_inventoryBaseSiteAttackData.load(std::memory_order_relaxed);
+#endif
 
         snapshot.successfulReads =
             g_successfulReads.load(
@@ -820,6 +1302,20 @@ namespace PersistentIdFixSourceReadObserver
         snapshot.baseCoreReplicationHelperReads =
             g_baseCoreReplicationHelperReads.load(
                 std::memory_order_relaxed);
+#if defined(MODLOADER_CLIENT_BUILD)
+        snapshot.crPackageTransportReplicatorReads =
+            g_crPackageTransportReplicatorReads.load(std::memory_order_relaxed);
+        snapshot.crPackageTransportReplicatorFailedReads =
+            g_crPackageTransportReplicatorFailedReads.load(std::memory_order_relaxed);
+        snapshot.storageShareableSubsystemDataReads =
+            g_storageShareableSubsystemDataReads.load(std::memory_order_relaxed);
+        snapshot.storageShareableSubsystemDataFailedReads =
+            g_storageShareableSubsystemDataFailedReads.load(std::memory_order_relaxed);
+        snapshot.baseSiteAttackDataReads =
+            g_baseSiteAttackDataReads.load(std::memory_order_relaxed);
+        snapshot.baseSiteAttackDataFailedReads =
+            g_baseSiteAttackDataFailedReads.load(std::memory_order_relaxed);
+#endif
 
         const auto independent =
             PersistentIdFixIndependentSourceCollector::GetSnapshot();
@@ -910,6 +1406,47 @@ namespace PersistentIdFixSourceReadObserver
                 snapshot.baseCoreReplicationHelperReads,
                 independent.baseCoreReplication);
 
+#if defined(MODLOADER_CLIENT_BUILD)
+        const bool descriptorRegistryReady =
+            PersistentIdFixIndependentSourceCollector::IsDescriptorRegistryReady();
+
+        snapshot.crPackageTransportReplicatorCertification =
+            CertifyExperimentalIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryGeneration,
+                snapshot.loadGeneration,
+                snapshot.inventoryCrPackageTransportReplicator,
+                snapshot.crPackageTransportReplicatorReads,
+                snapshot.crPackageTransportReplicatorFailedReads,
+                descriptorRegistryReady,
+                independent.crPackageTransportReplicator);
+
+        snapshot.storageShareableSubsystemDataCertification =
+            CertifyExperimentalIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryGeneration,
+                snapshot.loadGeneration,
+                snapshot.inventoryStorageShareableSubsystemData,
+                snapshot.storageShareableSubsystemDataReads,
+                snapshot.storageShareableSubsystemDataFailedReads,
+                descriptorRegistryReady,
+                independent.storageShareableSubsystemData);
+
+        snapshot.baseSiteAttackDataCertification =
+            CertifyExperimentalIndependent(
+                snapshot.inventoryCaptured,
+                snapshot.inventoryValid,
+                snapshot.inventoryGeneration,
+                snapshot.loadGeneration,
+                snapshot.inventoryBaseSiteAttackData,
+                snapshot.baseSiteAttackDataReads,
+                snapshot.baseSiteAttackDataFailedReads,
+                descriptorRegistryReady,
+                independent.baseSiteAttackData);
+#endif
+
         CountCertificationState(
             snapshot.massCertification,
             snapshot);
@@ -931,7 +1468,47 @@ namespace PersistentIdFixSourceReadObserver
         CountCertificationState(
             snapshot.baseCoreReplicationCertification,
             snapshot);
+#if defined(MODLOADER_CLIENT_BUILD)
+        CountCertificationState(
+            snapshot.crPackageTransportReplicatorCertification,
+            snapshot);
+        CountCertificationState(
+            snapshot.storageShareableSubsystemDataCertification,
+            snapshot);
+        CountCertificationState(
+            snapshot.baseSiteAttackDataCertification,
+            snapshot);
+#endif
 
+#if defined(MODLOADER_CLIENT_BUILD)
+        const bool originalSevenCertified =
+            snapshot.massCertification == CertificationState::Certified &&
+            snapshot.buildingCustomNamesCertification == CertificationState::Certified &&
+            snapshot.gameStateDataCertification == CertificationState::Certified &&
+            snapshot.antennasDataCertification == CertificationState::Certified &&
+            snapshot.ziplineReplicatorCertification == CertificationState::Certified &&
+            snapshot.ziplineSubsystemCertification == CertificationState::Certified &&
+            snapshot.baseCoreReplicationCertification == CertificationState::Certified;
+
+        const bool newDomainsResolved =
+            (snapshot.crPackageTransportReplicatorCertification == CertificationState::Certified ||
+                snapshot.crPackageTransportReplicatorCertification == CertificationState::SafelyAbsent) &&
+            (snapshot.storageShareableSubsystemDataCertification == CertificationState::Certified ||
+                snapshot.storageShareableSubsystemDataCertification == CertificationState::SafelyAbsent) &&
+            (snapshot.baseSiteAttackDataCertification == CertificationState::Certified ||
+                snapshot.baseSiteAttackDataCertification == CertificationState::SafelyAbsent);
+
+        snapshot.sourceCoverageComplete =
+            snapshot.inventoryCaptured &&
+            snapshot.inventoryValid &&
+            snapshot.inventoryGeneration == snapshot.loadGeneration &&
+            originalSevenCertified &&
+            newDomainsResolved &&
+            snapshot.pendingSections == 0 &&
+            snapshot.failedSections == 0 &&
+            snapshot.absentUnsupportedSections == 0 &&
+            snapshot.inventoryUnavailableSections == 0;
+#else
         snapshot.sourceCoverageComplete =
             snapshot.inventoryCaptured &&
             snapshot.inventoryValid &&
@@ -940,6 +1517,7 @@ namespace PersistentIdFixSourceReadObserver
             snapshot.failedSections == 0 &&
             snapshot.absentUnsupportedSections == 0 &&
             snapshot.inventoryUnavailableSections == 0;
+#endif
 
         return snapshot;
     }
@@ -1015,6 +1593,10 @@ namespace PersistentIdFixSourceReadObserver
     {
         const CoverageSnapshot snapshot =
             GetCoverageSnapshot();
+#if defined(MODLOADER_CLIENT_BUILD)
+        const auto collectorSnapshot =
+            PersistentIdFixIndependentSourceCollector::GetSnapshot();
+#endif
 
         LOG_INFO(
             "PersistentIdFix: source reads [%s]: generation=%llu successful=%llu recognized=%llu failed=%llu",
@@ -1049,6 +1631,17 @@ namespace PersistentIdFixSourceReadObserver
             snapshot.inventoryZiplineSubsystem ? 1u : 0u,
             snapshot.inventoryBaseCoreReplicationHelper ? 1u : 0u);
 
+#if defined(MODLOADER_CLIENT_BUILD)
+        LOG_INFO(
+            "PersistentIdFix: experimental source inventory [%s]: CrPackageTransportReplicator=%u StorageShareableSubsystemData=%u BaseSiteAttackData=%u generation=%llu inventoryGeneration=%llu",
+            phase != nullptr ? phase : "<null>",
+            snapshot.inventoryCrPackageTransportReplicator ? 1u : 0u,
+            snapshot.inventoryStorageShareableSubsystemData ? 1u : 0u,
+            snapshot.inventoryBaseSiteAttackData ? 1u : 0u,
+            static_cast<unsigned long long>(snapshot.loadGeneration),
+            static_cast<unsigned long long>(snapshot.inventoryGeneration));
+#endif
+
         LOG_INFO(
             "PersistentIdFix: source certification [%s]: Mass=%s CustomNames=%s GameState=%s Antennas=%s ZiplineReplicator=%s ZiplineSubsystem=%s BaseCoreReplication=%s",
             phase != nullptr ? phase : "<null>",
@@ -1060,6 +1653,15 @@ namespace PersistentIdFixSourceReadObserver
             CertificationStateName(snapshot.ziplineSubsystemCertification),
             CertificationStateName(snapshot.baseCoreReplicationCertification));
 
+#if defined(MODLOADER_CLIENT_BUILD)
+        LOG_INFO(
+            "PersistentIdFix: experimental source certification [%s]: CrPackageTransportReplicator=%s StorageShareableSubsystemData=%s BaseSiteAttackData=%s",
+            phase != nullptr ? phase : "<null>",
+            CertificationStateName(snapshot.crPackageTransportReplicatorCertification),
+            CertificationStateName(snapshot.storageShareableSubsystemDataCertification),
+            CertificationStateName(snapshot.baseSiteAttackDataCertification));
+#endif
+
         LOG_INFO(
             "PersistentIdFix: source coverage [%s]: complete=%u certified=%llu pending=%llu failed=%llu absentUnsupported=%llu inventoryUnavailable=%llu",
             phase != nullptr ? phase : "<null>",
@@ -1069,6 +1671,29 @@ namespace PersistentIdFixSourceReadObserver
             static_cast<unsigned long long>(snapshot.failedSections),
             static_cast<unsigned long long>(snapshot.absentUnsupportedSections),
             static_cast<unsigned long long>(snapshot.inventoryUnavailableSections));
+
+#if defined(MODLOADER_CLIENT_BUILD)
+        LOG_INFO(
+            "PersistentIdFix: experimental source outcomes [%s]: CrPackageTransportReplicator=read:%llu readFailed:%llu collect:%llu/%llu protectedIds:%llu StorageShareableSubsystemData=read:%llu readFailed:%llu collect:%llu/%llu protectedIds:%llu BaseSiteAttackData=read:%llu readFailed:%llu collect:%llu/%llu protectedIds:%llu certified=%llu safelyAbsent=%llu",
+            phase != nullptr ? phase : "<null>",
+            static_cast<unsigned long long>(snapshot.crPackageTransportReplicatorReads),
+            static_cast<unsigned long long>(snapshot.crPackageTransportReplicatorFailedReads),
+            static_cast<unsigned long long>(collectorSnapshot.crPackageTransportReplicator.successes),
+            static_cast<unsigned long long>(collectorSnapshot.crPackageTransportReplicator.attempts),
+            static_cast<unsigned long long>(collectorSnapshot.crPackageTransportReplicator.values),
+            static_cast<unsigned long long>(snapshot.storageShareableSubsystemDataReads),
+            static_cast<unsigned long long>(snapshot.storageShareableSubsystemDataFailedReads),
+            static_cast<unsigned long long>(collectorSnapshot.storageShareableSubsystemData.successes),
+            static_cast<unsigned long long>(collectorSnapshot.storageShareableSubsystemData.attempts),
+            static_cast<unsigned long long>(collectorSnapshot.storageShareableSubsystemData.values),
+            static_cast<unsigned long long>(snapshot.baseSiteAttackDataReads),
+            static_cast<unsigned long long>(snapshot.baseSiteAttackDataFailedReads),
+            static_cast<unsigned long long>(collectorSnapshot.baseSiteAttackData.successes),
+            static_cast<unsigned long long>(collectorSnapshot.baseSiteAttackData.attempts),
+            static_cast<unsigned long long>(collectorSnapshot.baseSiteAttackData.values),
+            static_cast<unsigned long long>(snapshot.certifiedSections),
+            static_cast<unsigned long long>(snapshot.safelyAbsentSections));
+#endif
 
         LOG_INFO(
             "PersistentIdFix: source attachment [%s]: gameWorld=%u generation=%llu attachedGeneration=%llu current=%u coverageComplete=%u",
@@ -1109,6 +1734,10 @@ namespace PersistentIdFixSourceReadObserver
             g_loadGeneration.fetch_add(
                 1,
                 std::memory_order_relaxed) + 1;
+
+        g_inventoryGeneration.store(
+            generation,
+            std::memory_order_relaxed);
 
         g_inventoryCaptured.store(true, std::memory_order_relaxed);
 

@@ -11,6 +11,7 @@
 
 #ifdef MODLOADER_CLIENT_BUILD
 #include "UI/UI.h"
+#include "plugin_map.h"
 #endif
 
 #include <algorithm>
@@ -18,15 +19,6 @@
 #include <limits>
 #include <vector>
 
-#ifndef MODLOADER_BUILD_TAG
-#define PERSISTENTIDFIX_STRINGIFY_INNER(value) #value
-#define PERSISTENTIDFIX_STRINGIFY(value) \
-    PERSISTENTIDFIX_STRINGIFY_INNER(value)
-#define MODLOADER_BUILD_TAG \
-    PERSISTENTIDFIX_STRINGIFY(VERSION_MAJOR) "." \
-    PERSISTENTIDFIX_STRINGIFY(VERSION_MINOR) "." \
-    PERSISTENTIDFIX_STRINGIFY(VERSION_PATCH)
-#endif
 
 IPluginSelf* g_self = nullptr;
 IPluginSelf* GetSelf() { return g_self; }
@@ -308,7 +300,7 @@ static void LogReadiness(
 
 static PluginInfo s_pluginInfo = {
     "PersistentIdFix",
-    MODLOADER_BUILD_TAG,
+    PERSISTENTIDFIX_VERSION_STRING,
     "Kian369",
     "Reuses unused persistent IDs from the loaded save to prevent persistent ID exhaustion",
     PLUGIN_INTERFACE_VERSION,
@@ -738,6 +730,18 @@ extern "C"
     __declspec(dllexport)
         bool PluginInit(IPluginSelf* self)
     {
+#ifdef MODLOADER_CLIENT_BUILD
+        if (!PluginSdkRuntime::Init(self ? self->hooks : nullptr))
+        {
+            if (self && self->logger && self->logger->Error)
+            {
+                self->logger->Error(self,
+                    "PersistentIdFix: SDK runtime initialization failed");
+            }
+            return false;
+        }
+#endif
+
         g_self = self;
 
         if (g_self == nullptr || g_self->hooks == nullptr)
