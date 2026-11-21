@@ -620,7 +620,7 @@ jobs:
       # Create GitHub Release
       # --------------------------------------------------------
       - name: Verify and carry forward the other target's release assets
-        if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+        if: ${{ (inputs.publish && github.ref == 'refs/heads/main') || (inputs.target == 'Client' && !inputs.publish && github.ref == 'refs/heads/develop') }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -690,6 +690,17 @@ jobs:
           "CARRY_MANIFEST_NAME=$manifestName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CARRY_ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Carrying $otherTarget $($manifest.version) unchanged from $($source.tag_name)"
+
+      - name: Upload carried Server assets artifact
+        if: ${{ inputs.target == 'Client' && !inputs.publish && github.ref == 'refs/heads/develop' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: PersistentIdFix-Server-v1.3.1-Carried
+          path: |
+            ${{ runner.temp }}/PersistentIdFix-carried-assets/PersistentIdFix-server-manifest.json
+            ${{ runner.temp }}/PersistentIdFix-carried-assets/PersistentIdFix-Server.dll
+            ${{ runner.temp }}/PersistentIdFix-carried-assets/PersistentIdFix-Server-v1.3.1.zip
+          if-no-files-found: error
 
       - name: Publish complete GitHub Release assets
         id: publish_release
