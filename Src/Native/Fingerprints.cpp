@@ -118,8 +118,8 @@ namespace PersistentIdFixFingerprints
 
         // UCrSaveSubsystem::OnPreLoadMap:
         //
-        // Audited Hotfix 0.3.5 entry sequence, shared by Client
-        // and Server. The compiler emits a redundant 0x40 REX prefix
+        // Historical Hotfix 0.3.5 entry sequence, retained for Server
+        // and legacy builds. The compiler emits a redundant 0x40 REX prefix
         // on push rbx, so include the complete two-byte instruction
         // rather than matching from its second byte.
         //
@@ -139,6 +139,14 @@ namespace PersistentIdFixFingerprints
         req = PLUGIN_SCAN_REQUEST_INIT;
         req.hookName =
             onPreLoadMapHookName;
+#if defined(MODLOADER_CLIENT_BUILD) && !defined(MODLOADER_SERVER_BUILD)
+        // CL-130045 PDB-verified entry: end the loading screen, broadcast
+        // OnPreSaveLoaded at +0x198, then remove PreLoadMapHandle at +0x118.
+        req.pattern =
+            "40 53 48 83 EC 20 33 D2 48 8B D9 E8 ?? ?? ?? ?? "
+            "48 8D 8B 98 01 00 00 E8 ?? ?? ?? ?? "
+            "48 8B 93 18 01 00 00 48 85 D2 74 ??";
+#else
         req.pattern =
             "40 53 "
             "48 83 EC 20 "
@@ -148,6 +156,7 @@ namespace PersistentIdFixFingerprints
             "48 8B 93 10 01 00 00 "
             "48 85 D2 "
             "74 0C";
+#endif
 
         req.kind =
             PLUGIN_SCAN_FUNCTION_START;
