@@ -64,7 +64,7 @@ namespace
     static_assert(sizeof(FCrBuildingInfectionAlarmFragment) == 8);
     static_assert(sizeof(FCrBuildingInfectionFragment) == 48);
     static_assert(sizeof(FCrBuildingStateFragment) == 4);
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
     static_assert(sizeof(FCrCraftingFragment) == 0xA0);
 #else
     static_assert(sizeof(FCrCraftingFragment) == 128);
@@ -72,24 +72,24 @@ namespace
     static_assert(sizeof(FCrElectricityFragment) == 20);
     static_assert(sizeof(FCrHeaterCoolerFragment) == 40);
     static_assert(sizeof(FCrInventoryFragment) == 592);
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
     static_assert(sizeof(FCrLogisticsAgentFragment) == 0xF0);
 #else
     static_assert(sizeof(FCrLogisticsAgentFragment) == 216);
 #endif
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
     static_assert(sizeof(FCrLogisticsIntersectionFragment) == 0x50);
 #else
     static_assert(sizeof(FCrLogisticsIntersectionFragment) == 48);
 #endif
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
     static_assert(sizeof(FCrLogisticsLineFragment) == 0x58);
 #else
     static_assert(sizeof(FCrLogisticsLineFragment) == 56);
 #endif
     static_assert(sizeof(FCrLogisticsRequestContainerFragment) == 40);
     static_assert(sizeof(FCrLogisticsRequestOptionsFragment) == 1);
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
     static_assert(sizeof(FCrLogisticsRoundaboutFragment) == 0x40);
 #else
     static_assert(sizeof(FCrLogisticsRoundaboutFragment) == 32);
@@ -99,7 +99,7 @@ namespace
     // Do not sizeof-assert this generated wrapper: the Client SDK injects a
     // synthetic byte into its empty CustomOnRep base and can inflate the
     // compiler layout of this derived type without changing native storage.
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
     static_assert(sizeof(FCrLogisticsVerticalConnectorFragment) == 0x28);
 #else
     static_assert(sizeof(FCrLogisticsVerticalConnectorFragment) == 48);
@@ -112,7 +112,7 @@ namespace
     static_assert(sizeof(FCrPackageReceiverFragment) == 56);
     static_assert(sizeof(FCrStandaloneInfectionFragment) == 40);
 
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
     // CL-130045 generated offsets, including nested array element strides.
     static_assert(offsetof(FCrCraftingFragment, LastStartTime) == 0x58);
     static_assert(offsetof(FCrLogisticsAgentFragment, CurrentPath) == 0xC0);
@@ -207,7 +207,7 @@ namespace
             { "ScriptStruct Chimera.CrBuildingInfectionAlarmFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 8, 4, false, FragmentClass::PidFree },
             { "ScriptStruct Chimera.CrBuildingInfectionFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 48, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrBuildingStateFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 4, 2, false, FragmentClass::PidFree },
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
             { "ScriptStruct Chimera.CrCraftingFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0xA0, 8, false, FragmentClass::PidFree },
 #else
             { "ScriptStruct Chimera.CrCraftingFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 128, 8, false, FragmentClass::PidFree },
@@ -215,31 +215,31 @@ namespace
             { "ScriptStruct Chimera.CrElectricityFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 20, 4, false, FragmentClass::PidFree },
             { "ScriptStruct Chimera.CrHeaterCoolerFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 40, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrInventoryFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 592, 8, false, FragmentClass::PidFree },
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
             { "ScriptStruct Chimera.CrLogisticsAgentFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0xF0, 8, false, FragmentClass::PidBearing },
 #else
             { "ScriptStruct Chimera.CrLogisticsAgentFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 216, 8, false, FragmentClass::PidBearing },
 #endif
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
             { "ScriptStruct Chimera.CrLogisticsIntersectionFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0x50, 8, false, FragmentClass::PidBearing },
 #else
             { "ScriptStruct Chimera.CrLogisticsIntersectionFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 48, 8, false, FragmentClass::PidBearing },
 #endif
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
             { "ScriptStruct Chimera.CrLogisticsLineFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0x58, 8, false, FragmentClass::PidBearing },
 #else
             { "ScriptStruct Chimera.CrLogisticsLineFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 56, 8, false, FragmentClass::PidBearing },
 #endif
             { "ScriptStruct Chimera.CrLogisticsRequestContainerFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 40, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrLogisticsRequestOptionsFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 1, 1, false, FragmentClass::PidFree },
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
             { "ScriptStruct Chimera.CrLogisticsRoundaboutFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0x40, 8, false, FragmentClass::PidBearing },
 #else
             { "ScriptStruct Chimera.CrLogisticsRoundaboutFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 32, 8, false, FragmentClass::PidBearing },
 #endif
             { "ScriptStruct Chimera.CrLogisticsSocketsFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 16, 8, false, FragmentClass::PidBearing },
             { "ScriptStruct Chimera.CrLogisticsTierFragment", "ScriptStruct Chimera.CrMassSavableFragmentWithCustomOnRepCallActor", 4, 4, false, FragmentClass::PidFree },
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
             { "ScriptStruct Chimera.CrLogisticsVerticalConnectorFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 0x28, 8, false, FragmentClass::PidBearing },
 #else
             { "ScriptStruct Chimera.CrLogisticsVerticalConnectorFragment", "ScriptStruct ChimeraMassCommon.CrMassSavableFragment", 48, 8, false, FragmentClass::PidBearing },
@@ -839,7 +839,7 @@ namespace
             const auto& f =
                 *reinterpret_cast<const FCrLogisticsVerticalConnectorFragment*>(memory);
 
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
             if (!CheckedEach(f.LaneStates, [&](const FCrLogisticsVerticalConnSimulationState& lane)
                 {
                     // WaitingItem is transient, but its helper contains a SaveGame PID.

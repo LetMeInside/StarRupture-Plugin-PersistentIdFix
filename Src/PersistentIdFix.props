@@ -1,21 +1,9 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
-    <StarRupturePluginSDKRoot Condition="'$(Configuration)' != 'Client Debug Experimental'">$(SolutionDir)..\..\StarRupture-Plugin-SDK\</StarRupturePluginSDKRoot>
-    <StarRupturePluginSDKRoot Condition="'$(Configuration)' == 'Client Debug Experimental'">C:\Modding\StarRupture\AlienX\StarRupture-Plugin-SDK\</StarRupturePluginSDKRoot>
+    <StarRupturePluginSDKRoot>$(SolutionDir)..\..\StarRupture-Plugin-SDK\</StarRupturePluginSDKRoot>
     <GameSDKRoot Condition="'$(GameSDKRoot)' == ''">$(StarRupturePluginSDKRoot)StarRupture SDK</GameSDKRoot>
-    <GameSDKRoot Condition="'$(Configuration)' == 'Client Debug Experimental'">C:\Modding\StarRupture\AlienX\StarRupture-Game-SDK-CL-130045</GameSDKRoot>
   </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)' == 'Client Debug' Or '$(Configuration)' == 'Client Debug Experimental' Or '$(Configuration)' == 'Client Release'">
-    <PersistentIdFixGameSDKIdentityHeader>$(GameSDKRoot)\Client\SDK.hpp</PersistentIdFixGameSDKIdentityHeader>
-  </PropertyGroup>
-
-  <PropertyGroup Condition="'$(PluginGameBuiltCL)' == '' And Exists('$(PersistentIdFixGameSDKIdentityHeader)')">
-    <PluginGameBuiltCL>$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(PersistentIdFixGameSDKIdentityHeader)')), '(?m)^// [0-9]+\.[0-9]+\.[0-9]+-([0-9]+)\+\+\+').Groups[1].Value)</PluginGameBuiltCL>
-  </PropertyGroup>
-
-  <Import Project="$(StarRupturePluginSDKRoot)PluginGameBuild.props" />
 
   <PropertyGroup Condition="'$(Configuration)' == 'Debug' Or '$(Configuration)' == 'Release'">
     <StarRuptureSDKSourceDir>$(GameSDKRoot)\Server\SDK\</StarRuptureSDKSourceDir>
@@ -32,16 +20,24 @@
     <StarRuptureSDKConfigDir>$(GameSDKRoot)\Server\;$(GameSDKRoot)\Server\SDK\</StarRuptureSDKConfigDir>
   </PropertyGroup>
 
+  <Import Project="$(StarRupturePluginSDKRoot)PluginGameBuild.props" />
+
   <ItemDefinitionGroup Condition="'$(Configuration)' == 'Client Debug' Or '$(Configuration)' == 'Client Debug Experimental' Or '$(Configuration)' == 'Client Release'">
     <ClCompile>
       <PreprocessorDefinitions>MODLOADER_CLIENT_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>MODLOADER_CLIENT_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ResourceCompile>
   </ItemDefinitionGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)' == 'Server Debug' Or '$(Configuration)' == 'Server Release'">
     <ClCompile>
       <PreprocessorDefinitions>MODLOADER_SERVER_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>MODLOADER_SERVER_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ResourceCompile>
   </ItemDefinitionGroup>
 </Project>
 

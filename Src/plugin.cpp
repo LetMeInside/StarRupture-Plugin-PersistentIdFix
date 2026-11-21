@@ -19,15 +19,6 @@
 #include <limits>
 #include <vector>
 
-#ifndef MODLOADER_BUILD_TAG
-#define PERSISTENTIDFIX_STRINGIFY_INNER(value) #value
-#define PERSISTENTIDFIX_STRINGIFY(value) \
-    PERSISTENTIDFIX_STRINGIFY_INNER(value)
-#define MODLOADER_BUILD_TAG \
-    PERSISTENTIDFIX_STRINGIFY(VERSION_MAJOR) "." \
-    PERSISTENTIDFIX_STRINGIFY(VERSION_MINOR) "." \
-    PERSISTENTIDFIX_STRINGIFY(VERSION_PATCH)
-#endif
 
 IPluginSelf* g_self = nullptr;
 IPluginSelf* GetSelf() { return g_self; }
@@ -309,7 +300,7 @@ static void LogReadiness(
 
 static PluginInfo s_pluginInfo = {
     "PersistentIdFix",
-    MODLOADER_BUILD_TAG,
+    PERSISTENTIDFIX_VERSION_STRING,
     "Kian369",
     "Reuses unused persistent IDs from the loaded save to prevent persistent ID exhaustion",
     PLUGIN_INTERFACE_VERSION,

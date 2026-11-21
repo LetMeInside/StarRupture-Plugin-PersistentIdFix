@@ -11,6 +11,9 @@
 
 #include "SDK/Chimera_structs.hpp"
 #include "SDK/CoreUObject_classes.hpp"
+#if defined(MODLOADER_CLIENT_BUILD)
+#include "SDK/MassAIPrototypeEnemyRuntime_structs.hpp"
+#endif
 
 #include <array>
 #include <atomic>
@@ -41,7 +44,13 @@ namespace
     static_assert(sizeof(FCrBaseCoreSaveData) == 0x28);
     static_assert(sizeof(FGameStateSaveData) == 0x490);
     static_assert(sizeof(FCrCharacterPlayersBaseSaveData) == 0x50);
-#if defined(PERSISTENTIDFIX_EXPERIMENTAL)
+#if defined(MODLOADER_CLIENT_BUILD)
+    static_assert(sizeof(FCrSenderConnectionsSaveData) == 0x58);
+    static_assert(sizeof(FCrStorageShareableSubsystemSaveData) == 0x10);
+    static_assert(sizeof(FCrStorageShareableSaveData) == 0x18);
+    static_assert(sizeof(FBaseSiteAttackSubsystemSaveData) == 0xE0);
+#endif
+#if defined(MODLOADER_CLIENT_BUILD)
     static_assert(sizeof(FCrCharacterPlayerBaseSaveDataPerPlayer) == 0x700);
 #else
     static_assert(sizeof(FCrCharacterPlayerBaseSaveDataPerPlayer) == 0x6F0);
@@ -62,10 +71,10 @@ namespace
         std::atomic<std::uint64_t> IncompleteCoverage{0};
     };
 
-    std::array<SectionState, 6> g_states;
+    std::array<SectionState, static_cast<std::size_t>(Section::Count)> g_states;
 
     std::mutex g_valuesMutex;
-    std::array<std::vector<std::uint32_t>, 6> g_values;
+    std::array<std::vector<std::uint32_t>, static_cast<std::size_t>(Section::Count)> g_values;
 
     struct DescriptorProfile
     {
@@ -74,20 +83,31 @@ namespace
         std::int32_t ExpectedSize;
     };
 
-    constexpr std::array<DescriptorProfile, 6> kProfiles{{
+    constexpr std::array<DescriptorProfile,
+#if defined(MODLOADER_CLIENT_BUILD)
+        9
+#else
+        6
+#endif
+    > kProfiles{{
         { Section::BuildingCustomNames, L"/Script/Chimera.BuildingCustomNameSaveData", 0x58 },
         { Section::AntennasData, L"/Script/Chimera.CrAntennaSaveData", 0x50 },
         { Section::ZiplineReplicator, L"/Script/Chimera.CrZiplineReplicatorSaveData", 0x50 },
         { Section::ZiplineSubsystem, L"/Script/Chimera.CrZiplineSaveData", 0x50 },
         { Section::BaseCoreReplication, L"/Script/Chimera.BaseCoreReplicationSaveData", 0x38 },
-        { Section::GameStateData, L"/Script/Chimera.GameStateSaveData", 0x490 }
+        { Section::GameStateData, L"/Script/Chimera.GameStateSaveData", 0x490 },
+#if defined(MODLOADER_CLIENT_BUILD)
+        { Section::CrPackageTransportReplicator, L"/Script/Chimera.CrSenderConnectionsSaveData", 0x58 },
+        { Section::StorageShareableSubsystemData, L"/Script/Chimera.CrStorageShareableSubsystemSaveData", 0x10 },
+        { Section::BaseSiteAttackData, L"/Script/MassAIPrototypeEnemyRuntime.BaseSiteAttackSubsystemSaveData", 0xE0 },
+#endif
     }};
 
     using StaticFindObjectSafeByNameFn =
         UObject* (__fastcall*)(UClass*, UObject*, const wchar_t*, bool);
 
     std::mutex g_registryMutex;
-    std::array<const UScriptStruct*, 6> g_descriptors{};
+    std::array<const UScriptStruct*, static_cast<std::size_t>(Section::Count)> g_descriptors{};
     std::size_t g_playerMapSlotStride = 0;
     bool g_registryReady = false;
 
@@ -828,7 +848,8 @@ namespace PersistentIdFixIndependentSourceCollector
 
         LOG_INFO(
             "PersistentIdFix: independent source descriptor registry ready: "
-            "profiles=6 reflectionTestMode=%u",
+            "profiles=%llu reflectionTestMode=%u",
+            static_cast<unsigned long long>(kProfiles.size()),
             PERSISTENTIDFIX_REFLECTION_TEST_MODE ? 1u : 0u);
 
         return true;
@@ -859,6 +880,13 @@ namespace PersistentIdFixIndependentSourceCollector
     void RecordReadFailure(Section section)
     {
         State(section).ReadFailures.fetch_add(
+            1,
+            std::memory_order_relaxed);
+    }
+
+    void RecordConsistencyFailure(Section section)
+    {
+        State(section).Failures.fetch_add(
             1,
             std::memory_order_relaxed);
     }
@@ -987,6 +1015,71 @@ namespace PersistentIdFixIndependentSourceCollector
                     });
             });
     }
+
+#if defined(MODLOADER_CLIENT_BUILD)
+    bool ObserveCrPackageTransportReplicator(
+        const UScriptStruct* structType,
+        const FCrSenderConnectionsSaveData* data)
+    {
+        return Observe(
+            Section::CrPackageTransportReplicator,
+            structType,
+            data,
+            [&](std::vector<std::uint32_t>& staged)
+            {
+                return CheckedSparseMap(
+                    Section::CrPackageTransportReplicator,
+                    data->SenderConnections,
+                    [&](const auto& pair)
+                    {
+                        if (!Emit(staged, pair.Key().ID))
+                            return false;
+
+                        return Emit(staged, pair.Value().Receiver.ID);
+                    });
+            });
+    }
+
+    bool ObserveStorageShareableSubsystemData(
+        const UScriptStruct* structType,
+        const FCrStorageShareableSubsystemSaveData* data)
+    {
+        return Observe(
+            Section::StorageShareableSubsystemData,
+            structType,
+            data,
+            [&](std::vector<std::uint32_t>& staged)
+            {
+                return CheckedEach(
+                    Section::StorageShareableSubsystemData,
+                    data->StoragesData,
+                    [&](const FCrStorageShareableSaveData& value)
+                    {
+                        return Emit(
+                            staged,
+                            value.StorageShareableHandlePersistent.ID);
+                    });
+            });
+    }
+
+    bool ObserveBaseSiteAttackData(
+        const UScriptStruct* structType,
+        const FBaseSiteAttackSubsystemSaveData* data)
+    {
+        return Observe(
+            Section::BaseSiteAttackData,
+            structType,
+            data,
+            [&](std::vector<std::uint32_t>& staged)
+            {
+                return Emit(
+                        staged,
+                        data->AttackedBaseCoreHandlePersistent.ID) &&
+                    Emit(staged, data->InitialTargetEntity.ID) &&
+                    Emit(staged, data->SpawnerEntity.ID);
+            });
+    }
+#endif
 
     bool ObserveGameState(
         const UScriptStruct* structType,
@@ -1275,6 +1368,14 @@ namespace PersistentIdFixIndependentSourceCollector
         result.ziplineSubsystem = SnapshotOf(Section::ZiplineSubsystem);
         result.baseCoreReplication = SnapshotOf(Section::BaseCoreReplication);
         result.gameStateData = SnapshotOf(Section::GameStateData);
+#if defined(MODLOADER_CLIENT_BUILD)
+        result.crPackageTransportReplicator =
+            SnapshotOf(Section::CrPackageTransportReplicator);
+        result.storageShareableSubsystemData =
+            SnapshotOf(Section::StorageShareableSubsystemData);
+        result.baseSiteAttackData =
+            SnapshotOf(Section::BaseSiteAttackData);
+#endif
 
         result.gameStatePlayers =
             g_gameStatePlayers.load(std::memory_order_relaxed);
@@ -1368,6 +1469,20 @@ namespace PersistentIdFixIndependentSourceCollector
             phase,
             "GameState",
             snapshot.gameStateData);
+#if defined(MODLOADER_CLIENT_BUILD)
+        LogSection(
+            phase,
+            "CrPackageTransportReplicator",
+            snapshot.crPackageTransportReplicator);
+        LogSection(
+            phase,
+            "StorageShareableSubsystemData",
+            snapshot.storageShareableSubsystemData);
+        LogSection(
+            phase,
+            "BaseSiteAttackData",
+            snapshot.baseSiteAttackData);
+#endif
 
         LOG_INFO(
             "PersistentIdFix: GameState source details [%s]: players=%llu floor=%llu antennaFog=%llu devicePayloads=%llu deviceEmpty=%llu deviceMalformed=%llu deviceUnknown=%llu deviceRecognizedPidFree=%llu opaqueStoreEntries=%llu discoveredBuildings=%llu",
