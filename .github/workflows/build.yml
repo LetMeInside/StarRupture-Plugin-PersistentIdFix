@@ -804,6 +804,7 @@ jobs:
           display_name: "${{ env.PLUGIN_NAME }} Client v${{ env.VERSION }}"
           description: "Changelog: https://github.com/${{ github.repository }}/releases/tag/v${{ env.VERSION }}"
           version: ${{ env.VERSION }}
+          update_mod_version: true
 
       # --------------------------------------------------------
       # Upload Server package to Nexus Mods
@@ -820,4 +821,3 @@ jobs:
           display_name: "${{ env.PLUGIN_NAME }} Server v${{ env.VERSION }}"
           description: "Changelog: https://github.com/${{ github.repository }}/releases/tag/v${{ env.VERSION }}"
           version: ${{ env.VERSION }}
-          update_mod_version: true
